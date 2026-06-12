@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "glovebox-worker",
+  "compatibility_date": "2026-03-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/index.ts",
+  "vars": {
+    "AUTH_EMAIL_FROM": "auth@glovebox.test",
+    "AUTH_EMAIL_FROM_NAME": "Glovebox",
+    "AUTH_EMAIL_MODE": "none",
+    "BETTER_AUTH_URL": "https://api.glovebox.test",
+    "BETTER_AUTH_TRUSTED_ORIGIN": "https://api.glovebox.test",
+    "BETTER_AUTH_COOKIE_DOMAIN": ".glovebox.test",
+    "BETTER_AUTH_DEV_PASSWORD": "true",
+    "INVITATION_EMAIL_FROM": "invites@glovebox.test",
+    "INVITATION_EMAIL_FROM_NAME": "Glovebox",
+    "INVITATION_ACCEPT_URL": "https://api.glovebox.test/invites/accept",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "glovebox-db",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "WORKSPACE_DO", "class_name": "WorkspaceDO" }],
+  },
+  "send_email": [{ "name": "EMAIL" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceDO"] }],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+  },
+}

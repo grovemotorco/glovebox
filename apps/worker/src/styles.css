@@ -1,0 +1,353 @@
+@import 'tailwindcss';
+
+@theme {
+  /* Grove Motor Co type system — Oswald (display) + Raleway (body). */
+  --font-display:
+    'Oswald', 'Trade Gothic LT Std', 'Roboto Condensed', 'Arial Narrow', system-ui, sans-serif;
+  --font-sans: 'Raleway', 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* ============================================================================
+   Grove Motor Co brand palette (pdf/guidelines.pdf v.01, April 2026).
+   The app's --gb-* tokens are mapped onto the brand's warm dark theme
+   (Ivory Circuit base, Grid Sand text, Carbon Shadow burnt-orange accent).
+   ========================================================================== */
+:root {
+  --grove-grid-sand: #faf5ec;
+  --grove-pitlane-dust: #ddd5c6;
+  --grove-desert-apex: #948a7a;
+  --grove-warm-tarmac: #3e3832;
+  --grove-ivory-circuit: #1c1916;
+  --grove-carbon-shadow: #d2692a;
+  --grove-carbon-shadow-alt: #e88858;
+  --grove-velocity-cyan: #5ebcca;
+  --grove-velocity-cyan-alt: #3a7a8a;
+  --grove-racing-dune: #f2dfc0;
+  --grove-racing-dune-alt: #1e3258;
+  --grove-sunset-circuit: #e5a24a;
+  --grove-sunset-circuit-alt: #7a2532;
+
+  --gb-bg: var(--grove-ivory-circuit);
+  --gb-sidebar-bg: color-mix(in oklch, var(--grove-ivory-circuit) 90%, var(--grove-warm-tarmac));
+  --gb-surface: color-mix(in oklch, var(--grove-ivory-circuit) 78%, var(--grove-warm-tarmac));
+  --gb-border: color-mix(in oklch, var(--grove-warm-tarmac) 82%, var(--grove-ivory-circuit));
+  --gb-text: var(--grove-grid-sand);
+  --gb-text-muted: var(--grove-desert-apex);
+  --gb-accent: var(--grove-carbon-shadow);
+  --gb-accent-hover: var(--grove-carbon-shadow-alt);
+  --gb-hover: color-mix(in oklch, var(--grove-grid-sand) 7%, transparent);
+  --gb-active: color-mix(in oklch, var(--grove-carbon-shadow) 16%, transparent);
+
+  /* Brand status tones (read on the warm dark surface). */
+  --gb-info: var(--grove-velocity-cyan);
+  --gb-success: var(--grove-velocity-cyan-alt);
+  --gb-warning: var(--grove-sunset-circuit);
+  --gb-danger: var(--grove-sunset-circuit-alt);
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  color: var(--gb-text);
+  font-family: var(--font-sans);
+  background-color: var(--gb-bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tame double-tap zoom delay and stray tap highlights on touch devices. */
+button,
+a,
+[role='button'],
+select,
+summary {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/*
+ * Consistent keyboard focus ring across every interactive element. Element +
+ * pseudo-class specificity (0,1,1) intentionally beats utility `.outline-none`
+ * (0,1,0), so controls that opt out of the default outline still show focus.
+ */
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[role='button']:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--gb-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Tabular figures keep numeric columns and IDs from shifting. */
+:where(input[type='number'], code, kbd, .gb-tabular) {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Respect users who prefer reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* CodeMirror overrides */
+.cm-editor {
+  height: 100%;
+  background: transparent !important;
+}
+.cm-editor .cm-scroller {
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.93rem;
+  line-height: 1.75;
+}
+.cm-editor .cm-content {
+  width: 100%;
+  max-width: 58rem;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 2.25rem 2.5rem;
+  color: var(--gb-text);
+  caret-color: var(--gb-accent);
+}
+.cm-editor .cm-gutters {
+  background: color-mix(in srgb, var(--gb-sidebar-bg) 78%, transparent);
+  border-right: 1px solid var(--gb-border);
+  color: color-mix(in srgb, var(--gb-text-muted) 70%, transparent);
+}
+.cm-editor .cm-activeLineGutter {
+  background: var(--gb-hover);
+}
+.cm-editor .cm-activeLine {
+  background: var(--gb-hover);
+}
+.cm-editor.cm-focused {
+  outline: none;
+}
+.cm-editor .cm-cursor {
+  border-left-color: var(--gb-accent);
+}
+.cm-editor .cm-selectionBackground {
+  background: color-mix(in oklch, var(--gb-accent) 28%, transparent) !important;
+}
+
+/* Markdown preview */
+.md-preview {
+  color: var(--gb-text);
+  font-size: 0.95rem;
+  line-height: 1.75;
+  word-break: break-word;
+}
+.md-preview > :first-child {
+  margin-top: 0;
+}
+.md-preview :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+  scroll-margin-top: 2rem;
+}
+.md-preview h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.15;
+  margin: 0 0 1rem;
+}
+.md-preview h2 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 2rem 0 0.85rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.md-preview h3 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1.5rem 0 0.65rem;
+}
+.md-preview p {
+  margin: 0 0 0.9rem;
+  text-wrap: pretty;
+}
+.md-preview ul,
+.md-preview ol {
+  margin: 0 0 0.95rem;
+  padding-left: 1.5rem;
+}
+.md-preview ul {
+  list-style-type: disc;
+}
+.md-preview ul.contains-task-list {
+  padding-left: 0;
+  list-style: none;
+}
+.md-preview li.task-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+.md-preview li.task-list-item > p {
+  margin: 0;
+}
+.md-preview input.task-list-item-checkbox {
+  margin-top: 0.35rem;
+  accent-color: var(--gb-accent);
+}
+.md-preview ol {
+  list-style-type: decimal;
+}
+.md-preview code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.15rem 0.35rem;
+  border-radius: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.md-preview pre {
+  background: rgba(0, 0, 0, 0.3);
+  margin: 1rem 0;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+.md-preview pre code {
+  background: none;
+  padding: 0;
+}
+.md-preview blockquote {
+  border-left: 3px solid var(--gb-accent);
+  margin: 1rem 0;
+  padding: 0.5rem 1rem;
+  color: var(--gb-text-muted);
+}
+.md-preview a {
+  color: var(--gb-accent);
+  text-decoration: underline;
+}
+.md-preview hr {
+  border: 0;
+  border-top: 1px solid var(--gb-border);
+  margin: 1.5rem 0;
+}
+.md-preview strong {
+  font-weight: 600;
+}
+.md-preview li + li {
+  margin-top: 0.25rem;
+}
+.md-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  overflow: hidden;
+  border-radius: 0.5rem;
+}
+.md-preview th,
+.md-preview td {
+  border: 1px solid var(--gb-border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+.md-preview th {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Dialogs trap scroll-chaining to the page behind the backdrop. */
+.cmd-dialog,
+.settings-dialog {
+  overscroll-behavior: contain;
+}
+
+/*
+ * The command palette input is borderless, full-bleed, and autofocused on open;
+ * the seam below it already frames the field. Suppress the global focus ring so
+ * it doesn't draw a boxed outline around the whole header. Higher specificity
+ * (0,2,0) intentionally overrides the global `input:focus-visible` (0,1,1).
+ */
+.cmd-search:focus-visible {
+  outline: none;
+}
+
+/* Command bar dialog */
+.cmd-dialog[open] {
+  animation: slideDown 120ms ease-out;
+}
+.cmd-dialog::backdrop {
+  animation: fadeIn 100ms ease-out;
+}
+
+/* Settings dialog */
+.settings-dialog[open] {
+  animation: scaleIn 150ms ease-out;
+}
+.settings-dialog::backdrop {
+  animation: fadeIn 120ms ease-out;
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

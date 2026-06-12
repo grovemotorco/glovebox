@@ -1,0 +1,33 @@
+version = 1
+agents = ["claude", "cursor", "codex"]
+
+[trust]
+allow_all = true
+
+[[skills]]
+name = "dotagents"
+source = "getsentry/dotagents"
+
+[[skills]]
+name = "vercel-react-best-practices"
+source = "vercel-labs/agent-skills"
+
+[[skills]]
+name = "web-design-guidelines"
+source = "vercel-labs/agent-skills"
+
+[[skills]]
+name = "agent-browser"
+source = "vercel-labs/agent-browser"
+
+[[skills]]
+name = "shadcn"
+source = "shadcn/ui"
+
+[[skills]]
+name = "portless"
+source = "vercel-labs/portless"
+
+[[skills]]
+name = "*"
+source = "cloudflare/skills"

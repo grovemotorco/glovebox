@@ -1,0 +1,45 @@
+{
+  "name": "@glovebox/sync",
+  "version": "0.0.0",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./loro": "./src/loro.ts",
+    "./server": "./src/server.ts",
+    "./package.json": "./package.json",
+    "./client": "./src/client.ts",
+    "./daemon": "./src/daemon.ts"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.mjs",
+      "./loro": "./dist/loro.mjs",
+      "./server": "./dist/server.mjs",
+      "./package.json": "./package.json",
+      "./client": "./dist/client.mjs",
+      "./daemon": "./dist/daemon.mjs"
+    }
+  },
+  "scripts": {
+    "build": "vp pack",
+    "dev": "vp pack --watch",
+    "test": "vp test",
+    "check": "vp check"
+  },
+  "dependencies": {
+    "@glovebox/core": "workspace:*",
+    "@glovebox/dofs": "workspace:*",
+    "@noble/hashes": "catalog:",
+    "@sanity/diff-match-patch": "catalog:",
+    "loro-crdt": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
+  }
+}

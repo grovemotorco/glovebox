@@ -1,0 +1,27 @@
+{
+  "name": "@glovebox/cli",
+  "version": "0.0.0",
+  "private": true,
+  "bin": {
+    "glovebox": "./dist/glovebox.mjs"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vp pack",
+    "test": "vp test",
+    "check": "vp check",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@glovebox/api": "workspace:*",
+    "@glovebox/core": "workspace:*",
+    "@glovebox/sync": "workspace:*"
+  },
+  "devDependencies": {
+    "@glovebox/harness": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
+  }
+}

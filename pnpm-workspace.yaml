@@ -1,0 +1,88 @@
+packages:
+  - apps/*
+  - packages/*
+  - tools/*
+  - tests/*
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
+
+catalog:
+  '@better-auth/api-key': ^1.6.9
+  '@better-auth/memory-adapter': ^1.6.9
+  '@cloudflare/vite-plugin': ^1.37.2
+  '@cloudflare/workers-types': ^4.20260519.1
+  '@orpc/client': ^1.14.2
+  '@orpc/contract': ^1.14.2
+  '@orpc/json-schema': ^1.14.2
+  '@orpc/openapi': ^1.14.2
+  '@orpc/server': ^1.14.2
+  '@orpc/tanstack-query': ^1.14.2
+  '@orpc/zod': ^1.14.2
+  '@sentry/dotagents': ^1.17.0
+  '@tailwindcss/vite': ^4.3.0
+  '@tanstack/react-query': ^5.100.11
+  '@tanstack/react-router': ^1.170.4
+  '@tanstack/react-start': ^1.168.6
+  '@types/react': ^19.2.15
+  '@types/react-dom': ^19.2.3
+  '@types/node': ^25.9.1
+  '@types/ws': ^8.18.1
+  '@typescript/native-preview': ^7.0.0-dev.20260519.1
+  '@vitejs/plugin-react': ^6.0.2
+  better-auth: ^1.6.9
+  drizzle-kit: ^0.31.10
+  drizzle-orm: ^0.45.2
+  portless: ^0.13.0
+  react: ^19.2.6
+  react-dom: ^19.2.6
+  tailwindcss: ^4.3.0
+  typescript: ^6.0.3
+  vite: npm:@voidzero-dev/vite-plus-core@latest
+  vite-plus: ^0.1.22
+  vitest: npm:@voidzero-dev/vite-plus-test@latest
+  wrangler: ^4.93.0
+  ws: ^8.21.0
+  zod: ^4.4.3
+  '@sanity/diff-match-patch': ^3.2.0
+  '@noble/hashes': ^2.2.0
+  '@comark/react': ^0.4.0
+  comark: ^0.4.0
+
+catalogMode: prefer
+minimumReleaseAgeExclude:
+  - '@cloudflare/vite-plugin@1.37.2'
+  - '@cloudflare/workers-types@4.20260519.1'
+  - '@shikijs/core@4.1.0'
+  - '@shikijs/engine-javascript@4.1.0'
+  - '@shikijs/engine-oniguruma@4.1.0'
+  - '@shikijs/langs@4.1.0'
+  - '@shikijs/primitive@4.1.0'
+  - '@shikijs/themes@4.1.0'
+  - '@shikijs/types@4.1.0'
+  - '@types/node@25.9.1'
+  - '@types/react@19.2.15'
+  - miniflare@4.20260518.0
+  - shiki@4.1.0
+  - wrangler@4.93.0
+  - '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-darwin-x64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-linux-arm64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-linux-arm@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-linux-x64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-win32-arm64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview-win32-x64@7.0.0-dev.20260519.1'
+  - '@typescript/native-preview@7.0.0-dev.20260519.1'
+overrides:
+  '@codemirror/view': ^6.43.0
+  vite: 'catalog:'
+  vitest: 'catalog:'
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: '*'
+    vitest: '*'

@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1781116285611,
+      "tag": "0000_living_shockwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1781116828551,
+      "tag": "0001_ambiguous_cardiac",
+      "breakpoints": true
+    }
+  ]
+}

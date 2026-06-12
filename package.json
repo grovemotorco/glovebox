@@ -1,0 +1,20 @@
+{
+  "name": "@glovebox/glovebox",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "vp check && vp test && vp run -r build",
+    "build": "vp run -r build",
+    "test": "vp test",
+    "dev": "vp run -r --parallel dev",
+    "dev:worker": "vp run @glovebox/worker#dev",
+    "dev:prototype": "vp run @glovebox/prototype#dev"
+  },
+  "devDependencies": {
+    "@sentry/dotagents": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "packageManager": "pnpm@11.1.3"
+}
