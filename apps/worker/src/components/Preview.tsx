@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ComponentPropsWithoutRef } from 'react'
+import type { ComponentProps, ComponentPropsWithoutRef } from 'react'
 import { ComarkRenderer } from '@comark/react'
 import { createParse } from 'comark'
 import type { ComarkTree } from 'comark'
@@ -7,6 +7,8 @@ import security from 'comark/plugins/security'
 import taskList from 'comark/plugins/task-list'
 import toc from 'comark/plugins/toc'
 import type { TocLink } from 'comark/plugins/toc'
+import mermaid, { Mermaid } from '@comark/react/plugins/mermaid'
+import type { DiagramColors } from 'beautiful-mermaid'
 import { useRoomContent, type RoomHandle } from '../state/workspace.tsx'
 
 const parseMarkdown = createParse({
@@ -17,6 +19,7 @@ const parseMarkdown = createParse({
     security({ blockedTags: ['script', 'style', 'iframe', 'object', 'embed'] }),
     taskList(),
     toc({ depth: 3 }),
+    mermaid(),
   ],
 })
 
@@ -161,8 +164,33 @@ function flattenTocLinks(links: TocLink[]): TocLink[] {
   return links.flatMap((link) => [link, ...flattenTocLinks(link.children ?? [])])
 }
 
+// Grove Motor Co palette (styles.css `--grove-*`) mapped onto beautiful-mermaid's
+// DiagramColors so diagrams match the app's warm dark theme.
+const GROVE_MERMAID_THEME: DiagramColors = {
+  bg: '#1c1916', // --grove-ivory-circuit (preview background)
+  fg: '#faf5ec', // --grove-grid-sand (node text)
+  surface: '#3e3832', // --grove-warm-tarmac (node fill)
+  border: '#948a7a', // --grove-desert-apex (node stroke)
+  line: '#948a7a', // --grove-desert-apex (connectors / edges)
+  muted: '#948a7a', // --grove-desert-apex (edge labels, secondary text)
+  accent: '#d2692a', // --grove-carbon-shadow (arrow heads, highlights)
+}
+
+// Default every diagram to the Grove theme (set both light/dark slots since the
+// app is dark-only) while still honoring a per-diagram `{theme="..."}` override.
+function ThemedMermaid({ theme, themeDark, ...props }: ComponentProps<typeof Mermaid>) {
+  return (
+    <Mermaid
+      {...props}
+      theme={theme ?? GROVE_MERMAID_THEME}
+      themeDark={themeDark ?? GROVE_MERMAID_THEME}
+    />
+  )
+}
+
 const previewComponents = {
   a: SafeAnchor,
+  mermaid: ThemedMermaid,
 }
 
 function SafeAnchor({ href, children, ...props }: ComponentPropsWithoutRef<'a'>) {

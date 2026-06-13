@@ -29,6 +29,7 @@
     "@orpc/zod": "catalog:",
     "@tanstack/react-router": "catalog:",
     "@tanstack/react-start": "catalog:",
+    "beautiful-mermaid": "catalog:",
     "better-auth": "catalog:",
     "codemirror": "^6.0.2",
     "comark": "catalog:",

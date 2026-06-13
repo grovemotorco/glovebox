@@ -50,6 +50,7 @@ catalog:
   '@noble/hashes': ^2.2.0
   '@comark/react': ^0.4.0
   comark: ^0.4.0
+  beautiful-mermaid: ^1.1.3
 
 catalogMode: prefer
 minimumReleaseAgeExclude:
