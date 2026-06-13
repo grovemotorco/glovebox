@@ -42,7 +42,7 @@ function roleClaims(
 
 class FakeStorage implements WorkspaceServerStorage {
   readonly #values = new Map<string, unknown>()
-  readonly sql: WorkspaceSqlStorage = new FakeSqlStorage()
+  readonly sql = new FakeSqlStorage()
 
   async get<T>(key: string): Promise<T | undefined> {
     const value = this.#values.get(key)
@@ -60,6 +60,51 @@ class FakeStorage implements WorkspaceServerStorage {
 
 class FakeSqlStorage implements WorkspaceSqlStorage {
   readonly #db = new DatabaseSync(':memory:')
+  readonly #faults: Array<{
+    match: (query: string, bindings: readonly unknown[]) => boolean
+    error: Error
+  }> = []
+  #transactionDepth = 0
+  #savepointId = 0
+
+  failNext(
+    match: (query: string, bindings: readonly unknown[]) => boolean,
+    error = new Error('injected SQL failure'),
+  ): void {
+    this.#faults.push({ match, error })
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    if (this.#transactionDepth === 0) {
+      this.#db.exec('BEGIN')
+      this.#transactionDepth += 1
+      try {
+        const value = closure()
+        this.#transactionDepth -= 1
+        this.#db.exec('COMMIT')
+        return value
+      } catch (error) {
+        this.#transactionDepth -= 1
+        this.#db.exec('ROLLBACK')
+        throw error
+      }
+    }
+
+    const savepoint = `sp_${++this.#savepointId}`
+    this.#db.exec(`SAVEPOINT ${savepoint}`)
+    this.#transactionDepth += 1
+    try {
+      const value = closure()
+      this.#transactionDepth -= 1
+      this.#db.exec(`RELEASE SAVEPOINT ${savepoint}`)
+      return value
+    } catch (error) {
+      this.#transactionDepth -= 1
+      this.#db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+      this.#db.exec(`RELEASE SAVEPOINT ${savepoint}`)
+      throw error
+    }
+  }
 
   exec(
     query: string,
@@ -68,6 +113,12 @@ class FakeSqlStorage implements WorkspaceSqlStorage {
     const normalized = bindings.map((binding) =>
       binding instanceof ArrayBuffer ? new Uint8Array(binding) : binding,
     )
+    const compactQuery = query.replace(/\s+/g, ' ').trim()
+    const faultIndex = this.#faults.findIndex((fault) => fault.match(compactQuery, normalized))
+    if (faultIndex >= 0) {
+      const [fault] = this.#faults.splice(faultIndex, 1)
+      throw fault!.error
+    }
     const rows = this.#db
       .prepare(query)
       .all(...(normalized as (string | number | null)[])) as Record<string, WorkspaceSqlValue>[]
@@ -141,6 +192,7 @@ class FakeHost {
       now: () => this.now,
       limits: this.limits,
       requireAuth: this.requireAuth,
+      transactionSync: (closure) => this.storage.sql.transactionSync(closure),
     })
   }
 
@@ -220,6 +272,36 @@ async function submitEdit(
   await host.send(socket, message)
   return message
 }
+
+function tableRowCount(host: FakeHost, table: string): number {
+  const exists = host.storage.sql
+    .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table)
+    .toArray()
+  if (exists.length === 0) return 0
+  const row = host.storage.sql.exec(`SELECT COUNT(*) AS count FROM ${table}`).toArray()[0]
+  return Number(row?.count ?? 0)
+}
+
+describe('WorkspaceServer test transaction harness', () => {
+  it('supports nested transactionSync rollback via savepoints', () => {
+    const sql = new FakeSqlStorage()
+
+    sql.transactionSync(() => {
+      sql.exec('CREATE TABLE tx_probe (id TEXT PRIMARY KEY)')
+      sql.exec('INSERT INTO tx_probe (id) VALUES (?)', 'outer-before')
+      expect(() =>
+        sql.transactionSync(() => {
+          sql.exec('INSERT INTO tx_probe (id) VALUES (?)', 'inner')
+          throw new Error('rollback inner')
+        }),
+      ).toThrow(/rollback inner/)
+      sql.exec('INSERT INTO tx_probe (id) VALUES (?)', 'outer-after')
+    })
+
+    const rows = sql.exec('SELECT id FROM tx_probe ORDER BY id ASC').toArray()
+    expect(rows.map((row) => row.id)).toEqual(['outer-after', 'outer-before'])
+  })
+})
 
 describe('WorkspaceServer hibernation safety', () => {
   it('mints strictly increasing peer IDs and never reissues one after eviction', async () => {
@@ -1326,6 +1408,94 @@ describe('WorkspaceServer batch.submit (tree ops)', () => {
     expect(replay.events.at(-1)).toMatchObject({ type: 'rename', newPath: 'renamed.md' })
   })
 
+  it('rolls back a mid-batch event-log failure without burned seqs or cached opIds', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-editor')
+    await fetchSnapshot(host, socket, 'file-a', 'a\n', 'a.md')
+    await fetchSnapshot(host, socket, 'file-b', 'b\n', 'b.md')
+    await host.send(socket, { type: 'events.since', requestId: 'rq-0', afterSeq: 0 })
+    const head = socket.received('events.batch').at(-1)!.currentSeq
+
+    let eventLogInserts = 0
+    host.storage.sql.failNext((query) => {
+      if (!query.startsWith('INSERT INTO workspace_changes ')) return false
+      eventLogInserts += 1
+      return eventLogInserts === 2
+    })
+
+    const batchOps: Extract<WorkspaceClientMessage, { type: 'batch.submit' }>['ops'] = [
+      {
+        type: 'file.rename',
+        opId: 'op-rename-a',
+        fileId: 'file-a',
+        baseSeq: head,
+        fromPath: 'a.md',
+        toPath: 'a-renamed.md',
+      },
+      {
+        type: 'file.rename',
+        opId: 'op-rename-b',
+        fileId: 'file-b',
+        baseSeq: head,
+        fromPath: 'b.md',
+        toPath: 'b-renamed.md',
+      },
+    ]
+
+    await host.send(socket, {
+      type: 'batch.submit',
+      requestId: 'rq-fault',
+      ops: batchOps,
+    })
+
+    expect(socket.received('error').at(-1)).toMatchObject({
+      requestId: 'rq-fault',
+      message: 'injected SQL failure',
+    })
+    expect(socket.received('batch.ack')).toHaveLength(0)
+    expect(socket.received('rename')).toHaveLength(0)
+    expect(tableRowCount(host, 'workspace_idempotency')).toBe(0)
+    expect(tableRowCount(host, 'workspace_recovery_records')).toBe(0)
+
+    let tree = await host.server.listTree()
+    expect(tree.currentSeq).toBe(head)
+    expect(tree.entries.map((entry) => entry.path).sort()).toEqual(['a.md', 'b.md'])
+
+    await host.send(socket, { type: 'events.since', requestId: 'rq-after-fault', afterSeq: head })
+    expect(socket.received('events.batch').at(-1)).toMatchObject({
+      requestId: 'rq-after-fault',
+      currentSeq: head,
+      events: [],
+    })
+
+    await host.send(socket, {
+      type: 'batch.submit',
+      requestId: 'rq-retry',
+      ops: batchOps,
+    })
+
+    const ack = socket.received('batch.ack').at(-1)!
+    expect(ack.requestId).toBe('rq-retry')
+    expect(ack.acceptedOps.map((op) => op.opId)).toEqual(['op-rename-a', 'op-rename-b'])
+    expect(ack.deferredOps).toEqual([])
+    expect(socket.received('rename')).toHaveLength(2)
+
+    tree = await host.server.listTree()
+    expect(tree.currentSeq).toBe(head + 2)
+    expect(tree.entries.map((entry) => entry.path).sort()).toEqual(['a-renamed.md', 'b-renamed.md'])
+    expect(tableRowCount(host, 'workspace_idempotency')).toBe(2)
+
+    await host.send(socket, { type: 'events.since', requestId: 'rq-after-retry', afterSeq: head })
+    const replay = socket.received('events.batch').at(-1)!
+    expect(replay.requestId).toBe('rq-after-retry')
+    expect(replay.currentSeq).toBe(head + 2)
+    expect(replay.events.map((event) => [event.seq, event.type])).toEqual([
+      [head + 1, 'rename'],
+      [head + 2, 'rename'],
+    ])
+  })
+
   it('replays a duplicate batch idempotently — same acceptance, no second event', async () => {
     const host = new FakeHost()
     const socket = await host.connect('alice')
@@ -1732,14 +1902,14 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     expect(tree.entries.filter((entry) => entry.fileId === 'f-long-2')).toHaveLength(0)
   })
 
-  it('content.submit is rejected, not acked, when the materialized tree row is refused', async () => {
+  it('first-contact markdown registration falls back from a refused observedPath', async () => {
     const host = new FakeHost()
     const socket = await host.connect('alice')
     const peerId = await helloPeerId(host, socket, 'device-a')
 
-    // Occupy a max-length markdown path. The colliding create must suffix,
-    // which pushes the canonical path over the path cap and makes the tree
-    // authority refuse the row after the Loro update has already imported.
+    // Occupy a max-length markdown path. The colliding create must suffix;
+    // the suffixed observedPath is over the path cap, so first contact falls
+    // back to the stable fileId path instead of minting a Loro-only orphan.
     const longPath = `${'a'.repeat(1024 - 3)}.md`
     await fetchSnapshot(host, socket, 'f-long-md-1', 'first\n', longPath)
 
@@ -1757,38 +1927,151 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
       loroUpdateB64: updateB64,
     })
 
-    const rejection = socket
-      .received('submit.rejected')
-      .find((message) => message.opId === 'op-long-md-2')
-    expect(rejection).toMatchObject({ fileId: 'f-long-md-2', reason: 'too-large' })
-    expect(socket.received('ack').filter((ack) => ack.fileId === 'f-long-md-2')).toHaveLength(0)
     expect(
-      socket.received('content.loroUpdate').filter((event) => event.fileId === 'f-long-md-2'),
+      socket.received('submit.rejected').filter((message) => message.fileId === 'f-long-md-2'),
     ).toHaveLength(0)
-    expect((await host.server.listTree()).entries).not.toContainEqual(
-      expect.objectContaining({ fileId: 'f-long-md-2' }),
-    )
-
-    // The failed attempt did import the Loro update, so a later retry can be
-    // appliedUpdates=0. It must still retry the materialized row instead of
-    // acking an unrolled edit.
-    await host.send(socket, {
-      type: 'content.submit',
-      fileId: 'f-long-md-2',
-      observedPath: 'retry-ok.md',
-      opId: 'op-long-md-2-retry',
-      baseContentVersionB64: bytesToBase64(base),
-      loroUpdateB64: updateB64,
-    })
-
     expect(socket.received('ack').at(-1)).toMatchObject({
       fileId: 'f-long-md-2',
-      opId: 'op-long-md-2-retry',
-      applied: false,
+      opId: 'op-long-md-2',
+      applied: true,
     })
-    const retryEntry = (await host.server.listTree()).entries.find(
+    const fallbackEntry = (await host.server.listTree()).entries.find(
       (entry) => entry.fileId === 'f-long-md-2',
     )
-    expect(retryEntry).toMatchObject({ path: 'retry-ok.md' })
+    expect(fallbackEntry).toMatchObject({ path: 'f-long-md-2.md' })
+    expect(socket.received('create').at(-1)).toMatchObject({
+      fileId: 'f-long-md-2',
+      path: 'f-long-md-2.md',
+    })
+    expect(host.server.listRecoveryRecords({ pendingOnly: true })).toHaveLength(0)
+  })
+
+  it('records registration-failed recovery when observedPath and fallback both fail', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+
+    const failRegistrationInsert = (query: string) =>
+      query.startsWith('INSERT INTO workspace_files ')
+    host.storage.sql.failNext(failRegistrationInsert, new Error('quota create failed'))
+    host.storage.sql.failNext(failRegistrationInsert, new Error('fallback create failed'))
+
+    await host.send(socket, {
+      type: 'snapshot.get',
+      requestId: 'rq-registration-fault',
+      fileId: 'f-registration-fault',
+      initialContent: 'orphan until retry\n',
+      observedPath: 'bad/registration.md',
+    })
+
+    expect(socket.received('snapshot.response')).toHaveLength(0)
+    expect(socket.received('error').at(-1)).toMatchObject({
+      requestId: 'rq-registration-fault',
+      message: 'materialized view refused file registration',
+    })
+    expect((await host.server.listTree()).entries).not.toContainEqual(
+      expect.objectContaining({ fileId: 'f-registration-fault' }),
+    )
+    const records = host.server.listRecoveryRecords({ pendingOnly: true })
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      fileId: 'f-registration-fault',
+      opId: 'snapshot:rq-registration-fault',
+      reason: 'registration-failed',
+      observedPath: 'bad/registration.md',
+    })
+
+    await host.send(socket, {
+      type: 'snapshot.get',
+      requestId: 'rq-registration-retry',
+      fileId: 'f-registration-fault',
+      observedPath: 'good/registration.md',
+    })
+    expect(socket.received('snapshot.response').at(-1)).toMatchObject({
+      requestId: 'rq-registration-retry',
+      fileId: 'f-registration-fault',
+    })
+    expect((await host.server.listTree()).entries).toContainEqual(
+      expect.objectContaining({ fileId: 'f-registration-fault', path: 'good/registration.md' }),
+    )
+  })
+
+  it('retries a faulted markdown row write before stale-baseSeq delete can win', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    const peerId = await helloPeerId(host, socket, 'device-a')
+    const { snapshotB64 } = await fetchSnapshot(host, socket, 'f-roll-fault', 'base\n', 'roll.md')
+    await host.send(socket, { type: 'events.since', requestId: 'rq-head', afterSeq: 0 })
+    const head = socket.received('events.batch').at(-1)!.currentSeq
+
+    host.storage.sql.failNext(
+      (query) => query.startsWith('UPDATE workspace_files SET content ='),
+      new Error('row write failed'),
+    )
+
+    const editor = LoroFileDoc.fromSnapshot(base64ToBytes(snapshotB64), {
+      peerId: BigInt(peerId),
+    })
+    const rejectedSubmit = await submitEdit(
+      host,
+      socket,
+      editor,
+      'f-roll-fault',
+      'base\nedited\n',
+      'op-roll-fault',
+    )
+
+    expect(socket.received('ack').filter((ack) => ack.fileId === 'f-roll-fault')).toHaveLength(0)
+    expect(socket.received('submit.rejected').at(-1)).toMatchObject({
+      fileId: 'f-roll-fault',
+      opId: 'op-roll-fault',
+      reason: 'too-large',
+    })
+    let entry = (await host.server.listTree()).entries.find(
+      (treeEntry) => treeEntry.fileId === 'f-roll-fault',
+    )!
+    expect(entry.seq).toBe(head)
+    expect(entry.contentHash).toBe(sha256Hex('base\n'))
+
+    // The first attempt imported into the Loro store before the row write
+    // faulted. Retrying the same op must still roll the stale projection and
+    // advance the per-file seq before a stale deleteIntent can be accepted.
+    await host.send(socket, rejectedSubmit)
+
+    expect(socket.received('ack').at(-1)).toMatchObject({
+      fileId: 'f-roll-fault',
+      opId: 'op-roll-fault',
+      applied: false,
+    })
+    entry = (await host.server.listTree()).entries.find(
+      (treeEntry) => treeEntry.fileId === 'f-roll-fault',
+    )!
+    expect(entry.seq).toBeGreaterThan(head)
+    expect(entry.contentHash).toBe(sha256Hex('base\nedited\n'))
+
+    await host.send(socket, {
+      type: 'batch.submit',
+      requestId: 'rq-stale-delete',
+      ops: [
+        {
+          type: 'file.deleteIntent',
+          opId: 'op-stale-delete-after-roll-fault',
+          fileId: 'f-roll-fault',
+          baseSeq: head,
+          path: 'roll.md',
+        },
+      ],
+    })
+
+    expect(socket.received('batch.ack').at(-1)).toMatchObject({
+      requestId: 'rq-stale-delete',
+      acceptedOps: [],
+      deferredOps: [{ opId: 'op-stale-delete-after-roll-fault', reason: 'remote-edit-wins' }],
+    })
+    expect(socket.received('delete')).toHaveLength(0)
+    const { snapshotB64: afterDelete } = await fetchSnapshot(host, socket, 'f-roll-fault')
+    expect(LoroFileDoc.fromSnapshot(base64ToBytes(afterDelete)).getTextContent()).toBe(
+      'base\nedited\n',
+    )
   })
 })

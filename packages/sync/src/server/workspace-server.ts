@@ -457,6 +457,7 @@ export class WorkspaceServer {
   readonly #dofs: WorkspaceFilesystem
   readonly #workspace: WorkspaceStore
   readonly #applier: WorkspaceBatchApplier
+  readonly #transactionSync: <T>(closure: () => T) => T
   readonly #limits: WorkspaceServerLimits
   readonly #ingressLimits: IngressLimits
   readonly #now: () => number
@@ -486,14 +487,16 @@ export class WorkspaceServer {
     this.#recovery = new WorkspaceRecoveryStore(options.sql, now)
     this.#trim = new TrimCoordinator(options.sql, now, options.trim)
     this.#baseCache = new TextBaseCache(options.sql, now)
+    this.#transactionSync = options.transactionSync ?? (<T>(closure: () => T): T => closure())
     // Tree/identity authority (ported loro-2 WorkspaceStore) + the batch
     // applier as the policy engine for structural ops. It allocates seq
     // from the SAME `workspace_meta` row as the event log — one seq domain.
     const sqlLike: WorkspaceSqlStorageLike = {
       sql: options.sql as unknown as WorkspaceSqlStorageLike['sql'],
-      transactionSync: options.transactionSync ?? (<T>(closure: () => T): T => closure()),
+      transactionSync: this.#transactionSync,
     }
     this.#workspace = new WorkspaceStore(sqlLike)
+    this.#workspace.ensureInitialized()
     // The applier's Loro surface points at the LIVE Loro tables
     // (SqliteLoroFileStore): a delete must clear the state content.submit
     // serves from, not the ported store's parallel tables. Only `delete`
@@ -511,11 +514,9 @@ export class WorkspaceServer {
         this.#trim.forgetFile(fileId)
       },
     }
-    this.#applier = new WorkspaceBatchApplier(
-      this.#workspace,
-      batchLoro,
-      new WorkspaceIdempotencyStore(sqlLike),
-    )
+    const batchIdempotency = new WorkspaceIdempotencyStore(sqlLike)
+    batchIdempotency.ensureInitialized()
+    this.#applier = new WorkspaceBatchApplier(this.#workspace, batchLoro, batchIdempotency)
     const dofsDb = new DofsDatabase({
       sql: options.sql as unknown as SQLStorageLike,
       transactionSync: options.transactionSync,
@@ -825,12 +826,24 @@ export class WorkspaceServer {
       // snapshot.get is the create surface on this wire: the file enters
       // the tree authority here (path policy, per-file seq) and the
       // 'create' event makes it discoverable by pulling replicas.
-      this.#registerFile(
+      const registered = this.#registerFile(
         message.fileId,
         message.observedPath,
         materialized.textContent,
         readAttachment(socket)?.principalId ?? 'anonymous',
+        {
+          opId: `snapshot:${message.requestId}`,
+          deviceId: readAttachment(socket)?.deviceId ?? 'unknown',
+        },
       )
+      if (!registered) {
+        this.#send(socket, {
+          type: 'error',
+          requestId: message.requestId,
+          message: 'materialized view refused file registration',
+        })
+        return
+      }
       snapshot = (await this.#files.exportSnapshot(message.fileId))!
       this.#noteSnapshotServed(socket, message.fileId, materialized.contentVersion)
       this.#trim.noteActivity(message.fileId)
@@ -845,6 +858,27 @@ export class WorkspaceServer {
     }
 
     const materialized = await this.#files.materialize(message.fileId)
+    const attachment = readAttachment(socket)
+    if (!this.#workspace.getByFileId(message.fileId) && canMutate(attachment)) {
+      const registered = this.#registerFile(
+        message.fileId,
+        message.observedPath,
+        materialized!.textContent,
+        attachment?.principalId ?? 'anonymous',
+        {
+          opId: `snapshot:${message.requestId}`,
+          deviceId: attachment?.deviceId ?? 'unknown',
+        },
+      )
+      if (!registered) {
+        this.#send(socket, {
+          type: 'error',
+          requestId: message.requestId,
+          message: 'materialized view refused file registration',
+        })
+        return
+      }
+    }
     this.#noteSnapshotServed(socket, message.fileId, materialized!.contentVersion)
     this.#send(socket, {
       type: 'snapshot.response',
@@ -976,8 +1010,11 @@ export class WorkspaceServer {
       return
     }
 
+    const row = this.#workspace.getByFileId(message.fileId)
+    const projectedText =
+      row && row.contentKind !== 'opaque' ? this.#workspace.readFileById(message.fileId) : null
     const needsMaterializedCommit =
-      result.appliedUpdates > 0 || !this.#workspace.getByFileId(message.fileId)
+      result.appliedUpdates > 0 || !row || projectedText !== result.textContent
     if (needsMaterializedCommit) {
       const committed = this.#commitContentUpdate({
         fileId: message.fileId,
@@ -987,6 +1024,10 @@ export class WorkspaceServer {
         contentVersionB64: bytesToBase64(result.contentVersion),
         modifiedBy: attachment?.principalId ?? 'anonymous',
         originDeviceId: attachment?.deviceId,
+        recovery: {
+          opId: message.opId,
+          deviceId: attachment?.deviceId ?? 'unknown',
+        },
       })
       if (!committed) {
         this.#send(socket, {
@@ -1091,12 +1132,14 @@ export class WorkspaceServer {
     contentVersionB64: string
     modifiedBy: string
     originDeviceId?: string
+    recovery?: { opId: string; deviceId: string }
   }): boolean {
     const rolledSeq = this.#rollMaterializedFile(
       input.fileId,
       input.observedPath,
       input.text,
       input.modifiedBy,
+      input.recovery,
     )
     if (rolledSeq === false) return false
     const body = {
@@ -1127,11 +1170,12 @@ export class WorkspaceServer {
     observedPath: string | undefined,
     text: string,
     modifiedBy: string,
+    recovery?: { opId: string; deviceId: string },
   ): number | null | false {
     try {
       const row = this.#workspace.getByFileId(fileId)
       if (!row) {
-        return this.#registerFile(fileId, observedPath, text, modifiedBy) ? null : false
+        return this.#registerFile(fileId, observedPath, text, modifiedBy, recovery) ? null : false
       }
       // Belt-and-braces kind routing: text must never land in an opaque
       // row (writeFileById would store raw text the byte readers then
@@ -1155,22 +1199,53 @@ export class WorkspaceServer {
     observedPath: string | undefined,
     text: string,
     modifiedBy: string,
+    recovery?: { opId: string; deviceId: string },
   ): boolean {
-    try {
-      if (this.#workspace.getByFileId(fileId)) return true
-      const path = this.#freePath(observedPath ?? `${fileId}.md`)
-      this.#workspace.createFile(path, text, { modifiedBy }, fileId)
+    const fallbackPath = `${fileId}.md`
+    const requestedPath = observedPath ?? fallbackPath
+    const candidatePaths =
+      requestedPath === fallbackPath ? [requestedPath] : [requestedPath, fallbackPath]
+    let lastError: unknown = null
+
+    for (const candidatePath of candidatePaths) {
+      try {
+        const existing = this.#workspace.getByFileId(fileId)
+        if (existing) return true
+        const path = this.#freePath(candidatePath)
+        this.#workspace.createFile(path, text, { modifiedBy }, fileId)
+      } catch (error) {
+        lastError = error
+        continue
+      }
+
       const entry = this.#workspace.getTreeEntryByFileId(fileId)
-      if (!entry || entry.seq === undefined) return false
+      if (!entry || entry.seq === undefined) {
+        lastError = new Error('Registered file has no tree seq')
+        continue
+      }
       const body = { path: entry.path, entry }
       this.#events.appendAt(entry.seq, 'create', fileId, JSON.stringify(body))
       this.#broadcast({ type: 'create', fileId, seq: entry.seq, ...body })
       return true
-    } catch {
-      // Tree policy rejected the path (invalid shape or quota). Do not ack
-      // a submit whose materialized tree row did not land.
-      return false
     }
+
+    // Tree policy or quota rejected both the observed path and the stable
+    // fileId fallback. Keep the orphaned Loro state observable and retryable.
+    if (recovery) {
+      this.#recovery.record({
+        fileId,
+        opId: recovery.opId,
+        reason: 'registration-failed',
+        deviceId: recovery.deviceId,
+        observedPath,
+        payload: JSON.stringify({
+          requestedPath,
+          fallbackPath,
+          error: getErrorMessage(lastError),
+        }),
+      })
+    }
+    return false
   }
 
   #freePath(path: string): string {
@@ -1229,57 +1304,65 @@ export class WorkspaceServer {
           },
     )
 
-    const result = this.#applier.apply(
-      {
-        workspaceId: 'workspace',
-        mountId: 'wire',
-        deviceId: attachment?.deviceId ?? 'unknown',
-        baseSeq: 0,
-        ops,
-      },
-      {
-        userId: attachment?.principalId ?? 'anonymous',
-        deviceId: attachment?.deviceId ?? 'unknown',
-      },
-    )
+    const broadcasts: WorkspaceServerMessage[] = []
+    const ack = this.#transactionSync<WorkspaceServerMessage>(() => {
+      const result = this.#applier.apply(
+        {
+          workspaceId: 'workspace',
+          mountId: 'wire',
+          deviceId: attachment?.deviceId ?? 'unknown',
+          baseSeq: 0,
+          ops,
+        },
+        {
+          userId: attachment?.principalId ?? 'anonymous',
+          deviceId: attachment?.deviceId ?? 'unknown',
+        },
+      )
 
-    // Every deferred intent lands in the recovery store before the ack is
-    // sent (ISSUE-0041: a refused intent must never just vanish; INV-2 at
-    // the intent level). Idempotent on opId, so a replayed batch returns
-    // the same deferrals without double-writing.
-    const opsById = new Map(message.ops.map((op) => [op.opId, op]))
-    for (const deferred of result.deferredOps) {
-      const op = opsById.get(deferred.opId)
-      if (!op) continue
-      this.#recovery.record({
-        fileId: op.fileId,
-        opId: op.opId,
-        reason: deferred.reason,
-        deviceId: attachment?.deviceId ?? 'unknown',
-        observedPath: op.type === 'file.rename' ? op.toPath : op.path,
-        payload: JSON.stringify({ op }),
-      })
-    }
+      // Every deferred intent lands in the recovery store before the ack is
+      // sent (ISSUE-0041: a refused intent must never just vanish; INV-2 at
+      // the intent level). Idempotent on opId, so a replayed batch returns
+      // the same deferrals without double-writing.
+      const opsById = new Map(message.ops.map((op) => [op.opId, op]))
+      for (const deferred of result.deferredOps) {
+        const op = opsById.get(deferred.opId)
+        if (!op) continue
+        this.#recovery.record({
+          fileId: op.fileId,
+          opId: op.opId,
+          reason: deferred.reason,
+          deviceId: attachment?.deviceId ?? 'unknown',
+          observedPath: op.type === 'file.rename' ? op.toPath : op.path,
+          payload: JSON.stringify({ op }),
+        })
+      }
 
-    // Every applier event carries the seq the store stamped on the change;
-    // record it in the wire log at that exact seq (shared counter — no
-    // gaps) and broadcast in the same shape events.batch reconstructs.
-    for (const event of result.events) {
-      if (event.type !== 'rename' && event.type !== 'delete') continue
-      if (event.seq === undefined) continue
-      const fileId = event.type === 'rename' ? event.entry.fileId : event.fileId
-      const { type, seq, ...body } = event
-      this.#events.appendAt(seq, type, fileId, JSON.stringify(body))
-      this.#broadcast({ ...event, fileId, seq } as WorkspaceServerMessage)
-    }
+      // Every applier event carries the seq the store stamped on the change;
+      // record it in the wire log at that exact seq (shared counter — no
+      // gaps) and broadcast in the same shape events.batch reconstructs.
+      for (const event of result.events) {
+        if (event.type !== 'rename' && event.type !== 'delete') continue
+        if (event.seq === undefined) continue
+        const fileId = event.type === 'rename' ? event.entry.fileId : event.fileId
+        const { type, seq, ...body } = event
+        this.#events.appendAt(seq, type, fileId, JSON.stringify(body))
+        broadcasts.push({ ...event, fileId, seq } as WorkspaceServerMessage)
+      }
 
-    this.#send(socket, {
-      type: 'batch.ack',
-      requestId: message.requestId,
-      currentSeq: this.#events.currentSeq(),
-      acceptedOps: result.acceptedOps,
-      deferredOps: result.deferredOps,
+      return {
+        type: 'batch.ack',
+        requestId: message.requestId,
+        currentSeq: this.#events.currentSeq(),
+        acceptedOps: result.acceptedOps,
+        deferredOps: result.deferredOps,
+      }
     })
+
+    for (const broadcast of broadcasts) {
+      this.#broadcast(broadcast)
+    }
+    this.#send(socket, ack)
   }
 
   async #handleOpaqueSubmit(

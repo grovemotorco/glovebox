@@ -169,6 +169,9 @@ export class WorkspaceBatchApplier {
     for (const op of input.ops) {
       const cached = this.#idempotency.lookup(op.opId)
       if (cached) {
+        // Events are intentionally not replayed here: the server records
+        // event-log rows in the same transaction that commits this cached
+        // idempotency row, so a retry only reconstructs the ack surface.
         result.acceptedOps.push(cached.acceptedOp ?? { opId: op.opId })
         result.snapshots.push(...cached.snapshots)
         result.opaqueContents.push(...(cached.opaqueContents ?? []))
