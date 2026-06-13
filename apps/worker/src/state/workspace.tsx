@@ -17,7 +17,7 @@ import type {
   WorkspaceTreeEntry,
 } from '@glovebox/api'
 import { createBrowserUser, type AwarenessUser } from '@glovebox/core'
-import { LoroRoomClient } from '@glovebox/sync/loro'
+import { LoroFileDoc, LoroRoomClient } from '@glovebox/sync/loro'
 import { WorkspacePresence, type WorkspacePresencePeer } from '@glovebox/sync/client'
 import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { api, getOrCreateDeviceId } from '../lib/api.ts'
@@ -26,6 +26,7 @@ import {
   type BatchSubmitResult,
   type ConnectionStatus,
 } from '../lib/transport.ts'
+import { applyTreeWireEvent, type TreeWireEvent } from '../lib/tree-events.ts'
 import { baseName } from '../lib/tree.ts'
 
 export interface SessionUser {
@@ -59,6 +60,7 @@ interface WorkspaceContextValue {
   refreshWorkspaces: () => Promise<void>
 
   tree: WorkspaceTreeEntry[]
+  treeLoaded: boolean
   refreshTree: () => Promise<void>
   createFile: (path: string) => Promise<string>
   /** Submit structural tree ops (rename / delete) and refresh the tree. */
@@ -95,6 +97,11 @@ interface KeyedData<T> {
   value: T
 }
 
+interface TreeData extends KeyedData<WorkspaceTreeEntry[]> {
+  seq: number
+  loaded: boolean
+}
+
 const EMPTY_TREE: WorkspaceTreeEntry[] = []
 const EMPTY_MEMBERS: MemberView[] = []
 const EMPTY_INVITES: InviteView[] = []
@@ -102,6 +109,15 @@ const EMPTY_RECOVERY: RecoveryRecord[] = []
 
 function humanPrincipalIdFor(userId: string): string {
   return `human_${userId.replaceAll(/[^A-Za-z0-9_-]/g, '_').slice(0, 120) || 'unknown'}`
+}
+
+function roomHasPendingChanges(handle: RoomHandle): boolean {
+  if (handle.status !== 'ready') return false
+  try {
+    return handle.room.hasPendingChanges()
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -124,7 +140,7 @@ export function WorkspaceProvider({
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([])
   const [workspacesLoaded, setWorkspacesLoaded] = useState(false)
   const [workspaceId, setWorkspaceId] = useState<string | null>(null)
-  const [treeData, setTreeData] = useState<KeyedData<WorkspaceTreeEntry[]> | null>(null)
+  const [treeData, setTreeData] = useState<TreeData | null>(null)
   const [memberData, setMemberData] = useState<KeyedData<MemberView[]> | null>(null)
   const [inviteData, setInviteData] = useState<KeyedData<InviteView[]> | null>(null)
   const [recoveryData, setRecoveryData] = useState<KeyedData<RecoveryRecord[]> | null>(null)
@@ -132,6 +148,8 @@ export function WorkspaceProvider({
   const [peers, setPeers] = useState<WorkspacePresencePeer[]>([])
 
   const transportRef = useRef<WorkspaceSocketTransport | null>(null)
+  const workspaceIdRef = useRef<string | null>(null)
+  const treeDataRef = useRef<TreeData | null>(null)
   // One lazily-created mutable store for room state, so re-renders never
   // allocate throwaway Map/Set instances in initializers.
   const [roomStore] = useState(() => ({
@@ -144,6 +162,15 @@ export function WorkspaceProvider({
     roomStore.snapshot = new Map(roomStore.rooms)
     for (const fn of roomStore.listeners) fn()
   }, [roomStore])
+
+  const commitTreeData = useCallback((next: TreeData) => {
+    treeDataRef.current = next
+    setTreeData(next)
+  }, [])
+
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId
+  }, [workspaceId])
 
   const refreshWorkspaces = useCallback(async () => {
     const result = await api.workspaces.list()
@@ -180,8 +207,16 @@ export function WorkspaceProvider({
   const refreshTree = useCallback(async () => {
     if (!workspaceId) return
     const result = await api.workspaces.tree({ workspaceId })
-    setTreeData({ workspaceId, value: result.entries })
-  }, [workspaceId])
+    if (workspaceIdRef.current !== workspaceId) return
+    const current = treeDataRef.current
+    if (current?.workspaceId === workspaceId && current.seq > result.seq) return
+    commitTreeData({
+      workspaceId,
+      value: result.entries,
+      seq: result.seq,
+      loaded: true,
+    })
+  }, [commitTreeData, workspaceId])
 
   const refreshMembers = useCallback(async () => {
     if (!workspaceId) return
@@ -204,6 +239,122 @@ export function WorkspaceProvider({
     })
   }, [workspaceId])
 
+  const resurrectRoomFromPendingDelete = useCallback(
+    async (handle: RoomHandle) => {
+      const transport = transportRef.current
+      if (!transport) return
+
+      let localText: string
+      try {
+        localText = handle.room.getTextContent()
+      } catch {
+        return
+      }
+
+      transport.registerSnapshotSeed(handle.fileId, {
+        observedPath: handle.path,
+        initialContent: localText,
+      })
+
+      let snapshot: Uint8Array
+      try {
+        snapshot = await transport.fetchSnapshot(handle.fileId)
+      } catch {
+        return
+      }
+
+      const current = roomStore.rooms.get(handle.fileId)
+      if (current?.room !== handle.room) return
+
+      const doc = LoroFileDoc.fromSnapshot(snapshot)
+      const room = new LoroRoomClient({
+        fileId: handle.fileId,
+        observedPath: handle.path,
+        deviceId,
+        transport,
+        hydrate: { snapshot, syncedVersion: doc.contentVersion() },
+      })
+      handle.room.disconnect()
+      const nextHandle: RoomHandle = {
+        fileId: handle.fileId,
+        path: handle.path,
+        room,
+        status: 'connecting',
+      }
+      roomStore.rooms.set(handle.fileId, nextHandle)
+      emitRooms()
+
+      try {
+        await room.connect()
+        const connected = roomStore.rooms.get(handle.fileId)
+        if (connected?.room !== room) return
+        if (room.getTextContent() !== localText) {
+          await room.setTextContent(localText)
+          await room.flush()
+        }
+        const latest = roomStore.rooms.get(handle.fileId)
+        if (latest?.room !== room) return
+        roomStore.rooms.set(handle.fileId, { ...latest, status: 'ready' })
+        emitRooms()
+        await refreshTree().catch(() => {})
+      } catch (error: unknown) {
+        const failed = roomStore.rooms.get(handle.fileId)
+        if (failed?.room !== room) return
+        roomStore.rooms.set(handle.fileId, {
+          ...nextHandle,
+          status: 'error',
+          error: error instanceof Error ? error.message : 'failed to resurrect file',
+        })
+        emitRooms()
+      }
+    },
+    [deviceId, emitRooms, refreshTree, roomStore],
+  )
+
+  const handleTreeEvent = useCallback(
+    (event: TreeWireEvent) => {
+      if (!workspaceId || workspaceIdRef.current !== workspaceId) return
+      const current = treeDataRef.current
+      if (!current || current.workspaceId !== workspaceId) {
+        void refreshTree().catch(() => {})
+        return
+      }
+      if (event.seq <= current.seq) return
+
+      const hadGap = event.seq > current.seq + 1
+      if (event.type === 'delete') {
+        const handle = roomStore.rooms.get(event.fileId)
+        if (handle && roomHasPendingChanges(handle)) {
+          commitTreeData({ ...current, seq: event.seq })
+          void resurrectRoomFromPendingDelete(handle).catch(() => {})
+          return
+        }
+      }
+
+      const nextTree = applyTreeWireEvent({ seq: current.seq, entries: current.value }, event)
+      commitTreeData({ ...current, value: nextTree.entries, seq: nextTree.seq })
+
+      let roomsChanged = false
+      if (event.type === 'rename') {
+        const handle = roomStore.rooms.get(event.fileId)
+        if (handle && handle.path !== event.newPath) {
+          roomStore.rooms.set(event.fileId, { ...handle, path: event.newPath })
+          roomsChanged = true
+        }
+      } else if (event.type === 'delete') {
+        const handle = roomStore.rooms.get(event.fileId)
+        if (handle) {
+          handle.room.disconnect()
+          roomStore.rooms.delete(event.fileId)
+          roomsChanged = true
+        }
+      }
+      if (roomsChanged) emitRooms()
+      if (hadGap) void refreshTree().catch(() => {})
+    },
+    [commitTreeData, emitRooms, refreshTree, resurrectRoomFromPendingDelete, roomStore, workspaceId],
+  )
+
   // Load the basics on workspace switch. No reset needed: the keyed
   // derivations below ignore data from any other workspace.
   useEffect(() => {
@@ -214,12 +365,15 @@ export function WorkspaceProvider({
     void refreshRecovery().catch(() => {})
   }, [workspaceId, refreshTree, refreshMembers, refreshInvites, refreshRecovery])
 
-  const tree = treeData?.workspaceId === workspaceId ? treeData.value : EMPTY_TREE
+  const currentTreeData = treeData?.workspaceId === workspaceId ? treeData : null
+  const tree = currentTreeData ? currentTreeData.value : EMPTY_TREE
+  const treeLoaded = currentTreeData?.loaded ?? false
   const members = memberData?.workspaceId === workspaceId ? memberData.value : EMPTY_MEMBERS
   const invites = inviteData?.workspaceId === workspaceId ? inviteData.value : EMPTY_INVITES
   const recovery = recoveryData?.workspaceId === workspaceId ? recoveryData.value : EMPTY_RECOVERY
 
-  // The tree has no push channel on this wire — poll while connected.
+  // Tree broadcasts are the fast path; polling is the full-state backstop
+  // for missed events and content-edit metadata.
   useEffect(() => {
     if (!workspaceId || !autoSync) return
     const timer = window.setInterval(() => {
@@ -260,6 +414,7 @@ export function WorkspaceProvider({
     })
     const presence = new WorkspacePresence({ transport })
     const unsubscribePresence = presence.subscribe(() => setPeers(presence.peers()))
+    const unsubscribeTreeEvents = transport.subscribeTreeEvents(handleTreeEvent)
     let cancelled = false
     void presence
       .start()
@@ -273,6 +428,7 @@ export function WorkspaceProvider({
     return () => {
       cancelled = true
       unsubscribePresence()
+      unsubscribeTreeEvents()
       presence.stop()
       for (const handle of roomStore.rooms.values()) {
         handle.room.disconnect()
@@ -284,7 +440,17 @@ export function WorkspaceProvider({
       setPeers([])
       setSocketStatus('closed')
     }
-  }, [workspaceId, autoSync, deviceId, principalId, user.name, user.email, roomStore, emitRooms])
+  }, [
+    workspaceId,
+    autoSync,
+    deviceId,
+    principalId,
+    user.name,
+    user.email,
+    roomStore,
+    emitRooms,
+    handleTreeEvent,
+  ])
 
   const openFile = useCallback(
     (fileId: string, path: string) => {
@@ -384,6 +550,7 @@ export function WorkspaceProvider({
     createWorkspace,
     refreshWorkspaces,
     tree,
+    treeLoaded,
     refreshTree,
     createFile,
     submitTreeOps,
