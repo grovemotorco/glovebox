@@ -17,8 +17,14 @@ import type {
   WorkspaceTreeEntry,
 } from '@glovebox/api'
 import { createBrowserUser, type AwarenessUser } from '@glovebox/core'
-import { LoroFileDoc, LoroRoomClient } from '@glovebox/sync/loro'
-import { WorkspacePresence, type WorkspacePresencePeer } from '@glovebox/sync/client'
+import type { LoroRoomClient } from '@glovebox/sync/loro'
+import {
+  IndexedDbClientStorage,
+  MemoryClientStorage,
+  WorkspacePresence,
+  WorkspaceSyncEngine,
+  type WorkspacePresencePeer,
+} from '@glovebox/sync/client'
 import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { api, getOrCreateDeviceId } from '../lib/api.ts'
 import {
@@ -86,6 +92,11 @@ const WorkspaceContext = createContext<WorkspaceContextValue | null>(null)
 const ACTIVE_WORKSPACE_KEY = 'glovebox.activeWorkspace'
 const TREE_POLL_INTERVAL_MS = 10_000
 
+function createClientStorage(workspaceId: string) {
+  if (typeof indexedDB === 'undefined') return new MemoryClientStorage()
+  return new IndexedDbClientStorage(workspaceId)
+}
+
 /**
  * Per-workspace data tagged with the workspace that produced it. Consumers
  * derive against the CURRENT selection, so a workspace switch can neither
@@ -148,6 +159,8 @@ export function WorkspaceProvider({
   const [peers, setPeers] = useState<WorkspacePresencePeer[]>([])
 
   const transportRef = useRef<WorkspaceSocketTransport | null>(null)
+  const engineRef = useRef<WorkspaceSyncEngine | null>(null)
+  const engineReadyRef = useRef<Promise<void> | null>(null)
   const workspaceIdRef = useRef<string | null>(null)
   const treeDataRef = useRef<TreeData | null>(null)
   // One lazily-created mutable store for room state, so re-renders never
@@ -241,65 +254,24 @@ export function WorkspaceProvider({
 
   const resurrectRoomFromPendingDelete = useCallback(
     async (handle: RoomHandle) => {
-      const transport = transportRef.current
-      if (!transport) return
+      const engine = engineRef.current
+      if (!engine) return
 
-      let localText: string
-      try {
-        localText = handle.room.getTextContent()
-      } catch {
-        return
-      }
-
-      transport.registerSnapshotSeed(handle.fileId, {
-        observedPath: handle.path,
-        initialContent: localText,
-      })
-
-      let snapshot: Uint8Array
-      try {
-        snapshot = await transport.fetchSnapshot(handle.fileId)
-      } catch {
-        return
-      }
-
-      const current = roomStore.rooms.get(handle.fileId)
-      if (current?.room !== handle.room) return
-
-      const doc = LoroFileDoc.fromSnapshot(snapshot)
-      const room = new LoroRoomClient({
-        fileId: handle.fileId,
-        observedPath: handle.path,
-        deviceId,
-        transport,
-        hydrate: { snapshot, syncedVersion: doc.contentVersion() },
-      })
-      handle.room.disconnect()
-      const nextHandle: RoomHandle = {
-        fileId: handle.fileId,
-        path: handle.path,
-        room,
-        status: 'connecting',
-      }
+      const nextHandle: RoomHandle = { ...handle, status: 'connecting' }
       roomStore.rooms.set(handle.fileId, nextHandle)
       emitRooms()
 
       try {
-        await room.connect()
-        const connected = roomStore.rooms.get(handle.fileId)
-        if (connected?.room !== room) return
-        if (room.getTextContent() !== localText) {
-          await room.setTextContent(localText)
-          await room.flush()
-        }
+        const room = await engine.resurrectDeletedFile(handle.fileId)
+        if (!room) return
         const latest = roomStore.rooms.get(handle.fileId)
-        if (latest?.room !== room) return
-        roomStore.rooms.set(handle.fileId, { ...latest, status: 'ready' })
+        if (!latest || latest.room !== handle.room) return
+        roomStore.rooms.set(handle.fileId, { ...latest, room, status: 'ready' })
         emitRooms()
         await refreshTree().catch(() => {})
       } catch (error: unknown) {
         const failed = roomStore.rooms.get(handle.fileId)
-        if (failed?.room !== room) return
+        if (failed?.room !== handle.room) return
         roomStore.rooms.set(handle.fileId, {
           ...nextHandle,
           status: 'error',
@@ -308,7 +280,7 @@ export function WorkspaceProvider({
         emitRooms()
       }
     },
-    [deviceId, emitRooms, refreshTree, roomStore],
+    [emitRooms, refreshTree, roomStore],
   )
 
   const handleTreeEvent = useCallback(
@@ -338,13 +310,14 @@ export function WorkspaceProvider({
       if (event.type === 'rename') {
         const handle = roomStore.rooms.get(event.fileId)
         if (handle && handle.path !== event.newPath) {
+          engineRef.current?.updateFilePath(event.fileId, event.newPath)
           roomStore.rooms.set(event.fileId, { ...handle, path: event.newPath })
           roomsChanged = true
         }
       } else if (event.type === 'delete') {
         const handle = roomStore.rooms.get(event.fileId)
         if (handle) {
-          handle.room.disconnect()
+          engineRef.current?.closeFile(event.fileId)
           roomStore.rooms.delete(event.fileId)
           roomsChanged = true
         }
@@ -407,6 +380,16 @@ export function WorkspaceProvider({
       },
     })
     transportRef.current = transport
+    const engine = new WorkspaceSyncEngine({
+      workspaceId,
+      deviceId,
+      storage: createClientStorage(workspaceId),
+      transport,
+    })
+    engineRef.current = engine
+    engineReadyRef.current = engine.start().catch(() => {
+      if (engineRef.current === engine) setSocketStatus('closed')
+    })
 
     const awarenessUser: AwarenessUser = createBrowserUser({
       id: principalId,
@@ -430,6 +413,9 @@ export function WorkspaceProvider({
       unsubscribePresence()
       unsubscribeTreeEvents()
       presence.stop()
+      engine.stop()
+      engineRef.current = null
+      engineReadyRef.current = null
       for (const handle of roomStore.rooms.values()) {
         handle.room.disconnect()
       }
@@ -454,52 +440,51 @@ export function WorkspaceProvider({
 
   const openFile = useCallback(
     (fileId: string, path: string) => {
-      const transport = transportRef.current
-      if (!transport || roomStore.rooms.has(fileId)) return
+      const engine = engineRef.current
+      if (!engine || roomStore.rooms.has(fileId)) return
 
-      const room = new LoroRoomClient({ fileId, observedPath: path, deviceId, transport })
-      const handle: RoomHandle = { fileId, path, room, status: 'connecting' }
-      roomStore.rooms.set(fileId, handle)
-      emitRooms()
-
-      void room
-        .connect()
-        .then(() => {
-          const current = roomStore.rooms.get(fileId)
-          if (current?.room !== room) return
-          roomStore.rooms.set(fileId, { ...handle, status: 'ready' })
-          emitRooms()
+      void (async () => {
+        await engineReadyRef.current
+        if (engineRef.current !== engine) return
+        const room = await engine.openFile(fileId, path)
+        const current = roomStore.rooms.get(fileId)
+        if (current && current.room !== room) return
+        roomStore.rooms.set(fileId, { fileId, path, room, status: 'ready' })
+        emitRooms()
+      })().catch((error: unknown) => {
+        const room = engine.client(fileId)
+        if (!room) return
+        roomStore.rooms.set(fileId, {
+          fileId,
+          path,
+          room,
+          status: 'error',
+          error: error instanceof Error ? error.message : 'failed to open file',
         })
-        .catch((error: unknown) => {
-          const current = roomStore.rooms.get(fileId)
-          if (current?.room !== room) return
-          roomStore.rooms.set(fileId, {
-            ...handle,
-            status: 'error',
-            error: error instanceof Error ? error.message : 'failed to open file',
-          })
-          emitRooms()
-        })
+        emitRooms()
+      })
     },
-    [deviceId, roomStore, emitRooms],
+    [roomStore, emitRooms],
   )
 
   const createFile = useCallback(
     async (path: string): Promise<string> => {
-      const transport = transportRef.current
-      if (!transport) throw new Error('Not connected — enable auto-sync to create files')
+      const engine = engineRef.current
+      if (!engine) throw new Error('Not connected — enable auto-sync to create files')
       const fileId = `f_${crypto.randomUUID()}`
-      transport.registerSnapshotSeed(fileId, {
-        observedPath: path,
-        initialContent: `# ${baseName(path).replace(/\.md$/i, '')}\n\n`,
-      })
-      openFile(fileId, path)
-      const handle = roomStore.rooms.get(fileId)
-      if (handle) await handle.room.connect()
+      await engineReadyRef.current
+      if (engineRef.current !== engine) throw new Error('Workspace changed while creating file')
+      const room = await engine.openFile(
+        fileId,
+        path,
+        `# ${baseName(path).replace(/\.md$/i, '')}\n\n`,
+      )
+      roomStore.rooms.set(fileId, { fileId, path, room, status: 'ready' })
+      emitRooms()
       await refreshTree().catch(() => {})
       return fileId
     },
-    [openFile, roomStore, refreshTree],
+    [emitRooms, roomStore, refreshTree],
   )
 
   const submitTreeOps = useCallback(

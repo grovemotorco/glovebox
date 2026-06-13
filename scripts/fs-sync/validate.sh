@@ -32,7 +32,7 @@ SA="${FS_SYNC_SESSION_A:-a}"
 SB="${FS_SYNC_SESSION_B:-b}"
 BASE="${FS_SYNC_BASE:-/tmp/glovebox-fs-sync}"
 MOUNT="$BASE/mount"
-EMAIL="${FS_SYNC_EMAIL:-fs-sync@glovebox.test}"
+EMAIL="${FS_SYNC_EMAIL:-fs-sync-$(date +%s)@glovebox.test}"
 PASS_WORD="${FS_SYNC_PASS:-fs-sync-pass-123}"
 CLI="$ROOT/apps/cli/dist/glovebox.mjs"
 
@@ -106,6 +106,7 @@ recovery_list() { api "$SA" documents/recoveryList "{\"workspaceId\":\"$(wsid)\"
 
 ws_batch() { page "$1" ws-batch.js "__WSID__=$(wsid)" "__OPS__=$2"; }
 ws_raw() { page "$1" ws-raw.js "__WSID__=$(wsid)" "__MSG__=$2"; }
+opaque_oversize() { page "$1" opaque-oversize.js "__WSID__=$(wsid)" "__FILEID__=$2" "__PATH__=$3" "__OPID__=$4"; }
 
 type_text() { page "$1" type-text.js "__TEXT__=$2" "__WHERE__=${3:-start}"; }
 editor_text() { page "$1" editor-text.js | pyj "d['text']"; }
@@ -202,16 +203,17 @@ ensure_signed_in() { # ensure_signed_in <session>
     return 0
   fi
   echo "session $s: signing in as $EMAIL"
+  agent-browser --session "$s" find role button click --name "Sign in" >/dev/null 2>&1 || true
   agent-browser --session "$s" fill "input[aria-label='Email']" "$EMAIL" >/dev/null 2>&1
   agent-browser --session "$s" fill "input[aria-label='Password']" "$PASS_WORD" >/dev/null 2>&1
-  agent-browser --session "$s" find role button click --name "Sign in" >/dev/null 2>&1
+  agent-browser --session "$s" press Enter >/dev/null 2>&1
   if ! poll 15 "signed in" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'"; then
     echo "session $s: sign-in failed — creating account"
     agent-browser --session "$s" find role button click --name "Create account" >/dev/null 2>&1
     agent-browser --session "$s" fill "input[aria-label='Name']" "fs-sync validator" >/dev/null 2>&1
     agent-browser --session "$s" fill "input[aria-label='Email']" "$EMAIL" >/dev/null 2>&1
     agent-browser --session "$s" fill "input[aria-label='Password']" "$PASS_WORD" >/dev/null 2>&1
-    agent-browser --session "$s" find role button click --name "Create account" >/dev/null 2>&1
+    agent-browser --session "$s" press Enter >/dev/null 2>&1
     poll 15 "account created" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'" || return 1
   fi
 }
@@ -221,6 +223,19 @@ cmd_setup() { # setup [fresh] — fresh creates a NEW workspace + empty mount,
               # scenarios independent either way; fresh also repoints both
               # browser sessions at the new workspace).
   mkdir -p "$BASE/mount"
+  if [ "${1:-}" = "fresh" ]; then
+    local s
+    for s in "$SA" "$SB"; do
+      # Fresh means hermetic: do not accept whatever account a reused
+      # agent-browser session happened to have from a previous run.
+      agent-browser --session "$s" open "$URL/" >/dev/null 2>&1 || true
+      agent-browser --session "$s" cookies clear >/dev/null 2>&1 || true
+      agent-browser --session "$s" storage local clear >/dev/null 2>&1 || true
+      agent-browser --session "$s" storage session clear >/dev/null 2>&1 || true
+      agent-browser --session "$s" open "$URL/" >/dev/null 2>&1 || true
+      agent-browser --session "$s" wait --load networkidle >/dev/null 2>&1 || true
+    done
+  fi
   ensure_signed_in "$SA" || { echo "setup: session $SA sign-in failed" >&2; exit 1; }
   ensure_signed_in "$SB" || { echo "setup: session $SB sign-in failed" >&2; exit 1; }
 
@@ -298,8 +313,9 @@ s_text_concurrent_merge() {
   open_file "$SA" "merge-$n.md" || { bad "open in $SA"; return; }
   # Concurrent: browser types at start while disk appends at end.
   type_text "$SA" "[[CM-A-$n]]" start >/dev/null &
+  local typer=$!
   printf '[[CM-D-%s]]\n' "$n" >> "$MOUNT/merge-$n.md"
-  wait
+  wait "$typer"
   check_poll "$CONVERGE_S" "disk has BOTH markers (no lost chars)" \
     sh -c "grep -q 'CM-A-$n' '$MOUNT/merge-$n.md' && grep -q 'CM-D-$n' '$MOUNT/merge-$n.md'"
   check_poll "$CONVERGE_S" "editor $SA has BOTH markers" \
@@ -333,8 +349,9 @@ s_create_collision() {
   # Same path created from disk and browser in the same instant: server
   # suffix-collision policy (file.md -> file-2.md) must keep BOTH.
   printf 'from disk %s\n' "$n" > "$MOUNT/col-$n.md" &
+  local writer=$!
   create_file_ui "$SB" "col-$n.md"
-  wait
+  wait "$writer"
   check_poll "$CONVERGE_S" "both collision survivors live on server" \
     sh -c "[ \$($0 __count_prefix col-$n) -eq 2 ]"
   check_poll "$CONVERGE_S" "both collision survivors on disk" \
@@ -489,6 +506,117 @@ s_delete_browser_to_disk() {
   local ack; ack="$(ws_batch "$SB" "[{\"type\":\"file.deleteIntent\",\"opId\":\"bd-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"path\":\"bdel-$n.md\"}]")"
   check "browser delete accepted" sh -c "echo '$ack' | grep -q 'batch.ack'"
   check_poll "$CONVERGE_S" "file removed from disk" sh -c "test ! -f '$MOUNT/bdel-$n.md'"
+}
+
+s_browser_delete_vs_edit_resurrect() {
+  local n; n="$(nonce)"
+  printf '# browser delete race\n' > "$MOUNT/bder-$n.md"
+  poll "$CONVERGE_S" "file synced" sh -c "$0 __server_has bder-$n.md" || { bad "seed never synced"; return; }
+  open_file "$SB" "bder-$n.md" || { bad "open bder-$n.md in $SB"; return; }
+  local fid seq; fid="$(file_id "bder-$n.md")"; seq="$(server_seq)"
+  type_text "$SB" "[[BDE-$n]]" end >/dev/null &
+  local typer=$!
+  local ack; ack="$(ws_batch "$SA" "[{\"type\":\"file.deleteIntent\",\"opId\":\"bde-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"path\":\"bder-$n.md\"}]")"
+  wait "$typer"
+  check "browser-origin delete race got a batch response" sh -c "echo '$ack' | grep -q 'batch.ack'"
+  check_poll 20 "browser pending edit survives remote delete on disk (RESURRECT)" \
+    sh -c "grep -q 'BDE-$n' '$MOUNT/bder-$n.md'"
+  check_poll 20 "browser pending edit survives remote delete on server" \
+    sh -c "$0 __server_text bder-$n.md | grep -q 'BDE-$n'"
+  open_file "$SA" "bder-$n.md" || { bad "open resurrected bder-$n.md in $SA"; return; }
+  check_poll "$CONVERGE_S" "other browser sees resurrected edit" sh -c "$0 __editor_has $SA BDE-$n"
+}
+
+s_tree_after_content_no_gap() {
+  local n; n="$(nonce)"
+  printf '# ordered\n' > "$MOUNT/order-$n.md"
+  printf '# side\n' > "$MOUNT/order-side-$n.md"
+  poll "$CONVERGE_S" "ordered fixtures synced" \
+    sh -c "$0 __server_has order-$n.md && $0 __server_has order-side-$n.md" || { bad "fixtures never synced"; return; }
+  open_file "$SA" "order-$n.md" || { bad "open order-$n.md in $SA"; return; }
+  open_file "$SB" "order-$n.md" || { bad "open order-$n.md in $SB"; return; }
+  type_text "$SA" "[[ORD-1-$n]]" end >/dev/null
+  check_poll "$CONVERGE_S" "first content edit reaches other browser" sh -c "$0 __editor_has $SB ORD-1-$n"
+  local fid seq ack; fid="$(file_id "order-side-$n.md")"; seq="$(server_seq)"
+  ack="$(ws_batch "$SB" "[{\"type\":\"file.rename\",\"opId\":\"ord-rn-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"fromPath\":\"order-side-$n.md\",\"toPath\":\"order-side2-$n.md\"}]")"
+  check "interleaved tree op accepted" sh -c "echo '$ack' | grep -q 'batch.ack'"
+  check_poll "$CONVERGE_S" "interleaved rename reaches disk" test -f "$MOUNT/order-side2-$n.md"
+  type_text "$SA" "[[ORD-2-$n]]" end >/dev/null
+  check_poll "$CONVERGE_S" "content after tree op reaches other browser without gap repair fallout" \
+    sh -c "$0 __editor_has $SB ORD-1-$n && $0 __editor_has $SB ORD-2-$n"
+  check_poll "$CONVERGE_S" "content after tree op reaches disk" \
+    sh -c "grep -q 'ORD-1-$n' '$MOUNT/order-$n.md' && grep -q 'ORD-2-$n' '$MOUNT/order-$n.md'"
+}
+
+s_open_file_rename_delete_room() {
+  local n; n="$(nonce)"
+  printf '# open room\n' > "$MOUNT/openrd-$n.md"
+  poll "$CONVERGE_S" "open-room fixture synced" sh -c "$0 __server_has openrd-$n.md" || { bad "fixture never synced"; return; }
+  open_file "$SA" "openrd-$n.md" || { bad "open openrd-$n.md in $SA"; return; }
+  type_text "$SA" "[[OPEN-BEFORE-$n]]" end >/dev/null
+  check_poll "$CONVERGE_S" "pre-rename edit on disk" sh -c "grep -q 'OPEN-BEFORE-$n' '$MOUNT/openrd-$n.md'"
+  local fid seq ack; fid="$(file_id "openrd-$n.md")"; seq="$(server_seq)"
+  ack="$(ws_batch "$SB" "[{\"type\":\"file.rename\",\"opId\":\"open-rn-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"fromPath\":\"openrd-$n.md\",\"toPath\":\"openrd2-$n.md\"}]")"
+  check "remote rename of open file accepted" sh -c "echo '$ack' | grep -q 'batch.ack'"
+  check_poll "$CONVERGE_S" "open editor kept its room across rename" sh -c "$0 __editor_has $SA OPEN-BEFORE-$n"
+  type_text "$SA" "[[OPEN-AFTER-$n]]" end >/dev/null
+  check_poll "$CONVERGE_S" "post-rename edit writes to renamed disk path" \
+    sh -c "grep -q 'OPEN-AFTER-$n' '$MOUNT/openrd2-$n.md' && test ! -f '$MOUNT/openrd-$n.md'"
+  seq="$(server_seq)"
+  ack="$(ws_batch "$SB" "[{\"type\":\"file.deleteIntent\",\"opId\":\"open-del-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"path\":\"openrd2-$n.md\"}]")"
+  check "remote delete of open file accepted" sh -c "echo '$ack' | grep -q 'batch.ack'"
+  check_poll "$CONVERGE_S" "deleted open file is removed from disk" sh -c "test ! -f '$MOUNT/openrd2-$n.md'"
+  check_poll 20 "deleted open file closes the editor" sh -c "$0 __editor_missing $SA"
+}
+
+s_opaque_oversize_rejected() {
+  local n out; n="$(nonce)"
+  out="$(opaque_oversize "$SB" "big_$n" "big-$n.bin" "big-$n")"
+  check "opaque >1MiB rejected as too-large" \
+    sh -c "echo '$out' | grep -q 'submit.rejected' && echo '$out' | grep -q 'too-large'"
+  check "oversize opaque row not created" sh -c "! $0 __server_has big-$n.bin"
+  check "oversize opaque bytes not materialized on disk" sh -c "test ! -f '$MOUNT/big-$n.bin'"
+}
+
+s_crlf_normalize_e2e() {
+  local n; n="$(nonce)"
+  printf 'crlf-a\r\ncrlf-b\r\n' > "$MOUNT/crlf-$n.md"
+  poll "$CONVERGE_S" "crlf file synced" sh -c "$0 __server_has crlf-$n.md" || { bad "crlf fixture never synced"; return; }
+  check_poll 20 "server text normalized to LF" sh -c "$0 __server_text crlf-$n.md | python3 -c 'import sys; s=sys.stdin.read(); assert \"\\r\" not in s and \"crlf-a\\ncrlf-b\" in s'"
+  open_file "$SB" "crlf-$n.md" || { bad "open crlf-$n.md in $SB"; return; }
+  check_poll "$CONVERGE_S" "browser editor sees LF-normalized text" sh -c "$0 __editor_no_cr $SB"
+  check_poll 20 "disk view is repaired to LF-normalized bytes" \
+    sh -c "python3 -c 'import pathlib,sys; data=pathlib.Path(\"$MOUNT/crlf-$n.md\").read_bytes(); sys.exit(0 if b\"\\r\" not in data else 1)'"
+}
+
+s_stopped_daemon_create_collision() {
+  local n; n="$(nonce)"
+  daemon_stop || { bad "daemon stop for stopped collision"; return; }
+  printf 'LOCAL-A-%s\n' "$n" > "$MOUNT/stopped-col-$n.md"
+  create_file_ui "$SB" "stopped-col-$n.md" || { bad "browser create while daemon stopped"; daemon_start; return; }
+  open_file "$SB" "stopped-col-$n.md" || { bad "open browser-created stopped-col-$n.md"; daemon_start; return; }
+  type_text "$SB" "[[BROWSER-B-$n]]" end >/dev/null
+  poll "$CONVERGE_S" "browser create reached server while daemon stopped" sh -c "$0 __server_has stopped-col-$n.md" || { bad "browser create never synced"; daemon_start; return; }
+  daemon_start || { bad "daemon restart for stopped collision"; return; }
+  check_poll 20 "stopped-daemon same-path create keeps both server rows" \
+    sh -c "[ \$($0 __count_prefix stopped-col-$n) -eq 2 ]"
+  check_poll 20 "stopped-daemon same-path create keeps both disk files" \
+    sh -c "[ \$(ls '$MOUNT' | grep -c '^stopped-col-$n') -eq 2 ]"
+  check_poll 20 "both stopped-daemon collision payloads survived" \
+    sh -c "cat '$MOUNT'/stopped-col-$n*.md | grep -q 'LOCAL-A-$n' && cat '$MOUNT'/stopped-col-$n*.md | grep -q 'BROWSER-B-$n'"
+}
+
+s_fresh_tab_midstream_repair() {
+  local n; n="$(nonce)"
+  printf '# fresh tab\n' > "$MOUNT/fresh-$n.md"
+  poll "$CONVERGE_S" "fresh-tab fixture synced" sh -c "$0 __server_has fresh-$n.md" || { bad "fixture never synced"; return; }
+  open_file "$SA" "fresh-$n.md" || { bad "open fresh-$n.md in $SA"; return; }
+  type_text "$SA" "[[FRESH-$n]]" end >/dev/null
+  agent-browser --session "$SB" open "$URL/" >/dev/null 2>&1
+  agent-browser --session "$SB" wait --load networkidle >/dev/null 2>&1
+  open_file "$SB" "fresh-$n.md" || { bad "open fresh-$n.md in fresh $SB"; return; }
+  check_poll "$CONVERGE_S" "fresh browser tab hydrates mid-stream edit" sh -c "$0 __editor_has $SB FRESH-$n"
+  check_poll "$CONVERGE_S" "fresh browser tab and disk agree" sh -c "grep -q 'FRESH-$n' '$MOUNT/fresh-$n.md'"
 }
 
 s_bulk_delete_window_guard() {
@@ -683,9 +811,11 @@ s_concurrent_three_writers() {
   open_file "$SA" "tri-$n.md" || { bad "open in $SA"; return; }
   open_file "$SB" "tri-$n.md" || { bad "open in $SB"; return; }
   type_text "$SA" "[[TRI-A-$n]]" start >/dev/null &
+  local typer_a=$!
   type_text "$SB" "[[TRI-B-$n]]" end >/dev/null &
+  local typer_b=$!
   printf '[[TRI-D-%s]]\n' "$n" >> "$MOUNT/tri-$n.md"
-  wait
+  wait "$typer_a" "$typer_b"
   local want="TRI-A-$n TRI-B-$n TRI-D-$n" m
   for m in $want; do
     check_poll "$CONVERGE_S" "disk has $m" sh -c "grep -q '$m' '$MOUNT/tri-$n.md'"
@@ -715,6 +845,13 @@ s_rename_vs_edit
 s_delete_tombstone_gate
 s_delete_vs_edit_resurrect
 s_delete_browser_to_disk
+s_browser_delete_vs_edit_resurrect
+s_tree_after_content_no_gap
+s_open_file_rename_delete_room
+s_opaque_oversize_rejected
+s_crlf_normalize_e2e
+s_stopped_daemon_create_collision
+s_fresh_tab_midstream_repair
 s_bulk_delete_window_guard
 s_sentinel_freeze
 s_md_opaque_rename_boundary
@@ -743,6 +880,8 @@ case "${1:-help}" in
   __entry_field)  entry_field "$2" "$3"; exit 0 ;;
   __count_prefix) tree_json | pyj "sum(1 for e in d['body']['json']['entries'] if e['path'].startswith('$2') and not e['tombstone'])"; exit 0 ;;
   __editor_has)   editor_text "$2" | grep -q "$3"; exit $? ;;
+  __editor_missing) page "$2" editor-text.js | grep -q 'no .cm-content'; exit $? ;;
+  __editor_no_cr)  editor_text "$2" | python3 -c 'import sys; sys.exit(0 if "\r" not in sys.stdin.read() else 1)'; exit $? ;;
   __recovery)     recovery_list; exit 0 ;;
   __live_count)   live_paths | wc -w | tr -d ' '; exit 0 ;;
 esac
@@ -756,6 +895,9 @@ case "$cmd" in
   list)     echo "$SCENARIO_ORDER" ;;
   run)
     : > "$FAILLOG"
+    if [ -z "$(daemon_pid)" ]; then
+      daemon_start || { echo "run: daemon failed to start (see $BASE/daemon.log)" >&2; exit 1; }
+    fi
     if [ "${1:-all}" = "all" ]; then
       for s in $SCENARIO_ORDER; do run_scenario "$s"; done
     else

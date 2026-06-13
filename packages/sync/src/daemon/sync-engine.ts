@@ -13,6 +13,7 @@ import {
 import type { EventsSinceResult, WireWorkspaceEvent } from '../client/sync-engine.ts'
 import type { WorkspaceBatchWireOp } from '../server/workspace-server.ts'
 import type { BatchAcceptedOp, BatchDeferredOp } from '../server/workspace-batch-applier.ts'
+import { getSuffixedPath } from '../server/workspace-store.ts'
 import { scanMount, type DaemonFileView } from './scanner.ts'
 import {
   DaemonStateStore,
@@ -575,10 +576,20 @@ export class DaemonSyncEngine {
    * writing a path we have no watermark for yet).
    */
   async #applyRemoteCreate(event: WireWorkspaceEvent): Promise<void> {
-    if (this.#views.has(event.fileId)) return // Our own create echoing back.
     const entry = event.entry as WorkspaceTreeEntry | undefined
     const path = entry?.path ?? event.path
     if (!path) return
+    const existing = this.#views.get(event.fileId)
+    if (existing) {
+      if (existing.path !== path) {
+        await this.#applyRemoteRename({
+          type: 'rename',
+          fileId: event.fileId,
+          newPath: path,
+        } as WireWorkspaceEvent)
+      }
+      return
+    }
     for (const view of this.#views.values()) {
       if (view.path === path) return // Local file occupies the path; scan owns it.
     }
@@ -592,11 +603,7 @@ export class DaemonSyncEngine {
         await this.#bindTreeEntry(entry)
         return
       }
-      // A local unknown file with DIFFERENT content sits at this path —
-      // scan will register it as its own create and the server's path
-      // policy adjudicates. Recorded limitation: this remote file stays
-      // undiscovered on this mount.
-      return
+      await this.#moveUnknownLocalCollision(path)
     }
     if (entry?.contentKind === 'opaque') {
       this.#views.set(event.fileId, {
@@ -628,6 +635,22 @@ export class DaemonSyncEngine {
     await this.#attach(event.fileId, { snapshot, syncedVersion: doc.contentVersion() })
     this.#resurrect.add(event.fileId)
     await this.#persistMarkdown(event.fileId)
+  }
+
+  async #moveUnknownLocalCollision(path: string): Promise<void> {
+    const bytes = await this.#fs.readFileBytes(path)
+    const nextPath = await this.#nextLocalSuffixPath(path)
+    await this.#fs.writeFileBytes(nextPath, bytes)
+    await this.#fs.deletePath(path)
+  }
+
+  async #nextLocalSuffixPath(path: string): Promise<string> {
+    for (let suffix = 2; ; suffix += 1) {
+      const candidate = getSuffixedPath(path, suffix)
+      if ([...this.#views.values()].some((view) => view.path === candidate)) continue
+      if ((await this.#fs.hash(candidate).catch(() => null)) !== null) continue
+      return candidate
+    }
   }
 
   /**

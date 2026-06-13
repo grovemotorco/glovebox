@@ -1441,8 +1441,12 @@ describe('remount adoption (ISSUE-0044)', () => {
       entry.path.startsWith('clash'),
     )
     expect(clashRows).toHaveLength(2)
-    expect(fs.getFile('clash.md')).toBe('local version\n')
+    expect(fs.getFile('clash.md')).toBe('remote version\n')
+    expect(fs.getFile('clash-2.md')).toBe('local version\n')
     expect(await host.serverText('file-clash-remote')).toBe('remote version\n')
+    const localSurvivor = clashRows.find((entry) => entry.fileId !== 'file-clash-remote')
+    expect(localSurvivor?.path).toBe('clash-2.md')
+    expect(await host.serverText(localSurvivor!.fileId)).toBe('local version\n')
   })
 
   it('empty adoption is a no-op, persists adoptedAt, and a second boot never re-adopts', async () => {

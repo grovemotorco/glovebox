@@ -976,6 +976,29 @@ export class WorkspaceServer {
       return
     }
 
+    const needsMaterializedCommit =
+      result.appliedUpdates > 0 || !this.#workspace.getByFileId(message.fileId)
+    if (needsMaterializedCommit) {
+      const committed = this.#commitContentUpdate({
+        fileId: message.fileId,
+        observedPath: message.observedPath,
+        text: result.textContent,
+        updateB64: message.loroUpdateB64,
+        contentVersionB64: bytesToBase64(result.contentVersion),
+        modifiedBy: attachment?.principalId ?? 'anonymous',
+        originDeviceId: attachment?.deviceId,
+      })
+      if (!committed) {
+        this.#send(socket, {
+          type: 'submit.rejected',
+          opId: message.opId,
+          fileId: message.fileId,
+          reason: 'too-large',
+        })
+        return
+      }
+    }
+
     const ack: WorkspaceServerMessage = {
       type: 'ack',
       opId: message.opId,
@@ -995,17 +1018,6 @@ export class WorkspaceServer {
         update,
       )
     }
-
-    if (result.appliedUpdates === 0) return
-    this.#commitContentUpdate({
-      fileId: message.fileId,
-      observedPath: message.observedPath,
-      text: result.textContent,
-      updateB64: message.loroUpdateB64,
-      contentVersionB64: bytesToBase64(result.contentVersion),
-      modifiedBy: attachment?.principalId ?? 'anonymous',
-      originDeviceId: attachment?.deviceId,
-    })
 
     // INV-13 at the WS ingress: updates are opaque ops, so EOL policy is
     // enforced POST-application — a CRLF that materialized lands a
@@ -1049,14 +1061,18 @@ export class WorkspaceServer {
     const result = await this.#files.importUpdates(input.fileId, [update], {
       maxTextBytes: this.#limits.maxTextBytes,
     })
-    this.#commitContentUpdate({
-      fileId: input.fileId,
-      text: result.textContent,
-      updateB64: bytesToBase64(update),
-      contentVersionB64: bytesToBase64(result.contentVersion),
-      modifiedBy: input.modifiedBy,
-      originDeviceId: input.originDeviceId ?? input.modifiedBy,
-    })
+    if (
+      !this.#commitContentUpdate({
+        fileId: input.fileId,
+        text: result.textContent,
+        updateB64: bytesToBase64(update),
+        contentVersionB64: bytesToBase64(result.contentVersion),
+        modifiedBy: input.modifiedBy,
+        originDeviceId: input.originDeviceId ?? input.modifiedBy,
+      })
+    ) {
+      throw new Error('materialized view refused server edit')
+    }
     return result
   }
 
@@ -1075,13 +1091,14 @@ export class WorkspaceServer {
     contentVersionB64: string
     modifiedBy: string
     originDeviceId?: string
-  }): void {
+  }): boolean {
     const rolledSeq = this.#rollMaterializedFile(
       input.fileId,
       input.observedPath,
       input.text,
       input.modifiedBy,
     )
+    if (rolledSeq === false) return false
     const body = {
       loroUpdateB64: input.updateB64,
       contentVersionB64: input.contentVersionB64,
@@ -1096,36 +1113,35 @@ export class WorkspaceServer {
     }
     this.#broadcast({ type: 'content.loroUpdate', fileId: input.fileId, seq, ...body })
     this.#trim.noteActivity(input.fileId)
+    return true
   }
 
   /**
    * Write the post-import text through the WorkspaceStore (per-file seq +
-   * materialized view) and return the allocated seq for the wire event, or
-   * null when the wire event must allocate its own (first-contact lazy
-   * registration emits its own 'create' event; store errors degrade to the
-   * event log's counter so the submit still completes).
+   * materialized view) and return the allocated seq for the wire event, null
+   * when first-contact registration already emitted the create event, or
+   * false when the materialized tree row refused the write.
    */
   #rollMaterializedFile(
     fileId: string,
     observedPath: string | undefined,
     text: string,
     modifiedBy: string,
-  ): number | null {
+  ): number | null | false {
     try {
       const row = this.#workspace.getByFileId(fileId)
       if (!row) {
-        this.#registerFile(fileId, observedPath, text, modifiedBy)
-        return null
+        return this.#registerFile(fileId, observedPath, text, modifiedBy) ? null : false
       }
       // Belt-and-braces kind routing: text must never land in an opaque
       // row (writeFileById would store raw text the byte readers then
       // base64-misdecode). The submit gates make this unreachable; keep
       // the invariant local anyway.
-      if (row.contentKind === 'opaque') return null
+      if (row.contentKind === 'opaque') return false
       this.#workspace.writeFileById(fileId, text, { modifiedBy })
       return this.#workspace.getTreeEntryByFileId(fileId)?.seq ?? null
     } catch {
-      return null
+      return false
     }
   }
 
@@ -1139,19 +1155,21 @@ export class WorkspaceServer {
     observedPath: string | undefined,
     text: string,
     modifiedBy: string,
-  ): void {
+  ): boolean {
     try {
-      if (this.#workspace.getByFileId(fileId)) return
+      if (this.#workspace.getByFileId(fileId)) return true
       const path = this.#freePath(observedPath ?? `${fileId}.md`)
       this.#workspace.createFile(path, text, { modifiedBy }, fileId)
       const entry = this.#workspace.getTreeEntryByFileId(fileId)
-      if (!entry || entry.seq === undefined) return
+      if (!entry || entry.seq === undefined) return false
       const body = { path: entry.path, entry }
       this.#events.appendAt(entry.seq, 'create', fileId, JSON.stringify(body))
       this.#broadcast({ type: 'create', fileId, seq: entry.seq, ...body })
+      return true
     } catch {
-      // Tree policy rejected the path (invalid shape). The file still syncs
-      // by fileId; the next content.submit retries registration.
+      // Tree policy rejected the path (invalid shape or quota). Do not ack
+      // a submit whose materialized tree row did not land.
+      return false
     }
   }
 

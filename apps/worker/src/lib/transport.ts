@@ -6,7 +6,13 @@ import {
   type SubmitUpdateInput,
   type SubmitUpdateResult,
 } from '@glovebox/sync/loro'
-import type { WorkspacePresenceTransport, WorkspacePresenceWireEvent } from '@glovebox/sync/client'
+import type {
+  EventsSinceResult,
+  WireWorkspaceEvent,
+  WorkspacePresenceTransport,
+  WorkspacePresenceWireEvent,
+  WorkspaceSyncTransport,
+} from '@glovebox/sync/client'
 import type { BatchAcceptedOp, BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { isTreeWireEvent, type TreeWireEvent } from './tree-events.ts'
 
@@ -40,11 +46,14 @@ interface TransportOptions {
  * opId (server idempotency dedupes), and re-snapshots subscribed files
  * after a reconnect to catch up on missed updates.
  */
-export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePresenceTransport {
+export class WorkspaceSocketTransport
+  implements LoroRoomTransport, WorkspacePresenceTransport, WorkspaceSyncTransport
+{
   readonly #options: TransportOptions
   readonly #subscribers = new Map<string, Set<(event: LoroUpdateWireEvent) => void>>()
   readonly #presenceSubscribers = new Set<(event: WorkspacePresenceWireEvent) => void>()
   readonly #treeSubscribers = new Set<(event: TreeWireEvent) => void>()
+  readonly #eventSubscribers = new Set<(event: WireWorkspaceEvent) => void>()
   readonly #snapshotSeeds = new Map<string, SnapshotSeed>()
   readonly #outbox: unknown[] = []
   readonly #pending = new Map<
@@ -68,6 +77,13 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       reject: (error: Error) => void
     }
   >()
+  readonly #pendingEvents = new Map<
+    string,
+    {
+      resolve: (result: EventsSinceResult) => void
+      reject: (error: Error) => void
+    }
+  >()
   #ws: WebSocket | null = null
   #ready: Promise<bigint> | null = null
   #readyResolve: ((peerId: bigint) => void) | null = null
@@ -75,8 +91,8 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
   #reconnectTimer: number | null = null
   #catchingUp = false
   #hasOpened = false
-  /** Last per-file seq seen on a broadcast `content.loroUpdate`. */
-  readonly #lastContentSeq = new Map<string, number>()
+  /** Last workspace seq seen on any broadcast event. */
+  #lastWorkspaceSeq: number | null = null
 
   constructor(options: TransportOptions) {
     this.#options = options
@@ -96,9 +112,23 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     return this.#waitUntilReady()
   }
 
-  async fetchSnapshot(fileId: string): Promise<Uint8Array> {
+  async fetchSnapshot(
+    fileId: string,
+    initialContent?: string,
+    observedPath?: string,
+  ): Promise<Uint8Array> {
     await this.#waitUntilReady()
-    return this.#requestSnapshot(fileId)
+    return this.#requestSnapshot(fileId, initialContent, observedPath)
+  }
+
+  async eventsSince(afterSeq: number): Promise<EventsSinceResult> {
+    await this.#waitUntilReady()
+    const requestId = crypto.randomUUID()
+    const promise = new Promise<EventsSinceResult>((resolve, reject) => {
+      this.#pendingEvents.set(requestId, { resolve, reject })
+    })
+    this.#sendWhenReady({ type: 'events.since', requestId, afterSeq })
+    return promise
   }
 
   async submitUpdate(input: SubmitUpdateInput): Promise<SubmitUpdateResult> {
@@ -166,6 +196,11 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     return () => this.#treeSubscribers.delete(handler)
   }
 
+  subscribeEvents(handler: (event: WireWorkspaceEvent) => void): () => void {
+    this.#eventSubscribers.add(handler)
+    return () => this.#eventSubscribers.delete(handler)
+  }
+
   close(): void {
     this.#closed = true
     if (this.#reconnectTimer !== null) window.clearTimeout(this.#reconnectTimer)
@@ -218,6 +253,25 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
           contentVersionB64: string
           originDeviceId?: string
           seq?: number
+        }
+      | {
+          type: 'content.opaqueUpdate'
+          fileId: string
+          bytesB64?: string
+          contentVersionB64?: string
+          originDeviceId?: string
+          seq?: number
+        }
+      | {
+          type: 'events.batch'
+          requestId: string
+          currentSeq: number
+          events: WireWorkspaceEvent[]
+        }
+      | {
+          type: 'events.snapshot-required'
+          requestId: string
+          currentSeq: number
         }
       | { type: 'ack'; opId: string; fileId: string; contentVersionB64: string; applied: boolean }
       | {
@@ -273,13 +327,46 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       return
     }
 
+    if (message.type === 'events.batch') {
+      const pending = this.#pendingEvents.get(message.requestId)
+      if (!pending) return
+      this.#pendingEvents.delete(message.requestId)
+      pending.resolve({
+        ok: true,
+        currentSeq: message.currentSeq,
+        events: message.events,
+      })
+      return
+    }
+
+    if (message.type === 'events.snapshot-required') {
+      const pending = this.#pendingEvents.get(message.requestId)
+      if (!pending) return
+      this.#pendingEvents.delete(message.requestId)
+      pending.resolve({
+        ok: false,
+        reason: 'snapshot-required',
+        currentSeq: message.currentSeq,
+      })
+      return
+    }
+
     if (message.type === 'content.loroUpdate') {
-      this.#noteContentSeq(message.fileId, message.seq)
+      this.#noteWorkspaceSeq(message.seq)
+      this.#dispatchEvent(message)
       this.#dispatch(message)
       return
     }
 
+    if (message.type === 'content.opaqueUpdate') {
+      this.#noteWorkspaceSeq(message.seq)
+      this.#dispatchEvent(message)
+      return
+    }
+
     if (isTreeWireEvent(message)) {
+      this.#noteWorkspaceSeq(message.seq)
+      this.#dispatchEvent(message)
       this.#dispatchTree(message)
       return
     }
@@ -380,6 +467,12 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       if (pendingBatch) {
         this.#pendingBatches.delete(message.requestId)
         pendingBatch.reject(new Error(message.message))
+        return
+      }
+      const pendingEvents = this.#pendingEvents.get(message.requestId)
+      if (pendingEvents) {
+        this.#pendingEvents.delete(message.requestId)
+        pendingEvents.reject(new Error(message.message))
       }
     }
   }
@@ -404,12 +497,20 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     return this.#ready!
   }
 
-  #requestSnapshot(fileId: string): Promise<Uint8Array> {
+  #requestSnapshot(
+    fileId: string,
+    initialContent?: string,
+    observedPath?: string,
+  ): Promise<Uint8Array> {
     const requestId = crypto.randomUUID()
     const promise = new Promise<Uint8Array>((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject })
     })
-    const seed = this.#snapshotSeeds.get(fileId)
+    const registeredSeed = this.#snapshotSeeds.get(fileId)
+    const seed =
+      observedPath !== undefined || initialContent !== undefined
+        ? { observedPath: observedPath ?? registeredSeed?.observedPath ?? `${fileId}.md`, initialContent }
+        : registeredSeed
     this.#sendWhenReady({
       type: 'snapshot.get',
       requestId,
@@ -448,16 +549,15 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
   }
 
   /**
-   * Per-file broadcast seqs are contiguous on a healthy socket; a jump means
-   * we missed an update (or a tree event consumed the counter) — re-snapshot
-   * that file rather than polling everything on a timer.
+   * The wire log is a single workspace seq domain. A gap means at least one
+   * broadcast was missed; it does not imply the current file missed content.
    */
-  #noteContentSeq(fileId: string, seq: number | undefined): void {
+  #noteWorkspaceSeq(seq: number | undefined): void {
     if (typeof seq !== 'number') return
-    const last = this.#lastContentSeq.get(fileId)
-    this.#lastContentSeq.set(fileId, seq)
-    if (last !== undefined && seq > last + 1 && this.#subscribers.has(fileId)) {
-      void this.#catchUpFile(fileId).catch(() => {})
+    const last = this.#lastWorkspaceSeq
+    this.#lastWorkspaceSeq = Math.max(this.#lastWorkspaceSeq ?? 0, seq)
+    if (last !== null && seq > last + 1 && this.#subscribers.size > 0) {
+      void this.#catchUpSubscribedFiles().catch(() => {})
     }
   }
 
@@ -465,6 +565,10 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     const bucket = this.#subscribers.get(event.fileId)
     if (!bucket) return
     for (const handler of bucket) handler(event)
+  }
+
+  #dispatchEvent(event: WireWorkspaceEvent): void {
+    for (const handler of this.#eventSubscribers) handler(event)
   }
 
   #dispatchPresence(event: WorkspacePresenceWireEvent): void {
@@ -510,5 +614,9 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       pending.reject(error)
     }
     this.#pendingBatches.clear()
+    for (const pending of this.#pendingEvents.values()) {
+      pending.reject(error)
+    }
+    this.#pendingEvents.clear()
   }
 }
