@@ -7,8 +7,19 @@ import {
   type SubmitUpdateResult,
 } from '@glovebox/sync/loro'
 import type { WorkspacePresenceTransport, WorkspacePresenceWireEvent } from '@glovebox/sync/client'
+import type { BatchAcceptedOp, BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed'
+
+/** Outcome of a `batch.submit` (structural rename / delete ops). */
+export type BatchSubmitResult =
+  | {
+      type: 'ack'
+      currentSeq: number
+      acceptedOps: BatchAcceptedOp[]
+      deferredOps: BatchDeferredOp[]
+    }
+  | { type: 'rejected'; reason: 'rate-limited' | 'forbidden'; retryAfterSec?: number }
 
 export interface SnapshotSeed {
   observedPath: string
@@ -45,6 +56,13 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     string,
     {
       resolve: (result: SubmitUpdateResult) => void
+      reject: (error: Error) => void
+    }
+  >()
+  readonly #pendingBatches = new Map<
+    string,
+    {
+      resolve: (result: BatchSubmitResult) => void
       reject: (error: Error) => void
     }
   >()
@@ -93,6 +111,22 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       baseContentVersionB64: bytesToBase64(input.baseContentVersion),
       loroUpdateB64: bytesToBase64(input.loroUpdate),
     })
+    return promise
+  }
+
+  /**
+   * Submit structural tree ops (rename / delete intents). Correlated by
+   * `requestId`; the server adjudicates per-op `baseSeq` (INV-3) and returns
+   * accepted/deferred ops, so a stale baseSeq surfaces as a deferred op rather
+   * than a thrown error.
+   */
+  async submitBatch(ops: WorkspaceBatchWireOp[]): Promise<BatchSubmitResult> {
+    await this.#waitUntilReady()
+    const requestId = crypto.randomUUID()
+    const promise = new Promise<BatchSubmitResult>((resolve, reject) => {
+      this.#pendingBatches.set(requestId, { resolve, reject })
+    })
+    this.#sendWhenReady({ type: 'batch.submit', requestId, ops })
     return promise
   }
 
@@ -198,6 +232,19 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       | { type: 'presence.leave'; key: string }
       | { type: 'presence.state'; requestId: string; dataB64: string }
       | { type: 'presence.rejected'; reason: 'rate-limited'; retryAfterSec?: number }
+      | {
+          type: 'batch.ack'
+          requestId: string
+          currentSeq: number
+          acceptedOps: BatchAcceptedOp[]
+          deferredOps: BatchDeferredOp[]
+        }
+      | {
+          type: 'batch.rejected'
+          requestId: string
+          reason: 'rate-limited' | 'forbidden'
+          retryAfterSec?: number
+        }
       | { type: 'error'; message: string; requestId?: string }
 
     if (message.type === 'ready') {
@@ -284,11 +331,42 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       return
     }
 
+    if (message.type === 'batch.ack') {
+      const pending = this.#pendingBatches.get(message.requestId)
+      if (!pending) return
+      this.#pendingBatches.delete(message.requestId)
+      pending.resolve({
+        type: 'ack',
+        currentSeq: message.currentSeq,
+        acceptedOps: message.acceptedOps,
+        deferredOps: message.deferredOps,
+      })
+      return
+    }
+
+    if (message.type === 'batch.rejected') {
+      const pending = this.#pendingBatches.get(message.requestId)
+      if (!pending) return
+      this.#pendingBatches.delete(message.requestId)
+      pending.resolve({
+        type: 'rejected',
+        reason: message.reason,
+        retryAfterSec: message.retryAfterSec,
+      })
+      return
+    }
+
     if (message.type === 'error' && message.requestId) {
       const pending = this.#pending.get(message.requestId)
       if (pending) {
         this.#pending.delete(message.requestId)
         pending.reject(new Error(message.message))
+        return
+      }
+      const pendingBatch = this.#pendingBatches.get(message.requestId)
+      if (pendingBatch) {
+        this.#pendingBatches.delete(message.requestId)
+        pendingBatch.reject(new Error(message.message))
       }
     }
   }
@@ -409,5 +487,11 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
       pending.reject(error)
     }
     this.#pendingSubmits.clear()
+    // Batch ops are not auto-retried; a rejection surfaces to the caller,
+    // which refreshes the tree and lets the user retry.
+    for (const pending of this.#pendingBatches.values()) {
+      pending.reject(error)
+    }
+    this.#pendingBatches.clear()
   }
 }

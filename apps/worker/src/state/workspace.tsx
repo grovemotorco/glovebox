@@ -19,8 +19,13 @@ import type {
 import { createBrowserUser, type AwarenessUser } from '@glovebox/core'
 import { LoroRoomClient } from '@glovebox/sync/loro'
 import { WorkspacePresence, type WorkspacePresencePeer } from '@glovebox/sync/client'
+import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { api, getOrCreateDeviceId } from '../lib/api.ts'
-import { WorkspaceSocketTransport, type ConnectionStatus } from '../lib/transport.ts'
+import {
+  WorkspaceSocketTransport,
+  type BatchSubmitResult,
+  type ConnectionStatus,
+} from '../lib/transport.ts'
 import { baseName } from '../lib/tree.ts'
 
 export interface SessionUser {
@@ -56,6 +61,8 @@ interface WorkspaceContextValue {
   tree: WorkspaceTreeEntry[]
   refreshTree: () => Promise<void>
   createFile: (path: string) => Promise<string>
+  /** Submit structural tree ops (rename / delete) and refresh the tree. */
+  submitTreeOps: (ops: WorkspaceBatchWireOp[]) => Promise<BatchSubmitResult>
 
   members: MemberView[]
   refreshMembers: () => Promise<void>
@@ -329,6 +336,20 @@ export function WorkspaceProvider({
     [openFile, roomStore, refreshTree],
   )
 
+  const submitTreeOps = useCallback(
+    async (ops: WorkspaceBatchWireOp[]): Promise<BatchSubmitResult> => {
+      const transport = transportRef.current
+      if (!transport) throw new Error('Not connected — enable auto-sync to modify files')
+      if (ops.length === 0) {
+        return { type: 'ack', currentSeq: 0, acceptedOps: [], deferredOps: [] }
+      }
+      const result = await transport.submitBatch(ops)
+      await refreshTree().catch(() => {})
+      return result
+    },
+    [refreshTree],
+  )
+
   const subscribeRooms = useCallback(
     (fn: () => void) => {
       roomStore.listeners.add(fn)
@@ -365,6 +386,7 @@ export function WorkspaceProvider({
     tree,
     refreshTree,
     createFile,
+    submitTreeOps,
     members,
     refreshMembers,
     invites,

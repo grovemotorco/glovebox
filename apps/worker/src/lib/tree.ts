@@ -1,4 +1,5 @@
 import type { WorkspaceTreeEntry } from '@glovebox/api'
+import type { BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
 
 export interface FileNode {
   kind: 'file'
@@ -125,4 +126,89 @@ export function formatRelative(timestamp: number): string {
 export function baseName(path: string): string {
   const segments = path.split('/').filter(Boolean)
   return segments[segments.length - 1] ?? path
+}
+
+/** Replace the final segment of `path` with `name` (rename within a folder). */
+export function withBaseName(path: string, name: string): string {
+  const lastSlash = path.lastIndexOf('/')
+  return lastSlash === -1 ? name : `${path.slice(0, lastSlash)}/${name}`
+}
+
+/** Live entries that live directly or transitively under a folder prefix. */
+export function entriesUnderFolder(
+  entries: WorkspaceTreeEntry[],
+  prefix: string,
+): WorkspaceTreeEntry[] {
+  const normalized = prefix.endsWith('/') ? prefix : `${prefix}/`
+  return liveEntries(entries).filter((entry) => entry.path.startsWith(normalized))
+}
+
+/** One `file.rename` op moving `entry` to `toPath`. baseSeq is the file's last-seen seq. */
+export function renameFileOp(entry: WorkspaceTreeEntry, toPath: string): WorkspaceBatchWireOp {
+  return {
+    type: 'file.rename',
+    opId: crypto.randomUUID(),
+    fileId: entry.fileId,
+    baseSeq: entry.seq ?? 0,
+    fromPath: entry.path,
+    toPath,
+  }
+}
+
+/** One `file.deleteIntent` op tombstoning `entry`. */
+export function deleteFileOp(entry: WorkspaceTreeEntry): WorkspaceBatchWireOp {
+  return {
+    type: 'file.deleteIntent',
+    opId: crypto.randomUUID(),
+    fileId: entry.fileId,
+    baseSeq: entry.seq ?? 0,
+    path: entry.path,
+  }
+}
+
+/**
+ * Rename a virtual folder by re-pathing every descendant file from `fromPrefix`
+ * to `toPrefix`. Folders are not server entities, so a folder move is a batch
+ * of per-file renames preserving the relative sub-path under the prefix.
+ */
+export function renameFolderOps(
+  entries: WorkspaceTreeEntry[],
+  fromPrefix: string,
+  toPrefix: string,
+): WorkspaceBatchWireOp[] {
+  const normalized = fromPrefix.endsWith('/') ? fromPrefix : `${fromPrefix}/`
+  const target = toPrefix.replace(/\/+$/, '')
+  return entriesUnderFolder(entries, fromPrefix).map((entry) =>
+    renameFileOp(entry, `${target}/${entry.path.slice(normalized.length)}`),
+  )
+}
+
+/** Delete a virtual folder by tombstoning every descendant file. */
+export function deleteFolderOps(
+  entries: WorkspaceTreeEntry[],
+  prefix: string,
+): WorkspaceBatchWireOp[] {
+  return entriesUnderFolder(entries, prefix).map(deleteFileOp)
+}
+
+/** Human-readable reason a structural op was deferred (not applied) by the server. */
+export function describeDeferredOp(reason: BatchDeferredOp['reason']): string {
+  switch (reason) {
+    case 'remote-edit-wins':
+      return 'The file changed elsewhere — refresh and try again'
+    case 'rename-target-occupied':
+      return 'A file already exists at that path'
+    case 'file-not-found':
+      return 'The file no longer exists'
+    case 'invalid-update':
+      return 'The operation was invalid'
+    case 'file-too-large':
+      return 'The file is too large'
+    case 'unsupported-op':
+      return 'That operation is not supported'
+    default: {
+      const _exhaustive: never = reason
+      return `The operation could not be completed (${String(_exhaustive)})`
+    }
+  }
 }
