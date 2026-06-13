@@ -101,6 +101,7 @@ export interface LoroRoomClientOptions {
 export class LoroRoomClient {
   readonly #options: Required<Pick<LoroRoomClientOptions, 'newOpId'>> &
     Omit<LoroRoomClientOptions, 'newOpId'>
+  #observedPath: string
   #doc: LoroFileDoc | null = null
   #unsubscribe: (() => void) | null = null
   #initialized = false
@@ -133,6 +134,7 @@ export class LoroRoomClient {
       ...options,
       newOpId: options.newOpId ?? defaultOpId,
     }
+    this.#observedPath = options.observedPath
   }
 
   /**
@@ -233,9 +235,26 @@ export class LoroRoomClient {
     // is a version-vector no-op (changed=false, no emit) — idempotency is the
     // suppression. The compare below is versions only; materializing the full
     // text here would make every remote keystroke O(doc).
-    if (this.#doc.importUpdate(bytes)) {
-      this.#emit('remote-update')
-    }
+    this.importRemoteUpdates([bytes])
+  }
+
+  /**
+   * Import server-originated update bytes into the open doc and surface
+   * Loro's pending-dependency signal to the owner of the workspace cursor.
+   */
+  importRemoteUpdates(updates: readonly (LoroUpdate | LoroSnapshot)[]): {
+    changed: boolean
+    pending: boolean
+  } {
+    this.#requireConnected()
+    const status = this.#doc!.importBatchWithStatus(updates)
+    if (status.changed) this.#emit('remote-update')
+    return status
+  }
+
+  /** Keep future submits aligned with the tree row after a live rename. */
+  setObservedPath(path: string): void {
+    this.#observedPath = path
   }
 
   /** Server-confirmed watermark; null before connect. */
@@ -287,7 +306,7 @@ export class LoroRoomClient {
           fileId: this.#options.fileId,
           baseContentVersion: flight.base,
           loroUpdate: flight.update,
-          observedPath: this.#options.observedPath,
+          observedPath: this.#observedPath,
           opId: flight.opId,
         })
       } catch {

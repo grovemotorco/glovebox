@@ -303,7 +303,19 @@ class FakeWebSocket extends EventTarget {
   }
 
   send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
-    this.#sent.push(String(data))
+    const text = String(data)
+    this.#sent.push(text)
+    const message = JSON.parse(text) as { type?: string; requestId?: string }
+    if (message.type === 'events.since' && message.requestId) {
+      queueMicrotask(() => {
+        this.receive({
+          type: 'events.batch',
+          requestId: message.requestId,
+          currentSeq: apiMock.treeSeq,
+          events: [],
+        })
+      })
+    }
   }
 
   close(): void {

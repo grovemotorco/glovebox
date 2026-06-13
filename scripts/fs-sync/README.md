@@ -56,11 +56,39 @@ assertions, all in `run all`:
   `s_md_opaque_rename_boundary` covers the rename-only halves in both
   directions.
 
+## Cross-target browser matrix
+
+The gate also drives browser↔disk↔browser cells that require two browser
+targets and the daemon on one live WorkspaceDO:
+
+- `s_browser_delete_vs_edit_resurrect`: browser delete racing an unacked
+  browser edit resurrects on disk, server, and the other browser.
+- `s_tree_after_content_no_gap`: content and tree events share one seq cursor;
+  a tree op after content does not strand later content as a gap.
+- `s_open_file_rename_delete_room`: renamed open files keep their room; deleted
+  open files close without dropping unacked edits.
+- `s_opaque_oversize_rejected`: >1 MiB opaque submit is rejected and never
+  corrupts the tree or disk.
+- `s_crlf_normalize_e2e`: CRLF disk input normalizes to LF through server,
+  browsers, and repaired disk bytes.
+- `s_stopped_daemon_create_collision`: daemon-stopped local create racing a
+  browser create at the same path keeps both suffixed survivors.
+- `s_fresh_tab_midstream_repair`: a fresh browser session hydrates mid-stream
+  edits from engine persistence/snapshot repair.
+
 ## Environment knobs
 
 `GLOVEBOX_URL`, `FS_SYNC_BASE` (default `/tmp/glovebox-fs-sync`),
 `FS_SYNC_SESSION_A/B` (default `a`/`b`), `FS_SYNC_EMAIL`/`FS_SYNC_PASS`
-(default `fs-sync@glovebox.test`). Sync timers are pinned in `validate.sh`
+(default email is run-unique: `fs-sync-<timestamp>@glovebox.test`).
+`setup fresh` clears cookies and browser storage before sign-in so both
+sessions share the same account/workspace; this matters because dev WebSocket
+auth is off and raw socket tests can otherwise mask RPC membership mistakes.
+Sync timers are pinned in `validate.sh`
 (`GLOVEBOX_SYNC_OVERRIDES`: 1 s rescan, 2 s tombstone, 1 s rename window,
 2 s bulk window, bulkMinCount 5) — keep `tombstoneDelayMs >=
 renameCorrectionWindowMs` or the engine throws.
+
+One harness footgun: do not use bare `wait` in a scenario. `run` starts the
+daemon as a background child, so scenarios must wait only for their own captured
+writer PIDs.

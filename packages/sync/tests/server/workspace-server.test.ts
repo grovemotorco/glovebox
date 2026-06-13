@@ -1731,4 +1731,64 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     const tree = await host.server.listTree()
     expect(tree.entries.filter((entry) => entry.fileId === 'f-long-2')).toHaveLength(0)
   })
+
+  it('content.submit is rejected, not acked, when the materialized tree row is refused', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    const peerId = await helloPeerId(host, socket, 'device-a')
+
+    // Occupy a max-length markdown path. The colliding create must suffix,
+    // which pushes the canonical path over the path cap and makes the tree
+    // authority refuse the row after the Loro update has already imported.
+    const longPath = `${'a'.repeat(1024 - 3)}.md`
+    await fetchSnapshot(host, socket, 'f-long-md-1', 'first\n', longPath)
+
+    const doc = LoroFileDoc.empty('', { peerId: BigInt(peerId) })
+    const base = doc.contentVersion()
+    doc.setTextContent('second\n')
+    const updateB64 = bytesToBase64(doc.exportUpdateSince(base))
+
+    await host.send(socket, {
+      type: 'content.submit',
+      fileId: 'f-long-md-2',
+      observedPath: longPath,
+      opId: 'op-long-md-2',
+      baseContentVersionB64: bytesToBase64(base),
+      loroUpdateB64: updateB64,
+    })
+
+    const rejection = socket
+      .received('submit.rejected')
+      .find((message) => message.opId === 'op-long-md-2')
+    expect(rejection).toMatchObject({ fileId: 'f-long-md-2', reason: 'too-large' })
+    expect(socket.received('ack').filter((ack) => ack.fileId === 'f-long-md-2')).toHaveLength(0)
+    expect(
+      socket.received('content.loroUpdate').filter((event) => event.fileId === 'f-long-md-2'),
+    ).toHaveLength(0)
+    expect((await host.server.listTree()).entries).not.toContainEqual(
+      expect.objectContaining({ fileId: 'f-long-md-2' }),
+    )
+
+    // The failed attempt did import the Loro update, so a later retry can be
+    // appliedUpdates=0. It must still retry the materialized row instead of
+    // acking an unrolled edit.
+    await host.send(socket, {
+      type: 'content.submit',
+      fileId: 'f-long-md-2',
+      observedPath: 'retry-ok.md',
+      opId: 'op-long-md-2-retry',
+      baseContentVersionB64: bytesToBase64(base),
+      loroUpdateB64: updateB64,
+    })
+
+    expect(socket.received('ack').at(-1)).toMatchObject({
+      fileId: 'f-long-md-2',
+      opId: 'op-long-md-2-retry',
+      applied: false,
+    })
+    const retryEntry = (await host.server.listTree()).entries.find(
+      (entry) => entry.fileId === 'f-long-md-2',
+    )
+    expect(retryEntry).toMatchObject({ path: 'retry-ok.md' })
+  })
 })

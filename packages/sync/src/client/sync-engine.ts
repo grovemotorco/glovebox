@@ -151,6 +151,39 @@ export class WorkspaceSyncEngine {
     return this.#files.get(fileId)?.client ?? null
   }
 
+  updateFilePath(fileId: string, path: string): void {
+    const file = this.#files.get(fileId)
+    if (!file) return
+    file.path = path
+    file.client.setObservedPath(path)
+  }
+
+  closeFile(fileId: string): void {
+    const file = this.#files.get(fileId)
+    if (!file) return
+    file.client.disconnect()
+    this.#files.delete(fileId)
+    this.#store.removeFile(fileId).catch(() => {})
+  }
+
+  async resurrectDeletedFile(fileId: string): Promise<LoroRoomClient | null> {
+    const file = this.#files.get(fileId)
+    if (!file) return null
+
+    const localText = file.client.getTextContent()
+    file.client.disconnect()
+    this.#files.delete(fileId)
+
+    const client = await this.#fetchAndAttach(fileId, file.path, localText)
+    if (client.getTextContent() !== localText) {
+      await client.setTextContent(localText)
+      await client.flush()
+    }
+    await this.#persistFile(fileId)
+    this.#emit({ type: 'file-changed', fileId, reason: 'hydrated' })
+    return client
+  }
+
   lastAckedSeq(): number {
     return this.#state?.lastAckedSeq ?? 0
   }
@@ -273,12 +306,11 @@ export class WorkspaceSyncEngine {
     for (const [fileId, updates] of updatesByFile) {
       const file = this.#files.get(fileId)
       if (!file) continue // Unknown file: tree ops are out of V1 scope.
-      const status = file.client.getDoc().importBatchWithStatus(updates)
+      const status = file.client.importRemoteUpdates(updates)
       if (status.pending) {
         await this.#repairFromSnapshot(fileId, 'import-pending')
-      } else if (status.changed) {
-        this.#emit({ type: 'file-changed', fileId, reason: 'remote-update' })
       }
+      if (status.changed) this.#emit({ type: 'file-changed', fileId, reason: 'remote-update' })
       await this.#persistFile(fileId)
     }
 
@@ -300,12 +332,11 @@ export class WorkspaceSyncEngine {
     if (event.type === 'content.loroUpdate' && event.loroUpdateB64) {
       const file = this.#files.get(event.fileId)
       if (file) {
-        const status = file.client
-          .getDoc()
-          .importBatchWithStatus([base64ToBytes(event.loroUpdateB64)])
+        const status = file.client.importRemoteUpdates([base64ToBytes(event.loroUpdateB64)])
         if (status.pending) {
           await this.#repairFromSnapshot(event.fileId, 'import-pending')
-        } else if (status.changed) {
+        }
+        if (status.changed) {
           this.#emit({ type: 'file-changed', fileId: event.fileId, reason: 'remote-update' })
         }
         await this.#persistFile(event.fileId)
