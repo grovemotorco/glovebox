@@ -24,8 +24,8 @@ const modes: { key: EditorMode; label: string; icon: ReactNode }[] = [
 
 export function EditorView() {
   const { activeFileId, editorMode, sidebarOpen } = useUiState()
-  const { setEditorMode, openCommandBar, toggleSidebar } = useUiActions()
-  const { tree, openFile, connectionStatus, peers } = useWorkspace()
+  const { setActiveFile, setEditorMode, openCommandBar, toggleSidebar } = useUiActions()
+  const { tree, treeLoaded, openFile, connectionStatus, peers } = useWorkspace()
 
   const activeEntry = useMemo(
     () => tree.find((entry) => entry.fileId === activeFileId && !entry.tombstone) ?? null,
@@ -37,6 +37,10 @@ export function EditorView() {
     if (!activeFileId || !activeEntry || connectionStatus === 'disconnected') return
     openFile(activeFileId, activeEntry.path)
   }, [activeFileId, activeEntry, connectionStatus, openFile])
+
+  useEffect(() => {
+    if (treeLoaded && activeFileId && !activeEntry) setActiveFile(null)
+  }, [treeLoaded, activeFileId, activeEntry, setActiveFile])
 
   const handle = useRoom(activeFileId)
 

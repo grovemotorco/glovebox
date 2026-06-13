@@ -8,6 +8,7 @@ import {
 } from '@glovebox/sync/loro'
 import type { WorkspacePresenceTransport, WorkspacePresenceWireEvent } from '@glovebox/sync/client'
 import type { BatchAcceptedOp, BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
+import { isTreeWireEvent, type TreeWireEvent } from './tree-events.ts'
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed'
 
@@ -43,6 +44,7 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
   readonly #options: TransportOptions
   readonly #subscribers = new Map<string, Set<(event: LoroUpdateWireEvent) => void>>()
   readonly #presenceSubscribers = new Set<(event: WorkspacePresenceWireEvent) => void>()
+  readonly #treeSubscribers = new Set<(event: TreeWireEvent) => void>()
   readonly #snapshotSeeds = new Map<string, SnapshotSeed>()
   readonly #outbox: unknown[] = []
   readonly #pending = new Map<
@@ -159,6 +161,11 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     return () => this.#presenceSubscribers.delete(handler)
   }
 
+  subscribeTreeEvents(handler: (event: TreeWireEvent) => void): () => void {
+    this.#treeSubscribers.add(handler)
+    return () => this.#treeSubscribers.delete(handler)
+  }
+
   close(): void {
     this.#closed = true
     if (this.#reconnectTimer !== null) window.clearTimeout(this.#reconnectTimer)
@@ -245,6 +252,7 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
           reason: 'rate-limited' | 'forbidden'
           retryAfterSec?: number
         }
+      | TreeWireEvent
       | { type: 'error'; message: string; requestId?: string }
 
     if (message.type === 'ready') {
@@ -268,6 +276,11 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
     if (message.type === 'content.loroUpdate') {
       this.#noteContentSeq(message.fileId, message.seq)
       this.#dispatch(message)
+      return
+    }
+
+    if (isTreeWireEvent(message)) {
+      this.#dispatchTree(message)
       return
     }
 
@@ -456,6 +469,10 @@ export class WorkspaceSocketTransport implements LoroRoomTransport, WorkspacePre
 
   #dispatchPresence(event: WorkspacePresenceWireEvent): void {
     for (const handler of this.#presenceSubscribers) handler(event)
+  }
+
+  #dispatchTree(event: TreeWireEvent): void {
+    for (const handler of this.#treeSubscribers) handler(event)
   }
 
   #send(message: unknown): void {
