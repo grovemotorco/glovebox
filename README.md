@@ -5,7 +5,8 @@ in sync with a shared workspace, and the same documents are editable live in the
 browser.
 
 The platform is a Vite+ monorepo: a Cloudflare Worker (API, WorkspaceDO, and
-TanStack web app), a local file-sync CLI, and shared sync/API packages.
+TanStack web app), a local file-sync CLI, and shared sync/API packages. See
+[`architecture.md`](./docs/architecture.md) for the system design.
 
 ## Using glovebox
 
@@ -148,17 +149,17 @@ vp run dev:worker   # https://api.glovebox.test
 
 ### Structure
 
-| Package                  | Path                    | Purpose                                      |
-| ------------------------ | ----------------------- | -------------------------------------------- |
-| `@glovebox/worker`       | `apps/worker`           | Worker dispatcher, Better Auth, ORPC, DO, UI |
-| `@glovebox/cli`          | `apps/cli`              | Local file-sync CLI daemon                   |
-| `@glovebox/prototype`    | `apps/prototype`        | Product UI prototype                         |
-| `@glovebox/api`          | `packages/api`          | ORPC contract, typed clients, OpenAPI inputs |
-| `@glovebox/sync`         | `packages/sync`         | Sync protocol, daemon/client/server core     |
-| `@glovebox/core`         | `packages/core`         | Shared types and protocol constants          |
-| `@glovebox/loro-codemirror` | `packages/loro-codemirror` | CodeMirror binding for Loro CRDTs       |
-| `@glovebox/dofs`         | `packages/dofs`         | Durable Object filesystem (vendored)         |
-| `@glovebox/harness`      | `packages/harness`      | Shared test harness                          |
+| Package                     | Path                       | Purpose                                      |
+| --------------------------- | -------------------------- | -------------------------------------------- |
+| `@glovebox/worker`          | `apps/worker`              | Worker dispatcher, Better Auth, ORPC, DO, UI |
+| `@glovebox/cli`             | `apps/cli`                 | Local file-sync CLI daemon                   |
+| `@glovebox/prototype`       | `apps/prototype`           | Product UI prototype                         |
+| `@glovebox/api`             | `packages/api`             | ORPC contract, typed clients, OpenAPI inputs |
+| `@glovebox/sync`            | `packages/sync`            | Sync protocol, daemon/client/server core     |
+| `@glovebox/core`            | `packages/core`            | Shared types and protocol constants          |
+| `@glovebox/loro-codemirror` | `packages/loro-codemirror` | CodeMirror binding for Loro CRDTs            |
+| `@glovebox/dofs`            | `packages/dofs`            | Durable Object filesystem (vendored)         |
+| `@glovebox/harness`         | `packages/harness`         | Shared test harness                          |
 
 ### Database and email
 
