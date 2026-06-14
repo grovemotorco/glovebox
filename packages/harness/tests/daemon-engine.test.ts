@@ -1,6 +1,11 @@
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
-import { sha256Hex } from '@glovebox/sync'
+import {
+  assembleOpaqueWirePayload,
+  buildOpaqueWirePayload,
+  sha256Hex,
+  type OpaqueObjectPayload,
+} from '@glovebox/sync'
 import {
   WorkspaceServer,
   type WorkspaceServerMessage,
@@ -147,6 +152,7 @@ class SocketTransport implements WorkspaceSyncTransport {
   >()
   readonly #pendingOpaqueSubmits = new Map<string, (result: SubmitOpaqueResult) => void>()
   readonly #pendingOpaqueGets = new Map<string, (result: OpaqueFetchResult) => void>()
+  readonly #pendingOpaqueGetObjects = new Map<string, OpaqueObjectPayload[]>()
   readonly #pendingTrees = new Map<string, (result: DaemonTreeState) => void>()
   readonly #eventHandlers = new Set<(event: WireWorkspaceEvent) => void>()
   /** When true, submits fail at the transport layer (offline simulation). */
@@ -230,6 +236,7 @@ class SocketTransport implements WorkspaceSyncTransport {
     const promise = new Promise<SubmitOpaqueResult>((resolve) => {
       this.#pendingOpaqueSubmits.set(input.opId, resolve)
     })
+    const payload = buildOpaqueWirePayload(input.bytes)
     await this.#host.server.handleMessage(
       this.#socket,
       JSON.stringify({
@@ -238,20 +245,40 @@ class SocketTransport implements WorkspaceSyncTransport {
         observedPath: input.observedPath,
         opId: input.opId,
         baseHashHex: input.baseHashHex,
-        bytesB64: bytesToBase64(input.bytes),
+        hashHex: payload.hashHex,
+        sizeBytes: payload.sizeBytes,
+        manifest: payload.manifest,
+        objects: payload.objects,
       }),
     )
     return promise
   }
 
-  async fetchOpaque(fileId: string): Promise<OpaqueFetchResult> {
+  async fetchOpaque(
+    fileId: string,
+    existingBytes?: Uint8Array,
+    options: { metadataOnly?: boolean } = {},
+  ): Promise<OpaqueFetchResult> {
     const requestId = `rq-${++this.#requestCounter}`
+    const existingPayload =
+      existingBytes === undefined || options.metadataOnly === true
+        ? undefined
+        : buildOpaqueWirePayload(existingBytes)
+    if (existingPayload) {
+      this.#pendingOpaqueGetObjects.set(requestId, existingPayload.objects)
+    }
     const promise = new Promise<OpaqueFetchResult>((resolve) => {
       this.#pendingOpaqueGets.set(requestId, resolve)
     })
     await this.#host.server.handleMessage(
       this.#socket,
-      JSON.stringify({ type: 'opaque.get', requestId, fileId }),
+      JSON.stringify({
+        type: 'opaque.get',
+        requestId,
+        fileId,
+        haveObjects: existingPayload?.manifest.chunks.map((chunk) => chunk.hashB64),
+        ...(options.metadataOnly === true ? { metadataOnly: true } : {}),
+      }),
     )
     return promise
   }
@@ -344,6 +371,8 @@ class SocketTransport implements WorkspaceSyncTransport {
         resolve?.({
           type: 'ack',
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
           conflict: message.conflict,
           path: message.path,
         })
@@ -352,12 +381,30 @@ class SocketTransport implements WorkspaceSyncTransport {
       case 'opaque.response': {
         const resolve = this.#pendingOpaqueGets.get(message.requestId)
         this.#pendingOpaqueGets.delete(message.requestId)
+        const localObjects = this.#pendingOpaqueGetObjects.get(message.requestId) ?? []
+        this.#pendingOpaqueGetObjects.delete(message.requestId)
+        const bytes =
+          message.found &&
+          message.contentKind === 'opaque' &&
+          message.hashHex !== undefined &&
+          message.sizeBytes !== undefined &&
+          message.manifest !== undefined &&
+          message.objects !== undefined
+            ? assembleOpaqueWirePayload({
+                hashHex: message.hashHex,
+                sizeBytes: message.sizeBytes,
+                manifest: message.manifest,
+                objects: [...localObjects, ...message.objects],
+              })
+            : undefined
         resolve?.({
           found: message.found,
           contentKind: message.contentKind,
           path: message.path,
-          bytes: message.bytesB64 === undefined ? undefined : base64ToBytes(message.bytesB64),
+          bytes,
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
         })
         return
       }
@@ -941,6 +988,14 @@ function pngBytes(...tail: number[]): Uint8Array {
   return Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...tail)
 }
 
+function patternedBytes(size: number): Uint8Array {
+  const bytes = new Uint8Array(size)
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    bytes[i] = (i * 31 + Math.floor(i / 257)) % 251
+  }
+  return bytes
+}
+
 describe('opaque cycle (ISSUE-0045)', () => {
   it('pushes a disk binary create: opaque tree row, right hash, tracked locally', async () => {
     const host = new ServerHost()
@@ -995,6 +1050,74 @@ describe('opaque cycle (ISSUE-0045)', () => {
     expect(await fsB.readFileBytes('img.png')).toEqual(v2)
   })
 
+  it('round-trips a 4 MiB opaque file disk -> server -> second daemon disk', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({})
+    const fsB = MemoryFS.from({})
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB, { deviceId: 'daemon-B' })
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+
+    const bytes = patternedBytes(4 * 1024 * 1024)
+    await fsA.writeFileBytes('large.bin', bytes)
+    await daemonA.engine.runCycle()
+
+    const entry = (await daemonA.transport.listTree()).entries.find(
+      (candidate) => candidate.path === 'large.bin',
+    )
+    expect(entry).toMatchObject({
+      contentKind: 'opaque',
+      contentHash: sha256Hex(bytes),
+      sizeBytes: bytes.byteLength,
+    })
+
+    await daemonB.engine.runCycle()
+    expect(await fsB.readFileBytes('large.bin')).toEqual(bytes)
+  }, 15_000)
+
+  it('behind-window opaque refresh uses metadata-only probes before object fetches', async () => {
+    const host = new ServerHost()
+    const fs = MemoryFS.from({})
+    const daemon = await bootDaemon(host, fs, { deviceId: 'daemon-A' })
+    await daemon.engine.runCycle()
+
+    const bytes = pngBytes(4, 5, 6)
+    await fs.writeFileBytes('clean.bin', bytes)
+    await daemon.engine.runCycle()
+    expect(await fs.readFileBytes('clean.bin')).toEqual(bytes)
+
+    const tree = await daemon.transport.listTree()
+    const currentSeq = tree.currentSeq
+    const realEventsSince = daemon.transport.eventsSince.bind(daemon.transport)
+    const realFetchOpaque = daemon.transport.fetchOpaque.bind(daemon.transport)
+    const fetches: Array<{ existingBytes?: Uint8Array; metadataOnly?: boolean }> = []
+    daemon.transport.eventsSince = async () => ({
+      ok: false,
+      reason: 'snapshot-required',
+      currentSeq,
+    })
+    daemon.transport.fetchOpaque = async (fileId, existingBytes, options) => {
+      fetches.push({ existingBytes, metadataOnly: options?.metadataOnly })
+      return realFetchOpaque(fileId, existingBytes, options)
+    }
+
+    await daemon.engine.runCycle()
+    expect(fetches).toEqual([{ existingBytes: undefined, metadataOnly: true }])
+
+    fetches.length = 0
+    const dirty = pngBytes(8, 9, 10)
+    await fs.writeFileBytes('clean.bin', dirty)
+    await daemon.engine.runCycle()
+    daemon.transport.eventsSince = realEventsSince
+
+    expect(fetches).toEqual([{ existingBytes: undefined, metadataOnly: true }])
+    const dirtyEntry = (await daemon.transport.listTree()).entries.find(
+      (candidate) => candidate.path === 'clean.bin',
+    )
+    expect(dirtyEntry?.contentHash).toBe(sha256Hex(dirty))
+  })
+
   it('opaque conflict: the later submitter wins LWW and the loser lands in recovery', async () => {
     const host = new ServerHost()
     const fsA = MemoryFS.from({})
@@ -1019,8 +1142,9 @@ describe('opaque cycle (ISSUE-0045)', () => {
     const records = host.server.listRecoveryRecords({ pendingOnly: true })
     expect(records).toHaveLength(1)
     expect(records[0]!.reason).toBe('opaque-conflict-loser')
-    const payload = JSON.parse(records[0]!.payload) as { bytesB64: string }
-    expect(base64ToBytes(payload.bytesB64)).toEqual(fromA) // preserved, not dropped
+    const payload = JSON.parse(records[0]!.payload) as { hashHex: string; sizeBytes: number }
+    expect(payload.hashHex).toBe(sha256Hex(fromA))
+    expect(payload.sizeBytes).toBe(fromA.byteLength)
 
     // Neither disk was zeroed; further cycles converge both to the winner.
     expect(await fsB.readFileBytes('shared.png')).toEqual(fromB)

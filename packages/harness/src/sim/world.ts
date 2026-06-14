@@ -28,6 +28,11 @@ import {
   type SubmitOpaqueInput,
   type SubmitOpaqueResult,
 } from '@glovebox/sync/daemon'
+import {
+  assembleOpaqueWirePayload,
+  buildOpaqueWirePayload,
+  type OpaqueObjectPayload,
+} from '@glovebox/sync'
 import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { MemoryFS } from '../fs/memory-fs.ts'
 import { CrashFuse, SimChannel, SimCrash, SimScheduler, type ChannelPolicy } from './scheduler.ts'
@@ -139,6 +144,7 @@ class SimTransport implements WorkspaceSyncTransport {
   readonly #pendingBatches = new Map<string, (result: BatchSubmitResult) => void>()
   readonly #pendingOpaqueSubmits = new Map<string, (result: SubmitOpaqueResult) => void>()
   readonly #pendingOpaqueGets = new Map<string, (result: OpaqueFetchResult) => void>()
+  readonly #pendingOpaqueGetObjects = new Map<string, OpaqueObjectPayload[]>()
   readonly #pendingTrees = new Map<string, (result: DaemonTreeState) => void>()
   readonly #eventHandlers = new Set<(event: WireWorkspaceEvent) => void>()
   offline = false
@@ -220,6 +226,7 @@ class SimTransport implements WorkspaceSyncTransport {
     const promise = new Promise<SubmitOpaqueResult>((resolve) => {
       this.#pendingOpaqueSubmits.set(input.opId, resolve)
     })
+    const payload = buildOpaqueWirePayload(input.bytes)
     await this.#world.server.handleMessage(
       this.#socket,
       JSON.stringify({
@@ -228,21 +235,41 @@ class SimTransport implements WorkspaceSyncTransport {
         observedPath: input.observedPath,
         opId: input.opId,
         baseHashHex: input.baseHashHex,
-        bytesB64: bytesToBase64(input.bytes),
+        hashHex: payload.hashHex,
+        sizeBytes: payload.sizeBytes,
+        manifest: payload.manifest,
+        objects: payload.objects,
       }),
     )
     return promise
   }
 
-  async fetchOpaque(fileId: string): Promise<OpaqueFetchResult> {
+  async fetchOpaque(
+    fileId: string,
+    existingBytes?: Uint8Array,
+    options: { metadataOnly?: boolean } = {},
+  ): Promise<OpaqueFetchResult> {
     this.#assertOnline()
     const requestId = `rq-${++this.#requestCounter}`
+    const existingPayload =
+      existingBytes === undefined || options.metadataOnly === true
+        ? undefined
+        : buildOpaqueWirePayload(existingBytes)
+    if (existingPayload) {
+      this.#pendingOpaqueGetObjects.set(requestId, existingPayload.objects)
+    }
     const promise = new Promise<OpaqueFetchResult>((resolve) => {
       this.#pendingOpaqueGets.set(requestId, resolve)
     })
     await this.#world.server.handleMessage(
       this.#socket,
-      JSON.stringify({ type: 'opaque.get', requestId, fileId }),
+      JSON.stringify({
+        type: 'opaque.get',
+        requestId,
+        fileId,
+        haveObjects: existingPayload?.manifest.chunks.map((chunk) => chunk.hashB64),
+        ...(options.metadataOnly === true ? { metadataOnly: true } : {}),
+      }),
     )
     return promise
   }
@@ -340,6 +367,8 @@ class SimTransport implements WorkspaceSyncTransport {
         resolve?.({
           type: 'ack',
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
           conflict: message.conflict,
           path: message.path,
         })
@@ -348,12 +377,30 @@ class SimTransport implements WorkspaceSyncTransport {
       case 'opaque.response': {
         const resolve = this.#pendingOpaqueGets.get(message.requestId)
         this.#pendingOpaqueGets.delete(message.requestId)
+        const localObjects = this.#pendingOpaqueGetObjects.get(message.requestId) ?? []
+        this.#pendingOpaqueGetObjects.delete(message.requestId)
+        const bytes =
+          message.found &&
+          message.contentKind === 'opaque' &&
+          message.hashHex !== undefined &&
+          message.sizeBytes !== undefined &&
+          message.manifest !== undefined &&
+          message.objects !== undefined
+            ? assembleOpaqueWirePayload({
+                hashHex: message.hashHex,
+                sizeBytes: message.sizeBytes,
+                manifest: message.manifest,
+                objects: [...localObjects, ...message.objects],
+              })
+            : undefined
         resolve?.({
           found: message.found,
           contentKind: message.contentKind,
           path: message.path,
-          bytes: message.bytesB64 === undefined ? undefined : base64ToBytes(message.bytesB64),
+          bytes,
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
         })
         return
       }

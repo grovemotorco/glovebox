@@ -5,6 +5,7 @@ import {
   WorkspaceServer,
   verifyWorkspaceToken,
   type WorkspaceConnectionClaims,
+  type WorkspaceServerLimits,
   type WorkspaceServerStorage,
   type WorkspaceSocket,
   type WorkspaceSqlStorage,
@@ -87,6 +88,7 @@ export interface LiveWorkspaceHostOptions {
   /** Set to enable auth: upgrades must carry a valid signed token. */
   authSecret?: string
   now?: () => number
+  limits?: Partial<WorkspaceServerLimits>
 }
 
 export class LiveWorkspaceHost {
@@ -116,6 +118,7 @@ export class LiveWorkspaceHost {
       getSockets: () => [...this.#shims],
       requireAuth: Boolean(this.#authSecret),
       now: this.#now,
+      limits: options.limits,
     })
   }
 

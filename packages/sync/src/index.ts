@@ -13,6 +13,15 @@ export {
 export { isMarkdownFile, isSyncableFile } from './fs/file-kind.ts'
 export { normalizeEol } from './fs/eol.ts'
 export { requireWorkspaceMarkdownPath, requireWorkspaceRelativePath } from './fs/workspace-path.ts'
+export {
+  OPAQUE_CHUNK_SIZE,
+  assembleOpaqueWirePayload,
+  buildOpaqueWirePayload,
+  contentRefFromPayload,
+  type OpaqueContentRef,
+  type OpaqueObjectPayload,
+  type OpaqueWirePayload,
+} from './opaque-wire.ts'
 
 // Loro primitives
 export {

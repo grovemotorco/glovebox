@@ -64,6 +64,11 @@ export interface WriteMeta {
   modifiedBy: string
 }
 
+export interface OpaqueContentMetadata {
+  contentHash: string
+  sizeBytes: number
+}
+
 export interface CreateResult {
   fileId: string
   created: boolean
@@ -545,16 +550,15 @@ export class WorkspaceStore {
    */
   createOpaqueFile(
     path: string,
-    contentBytes: Uint8Array,
+    content: OpaqueContentMetadata,
     meta: WriteMeta,
     providedFileId?: string,
   ): CreateResult {
     this.ensureInitialized()
 
     const normalizedPath = requireWorkspaceFilePath(path)
-    const sizeBytes = contentBytes.byteLength
-    const contentHash = sha256Hex(contentBytes)
-    const storedContent = Buffer.from(contentBytes).toString('base64')
+    const sizeBytes = content.sizeBytes
+    const contentHash = content.contentHash
     const parentPath = getParentPath(normalizedPath)
     const name = getBaseName(normalizedPath)
     const now = Date.now()
@@ -610,7 +614,7 @@ export class WorkspaceStore {
         normalizedPath,
         parentPath,
         name,
-        storedContent,
+        null,
         contentHash,
         sizeBytes,
         serializeVersionVector(versionVector),
@@ -632,35 +636,19 @@ export class WorkspaceStore {
   }
 
   /**
-   * Re-derive a row's content kind after its path crossed the md↔opaque
-   * boundary (ISSUE-0043). The stored bytes are preserved exactly —
-   * markdown text re-encodes as base64, opaque bytes decode as UTF-8 text
-   * (lossy only for non-UTF-8 binaries renamed to .md, the user's explicit
-   * choice). NO seq is allocated and the version vector does not move: the
-   * rename that triggered the transition is the one observable event.
+   * Re-derive a row's content kind after its path crossed the md→opaque
+   * boundary. Opaque bytes live in DOFS, so the caller supplies the new
+   * metadata after writing the UTF-8 bytes there. NO seq is allocated and
+   * the version vector does not move: the rename that triggered the
+   * transition is the one observable event.
    */
-  transitionContentKind(fileId: string, kind: 'markdown' | 'opaque'): boolean {
+  transitionMarkdownToOpaque(fileId: string, content: OpaqueContentMetadata): boolean {
     this.ensureInitialized()
 
     return this.#storage.transactionSync(() => {
       const existing = this.#getFileRowById(fileId)
       if (!existing) return false
-      if (contentKindFromRow(existing) === kind) return false
-
-      let content: string
-      let contentHash: string
-      let sizeBytes: number
-      if (kind === 'opaque') {
-        const bytes = Buffer.from(existing.content ?? '', 'utf-8')
-        content = bytes.toString('base64')
-        contentHash = sha256Hex(new Uint8Array(bytes))
-        sizeBytes = bytes.byteLength
-      } else {
-        const text = Buffer.from(existing.content ?? '', 'base64').toString('utf-8')
-        content = text
-        contentHash = sha256Hex(text)
-        sizeBytes = getContentSizeBytes(text)
-      }
+      if (contentKindFromRow(existing) === 'opaque') return false
 
       this.#storage.sql.exec(
         `
@@ -668,13 +656,42 @@ export class WorkspaceStore {
           SET content = ?, content_hash = ?, size_bytes = ?, content_kind = ?
           WHERE file_id = ?
         `,
-        content,
+        null,
+        content.contentHash,
+        content.sizeBytes,
+        'opaque',
+        requireFileId(existing, 'content kind transition'),
+      )
+      return true
+    })
+  }
+
+  /**
+   * Re-derive a row's content kind after its path crossed the opaque→md
+   * boundary. The caller has already read/decode-validated DOFS bytes.
+   * NO seq is allocated; the rename remains the observable change.
+   */
+  transitionOpaqueToMarkdown(fileId: string, text: string): boolean {
+    this.ensureInitialized()
+
+    const contentHash = sha256Hex(text)
+    const sizeBytes = getContentSizeBytes(text)
+
+    return this.#storage.transactionSync(() => {
+      const existing = this.#getFileRowById(fileId)
+      if (!existing) return false
+      if (contentKindFromRow(existing) !== 'opaque') return false
+
+      this.#storage.sql.exec(
+        `
+          UPDATE workspace_files
+          SET content = ?, content_hash = ?, size_bytes = ?, content_kind = ?
+          WHERE file_id = ?
+        `,
+        text,
         contentHash,
         sizeBytes,
-        // Literal 'markdown', never NULL — the canonical schema declares
-        // the column NOT NULL DEFAULT 'markdown'; only the legacy ALTER
-        // migration tolerates NULL.
-        kind,
+        'markdown',
         requireFileId(existing, 'content kind transition'),
       )
       return true
@@ -683,15 +700,14 @@ export class WorkspaceStore {
 
   createOpaqueFileOrSuffix(
     path: string,
-    contentBytes: Uint8Array,
+    content: OpaqueContentMetadata,
     meta: WriteMeta,
   ): CreateOrSuffixResult {
     this.ensureInitialized()
 
     const requestedPath = requireWorkspaceFilePath(path)
-    const sizeBytes = contentBytes.byteLength
-    const contentHash = sha256Hex(contentBytes)
-    const storedContent = Buffer.from(contentBytes).toString('base64')
+    const sizeBytes = content.sizeBytes
+    const contentHash = content.contentHash
     const now = Date.now()
 
     return this.#storage.transactionSync(() => {
@@ -737,7 +753,7 @@ export class WorkspaceStore {
         normalizedPath,
         parentPath,
         name,
-        storedContent,
+        null,
         contentHash,
         sizeBytes,
         serializeVersionVector(versionVector),
@@ -976,9 +992,8 @@ export class WorkspaceStore {
 
     const row = this.#getFileRowById(fileId)
     if (!row) return null
-    return contentKindFromRow(row) === 'opaque'
-      ? new Uint8Array(Buffer.from(row.content ?? '', 'base64'))
-      : new Uint8Array(Buffer.from(row.content ?? '', 'utf-8'))
+    if (contentKindFromRow(row) === 'opaque') return null
+    return new Uint8Array(Buffer.from(row.content ?? '', 'utf-8'))
   }
 
   readTombstoneContentById(fileId: string): TombstoneContentResult | null {
@@ -1048,12 +1063,15 @@ export class WorkspaceStore {
     })
   }
 
-  writeFileBytesById(fileId: string, content: Uint8Array, meta: WriteMeta): WriteResult | null {
+  writeOpaqueMetadataById(
+    fileId: string,
+    content: OpaqueContentMetadata,
+    meta: WriteMeta,
+  ): WriteResult | null {
     this.ensureInitialized()
 
-    const stored = Buffer.from(content).toString('base64')
-    const sizeBytes = content.byteLength
-    const contentHash = sha256Hex(content)
+    const sizeBytes = content.sizeBytes
+    const contentHash = content.contentHash
     const now = Date.now()
 
     return this.#storage.transactionSync(() => {
@@ -1086,7 +1104,7 @@ export class WorkspaceStore {
             modified_at = ?
           WHERE path = ?
         `,
-        stored,
+        null,
         contentHash,
         sizeBytes,
         version,
@@ -1552,7 +1570,7 @@ export class WorkspaceStore {
       `,
       requireFileId(row, 'file tombstone'),
       row.path,
-      row.content ?? '',
+      contentKindFromRow(row) === 'opaque' ? null : (row.content ?? ''),
       contentKindFromRow(row),
       requireFileContentHash(row, 'file tombstone'),
       row.size_bytes,

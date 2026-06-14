@@ -17,6 +17,15 @@ export interface WorkspaceTreeEntry {
   modifiedAt: number
 }
 
+export interface OpaqueChunkRef {
+  hashB64: string
+  size: number
+}
+
+export interface OpaqueManifest {
+  chunks: OpaqueChunkRef[]
+}
+
 export type WorkspaceChangeEvent =
   | { type: 'snapshot'; entries: WorkspaceTreeEntry[]; seq?: number }
   | { type: 'create'; path: string; entry: WorkspaceTreeEntry; seq?: number }
@@ -50,7 +59,9 @@ export type WorkspaceChangeEvent =
   | {
       type: 'content.opaqueUpdate'
       fileId: string
-      bytesB64: string
+      hashHex: string
+      sizeBytes: number
+      manifest: OpaqueManifest
       originDeviceId?: string
       seq?: number
     }

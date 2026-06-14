@@ -2,6 +2,11 @@ import type { EventsSinceResult, WireWorkspaceEvent } from '../client/sync-engin
 import type { SubmitUpdateInput, SubmitUpdateResult } from '../loro/room-client.ts'
 import type { WorkspaceBatchWireOp, WorkspaceServerMessage } from '../server/workspace-server.ts'
 import { base64ToBytes, bytesToBase64 } from '../loro/base64.ts'
+import {
+  assembleOpaqueWirePayload,
+  buildOpaqueWirePayload,
+  type OpaqueObjectPayload,
+} from '../opaque-wire.ts'
 import type {
   BatchSubmitResult,
   DaemonTransport,
@@ -91,6 +96,7 @@ export class WsDaemonTransport implements DaemonTransport {
   readonly #pendingSubmits = new Map<string, PendingRequest<SubmitUpdateResult>>()
   readonly #pendingOpaqueSubmits = new Map<string, PendingRequest<SubmitOpaqueResult>>()
   readonly #pendingOpaqueGets = new Map<string, PendingRequest<OpaqueFetchResult>>()
+  readonly #pendingOpaqueGetObjects = new Map<string, OpaqueObjectPayload[]>()
   readonly #pendingTrees = new Map<string, PendingRequest<DaemonTreeState>>()
   readonly #eventHandlers = new Set<(event: WireWorkspaceEvent) => void>()
 
@@ -153,22 +159,39 @@ export class WsDaemonTransport implements DaemonTransport {
   }
 
   async submitOpaque(input: SubmitOpaqueInput): Promise<SubmitOpaqueResult> {
+    const payload = buildOpaqueWirePayload(input.bytes)
     return this.#request(this.#pendingOpaqueSubmits, input.opId, {
       type: 'opaque.submit',
       fileId: input.fileId,
       observedPath: input.observedPath,
       opId: input.opId,
       baseHashHex: input.baseHashHex,
-      bytesB64: bytesToBase64(input.bytes),
+      hashHex: payload.hashHex,
+      sizeBytes: payload.sizeBytes,
+      manifest: payload.manifest,
+      objects: payload.objects,
     })
   }
 
-  async fetchOpaque(fileId: string): Promise<OpaqueFetchResult> {
+  async fetchOpaque(
+    fileId: string,
+    existingBytes?: Uint8Array,
+    options: { metadataOnly?: boolean } = {},
+  ): Promise<OpaqueFetchResult> {
     const requestId = this.#nextRequestId()
+    const existingPayload =
+      existingBytes === undefined || options.metadataOnly === true
+        ? undefined
+        : buildOpaqueWirePayload(existingBytes)
+    if (existingPayload) {
+      this.#pendingOpaqueGetObjects.set(requestId, existingPayload.objects)
+    }
     return this.#request(this.#pendingOpaqueGets, requestId, {
       type: 'opaque.get',
       requestId,
       fileId,
+      haveObjects: existingPayload?.manifest.chunks.map((chunk) => chunk.hashB64),
+      ...(options.metadataOnly === true ? { metadataOnly: true } : {}),
     })
   }
 
@@ -486,6 +509,8 @@ export class WsDaemonTransport implements DaemonTransport {
         pending?.resolve({
           type: 'ack',
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
           conflict: message.conflict,
           path: message.path,
         })
@@ -494,12 +519,37 @@ export class WsDaemonTransport implements DaemonTransport {
       case 'opaque.response': {
         const pending = this.#pendingOpaqueGets.get(message.requestId)
         this.#pendingOpaqueGets.delete(message.requestId)
+        const localObjects = this.#pendingOpaqueGetObjects.get(message.requestId) ?? []
+        this.#pendingOpaqueGetObjects.delete(message.requestId)
+        let bytes: Uint8Array | undefined
+        if (
+          message.found &&
+          message.contentKind === 'opaque' &&
+          message.hashHex !== undefined &&
+          message.sizeBytes !== undefined &&
+          message.manifest !== undefined &&
+          message.objects !== undefined
+        ) {
+          try {
+            bytes = assembleOpaqueWirePayload({
+              hashHex: message.hashHex,
+              sizeBytes: message.sizeBytes,
+              manifest: message.manifest,
+              objects: [...localObjects, ...message.objects],
+            })
+          } catch (error) {
+            pending?.reject(error instanceof Error ? error : new Error(String(error)))
+            return
+          }
+        }
         pending?.resolve({
           found: message.found,
           contentKind: message.contentKind,
           path: message.path,
-          bytes: message.bytesB64 === undefined ? undefined : base64ToBytes(message.bytesB64),
+          bytes,
           hashHex: message.hashHex,
+          sizeBytes: message.sizeBytes,
+          manifest: message.manifest,
         })
         return
       }

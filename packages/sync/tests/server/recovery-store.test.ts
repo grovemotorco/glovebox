@@ -31,7 +31,7 @@ const INPUT = {
   reason: 'opaque-conflict-loser',
   deviceId: 'device-a',
   observedPath: 'assets/img.png',
-  payload: JSON.stringify({ bytesB64: 'aGk=', hashHex: 'abc' }),
+  payload: JSON.stringify({ hashHex: 'abc', sizeBytes: 2, manifest: { chunks: [] } }),
 }
 
 describe('WorkspaceRecoveryStore', () => {
@@ -52,7 +52,11 @@ describe('WorkspaceRecoveryStore', () => {
       createdAt: T0,
       acknowledgedAt: null,
     })
-    expect(JSON.parse(records[0]!.payload)).toEqual({ bytesB64: 'aGk=', hashHex: 'abc' })
+    expect(JSON.parse(records[0]!.payload)).toEqual({
+      hashHex: 'abc',
+      sizeBytes: 2,
+      manifest: { chunks: [] },
+    })
   })
 
   it('acknowledge sets the timestamp once and pendingOnly filters it out', () => {

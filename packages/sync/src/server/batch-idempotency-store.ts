@@ -11,7 +11,6 @@ interface IdempotencyRow extends Record<string, ArrayBuffer | string | number | 
   events_json: string
   accepted_op_json: string | null
   snapshots_json: string | null
-  opaque_contents_json: string | null
 }
 
 interface IdempotencyAcceptedOp {
@@ -30,12 +29,6 @@ interface IdempotencySnapshot {
   textContent: string
 }
 
-interface IdempotencyOpaqueContent {
-  fileId: string
-  contentBytes: Uint8Array<ArrayBuffer>
-  contentHash: string
-}
-
 interface IdempotencyRecord {
   opId: string
   deviceId: string
@@ -43,7 +36,6 @@ interface IdempotencyRecord {
   events: WorkspaceChangeEvent[]
   acceptedOp: IdempotencyAcceptedOp | null
   snapshots: IdempotencySnapshot[]
-  opaqueContents: IdempotencyOpaqueContent[]
 }
 
 /**
@@ -72,8 +64,7 @@ export class WorkspaceIdempotencyStore {
           applied_at INTEGER NOT NULL,
           events_json TEXT NOT NULL,
           accepted_op_json TEXT,
-          snapshots_json TEXT,
-          opaque_contents_json TEXT
+          snapshots_json TEXT
         )
       `)
       try {
@@ -83,13 +74,6 @@ export class WorkspaceIdempotencyStore {
       }
       try {
         this.#storage.sql.exec(`ALTER TABLE workspace_idempotency ADD COLUMN snapshots_json TEXT`)
-      } catch {
-        // Existing DO storage may already have this prototype column.
-      }
-      try {
-        this.#storage.sql.exec(
-          `ALTER TABLE workspace_idempotency ADD COLUMN opaque_contents_json TEXT`,
-        )
       } catch {
         // Existing DO storage may already have this prototype column.
       }
@@ -113,8 +97,7 @@ export class WorkspaceIdempotencyStore {
             applied_at,
             events_json,
             accepted_op_json,
-            snapshots_json,
-            opaque_contents_json
+            snapshots_json
           FROM workspace_idempotency
           WHERE op_id = ?
           LIMIT 1
@@ -150,17 +133,6 @@ export class WorkspaceIdempotencyStore {
       }
     }
 
-    let opaqueContents: IdempotencyOpaqueContent[] = []
-    if (row.opaque_contents_json) {
-      try {
-        opaqueContents = (JSON.parse(row.opaque_contents_json) as StoredOpaqueContent[]).map(
-          fromStoredOpaqueContent,
-        )
-      } catch {
-        opaqueContents = []
-      }
-    }
-
     return {
       opId: row.op_id,
       deviceId: row.device_id,
@@ -168,7 +140,6 @@ export class WorkspaceIdempotencyStore {
       events,
       acceptedOp,
       snapshots,
-      opaqueContents,
     }
   }
 
@@ -179,7 +150,6 @@ export class WorkspaceIdempotencyStore {
       events: WorkspaceChangeEvent[]
       acceptedOp: IdempotencyAcceptedOp
       snapshots: readonly IdempotencySnapshot[]
-      opaqueContents?: readonly IdempotencyOpaqueContent[]
     },
   ): void {
     this.ensureInitialized()
@@ -193,10 +163,9 @@ export class WorkspaceIdempotencyStore {
             applied_at,
             events_json,
             accepted_op_json,
-            snapshots_json,
-            opaque_contents_json
+            snapshots_json
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?)
         `,
         opId,
         deviceId,
@@ -204,7 +173,6 @@ export class WorkspaceIdempotencyStore {
         JSON.stringify(record.events),
         JSON.stringify(record.acceptedOp),
         JSON.stringify(record.snapshots.map(toStoredSnapshot)),
-        JSON.stringify((record.opaqueContents ?? []).map(toStoredOpaqueContent)),
       )
       this.#prune(now)
     })
@@ -225,12 +193,6 @@ interface StoredSnapshot {
   textContent: string
 }
 
-interface StoredOpaqueContent {
-  fileId: string
-  contentBytesB64: string
-  contentHash: string
-}
-
 function toStoredSnapshot(snapshot: IdempotencySnapshot): StoredSnapshot {
   return {
     fileId: snapshot.fileId,
@@ -246,22 +208,6 @@ function fromStoredSnapshot(snapshot: StoredSnapshot): IdempotencySnapshot {
     contentVersion: base64ToBytes(snapshot.contentVersionB64),
     loroSnapshot: base64ToBytes(snapshot.loroSnapshotB64),
     textContent: snapshot.textContent,
-  }
-}
-
-function toStoredOpaqueContent(content: IdempotencyOpaqueContent): StoredOpaqueContent {
-  return {
-    fileId: content.fileId,
-    contentBytesB64: bytesToBase64(content.contentBytes),
-    contentHash: content.contentHash,
-  }
-}
-
-function fromStoredOpaqueContent(content: StoredOpaqueContent): IdempotencyOpaqueContent {
-  return {
-    fileId: content.fileId,
-    contentBytes: base64ToBytes(content.contentBytesB64),
-    contentHash: content.contentHash,
   }
 }
 

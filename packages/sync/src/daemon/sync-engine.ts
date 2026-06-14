@@ -1,4 +1,4 @@
-import { SYNC, type WorkspaceTreeEntry } from '@glovebox/core'
+import { SYNC, type OpaqueManifest, type WorkspaceTreeEntry } from '@glovebox/core'
 import { normalizeEol } from '../fs/eol.ts'
 import { isMarkdownFile } from '../fs/file-kind.ts'
 import { sha256Hex } from '../fs/hash.ts'
@@ -84,6 +84,8 @@ export type SubmitOpaqueResult =
   | {
       type: 'ack'
       hashHex: string
+      sizeBytes: number
+      manifest: OpaqueManifest
       conflict: boolean
       /** Canonical row path (suffixed on create collision). */
       path?: string
@@ -101,6 +103,8 @@ export interface OpaqueFetchResult {
   path?: string
   bytes?: Uint8Array
   hashHex?: string
+  sizeBytes?: number
+  manifest?: OpaqueManifest
 }
 
 export interface DaemonTreeState {
@@ -118,7 +122,11 @@ export interface DaemonTransport {
   /** `opaque.submit` — LWW byte write, resolved by opaque.ack/rejection. */
   submitOpaque(input: SubmitOpaqueInput): Promise<SubmitOpaqueResult>
   /** `opaque.get` — current opaque bytes for one file (read-only). */
-  fetchOpaque(fileId: string): Promise<OpaqueFetchResult>
+  fetchOpaque(
+    fileId: string,
+    existingBytes?: Uint8Array,
+    options?: { metadataOnly?: boolean },
+  ): Promise<OpaqueFetchResult>
   /** `tree.list` — live tree + seq watermark (the adoption surface). */
   listTree(): Promise<DaemonTreeState>
   /** `batch.submit` — structural ops (rename / delete intents). */
@@ -819,7 +827,7 @@ export class DaemonSyncEngine {
   }
 
   /**
-   * Remote opaque bytes (event-carried). Guarded write (INV-5 analog):
+   * Remote opaque bytes (hash event + object fetch). Guarded write (INV-5 analog):
    * only over bytes we wrote/confirmed, or onto an adjudicated absence
    * (canceled delete intent / resurrect authorization). A dirty disk keeps
    * the user's bytes — the next push submits them with a now-stale base,
@@ -828,15 +836,14 @@ export class DaemonSyncEngine {
    */
   async #applyRemoteOpaqueUpdate(event: WireWorkspaceEvent): Promise<void> {
     const view = this.#views.get(event.fileId)
-    if (!view || view.contentKind !== 'opaque' || event.bytesB64 === undefined) return
-    const bytes = base64ToBytes(event.bytesB64)
-    const newHash = sha256Hex(bytes)
+    if (!view || view.contentKind !== 'opaque' || event.hashHex === undefined) return
+    const newHash = event.hashHex
     if (newHash === view.lastWrittenHash) return // Our own echo / already confirmed.
     const diskHash = await this.#fs.hash(view.path).catch(() => null)
     if (diskHash === newHash) {
       // Disk already holds these bytes — roll the watermark only.
       view.lastWrittenHash = newHash
-      view.sizeBytes = bytes.byteLength
+      view.sizeBytes = event.sizeBytes ?? view.sizeBytes
       await this.#persistOpaque(event.fileId)
       return
     }
@@ -849,10 +856,19 @@ export class DaemonSyncEngine {
         return // Unadjudicated absence — the INV-3 machinery owns it.
       }
       this.#resurrect.delete(event.fileId)
+      const fetched = await this.#options.transport.fetchOpaque(event.fileId).catch(() => null)
+      if (!fetched?.bytes || fetched.hashHex !== newHash) return
+      const bytes = fetched.bytes
       await this.#writeOpaqueCheckout(event.fileId, view, bytes)
       return
     }
     if (diskHash !== view.lastWrittenHash) return // Dirty — push adjudicates by LWW.
+    const existingBytes = await this.#fs.readFileBytes(view.path).catch(() => undefined)
+    const fetched = await this.#options.transport
+      .fetchOpaque(event.fileId, existingBytes)
+      .catch(() => null)
+    if (!fetched?.bytes || fetched.hashHex !== newHash) return
+    const bytes = fetched.bytes
     await this.#writeOpaqueCheckout(event.fileId, view, bytes)
   }
 
@@ -869,13 +885,16 @@ export class DaemonSyncEngine {
     for (const [fileId, view] of Array.from(this.#views)) {
       if (view.contentKind !== 'opaque') continue
       if (this.#pendingDeletes.has(fileId)) continue
+      const diskHash = await this.#fs.hash(view.path).catch(() => null)
+      const diskIsClean = diskHash !== null && diskHash === view.lastWrittenHash
       let fetched: OpaqueFetchResult
       try {
-        fetched = await this.#options.transport.fetchOpaque(fileId)
+        fetched = await this.#options.transport.fetchOpaque(fileId, undefined, {
+          metadataOnly: true,
+        })
       } catch {
         continue // Outcome unknown — the next cycle re-polls.
       }
-      const diskHash = await this.#fs.hash(view.path).catch(() => null)
       if (!fetched.found) {
         if (view.lastWrittenHash === '') continue // Never created server-side yet.
         if (diskHash !== null && diskHash !== view.lastWrittenHash) {
@@ -909,7 +928,16 @@ export class DaemonSyncEngine {
         await this.#persistOpaque(fileId)
         continue
       }
-      if (diskHash !== null && diskHash === view.lastWrittenHash && fetched.bytes) {
+      if (diskIsClean) {
+        if (!fetched.bytes) {
+          const existingBytes = await this.#fs.readFileBytes(view.path).catch(() => undefined)
+          try {
+            fetched = await this.#options.transport.fetchOpaque(fileId, existingBytes)
+          } catch {
+            continue
+          }
+        }
+        if (!fetched.bytes || fetched.hashHex === undefined) continue
         await this.#writeOpaqueCheckout(fileId, view, fetched.bytes)
       }
       // Dirty disk: keep the user's bytes; push adjudicates by LWW.

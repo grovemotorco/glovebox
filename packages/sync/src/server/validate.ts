@@ -8,10 +8,20 @@ import type { WorkspaceClientMessage } from './workspace-server.ts'
  */
 
 export interface IngressLimits {
-  /** Pre-decode cap on the raw inbound message, in UTF-16 code units. */
+  /** Absolute pre-decode cap on the raw inbound message, in UTF-16 code units. */
   maxMessageChars: number
   /** Cap on a base64 Loro update field (chars), derived from maxUpdateBytes. */
   maxUpdateB64Chars: number
+  /** Cap on one opaque object/chunk base64 field (chars). */
+  maxOpaqueObjectB64Chars: number
+  /** Raw-message cap for markdown content.submit. */
+  maxContentSubmitMessageChars: number
+  /** Raw-message cap for opaque.submit. */
+  maxOpaqueSubmitMessageChars: number
+  /** Raw-message cap for snapshot.get with initialContent. */
+  maxSnapshotMessageChars: number
+  /** Raw-message cap for lightweight control messages. */
+  maxControlMessageChars: number
   /** Cap on inline initial content (chars). */
   maxInitialContentChars: number
 }
@@ -24,6 +34,8 @@ const PATH_MAX = 1024
 const VERSION_B64_MAX = 262_144
 /** Structural ops per batch — bounds the work one message can demand. */
 const BATCH_OPS_MAX = 128
+const OPAQUE_CHUNKS_MAX = 256
+const OPAQUE_HASH_B64_MAX = 64
 /**
  * Cap on a connection's serialized presence state. Presence is display
  * data (cursor, name, color) — it is broadcast to every socket, so the cap
@@ -35,6 +47,10 @@ export function parseClientMessage(raw: string, limits: IngressLimits): Workspac
   if (raw.length > limits.maxMessageChars) {
     throw new Error('Message exceeds size limit')
   }
+  const hintedLimit = hintedRawLimit(raw, limits)
+  if (hintedLimit !== undefined && raw.length > hintedLimit) {
+    throw new Error('Message exceeds size limit')
+  }
 
   const value: unknown = JSON.parse(raw)
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -44,10 +60,12 @@ export function parseClientMessage(raw: string, limits: IngressLimits): Workspac
 
   switch (message.type) {
     case 'hello':
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'deviceId'])
       optionalString(message, 'deviceId', DEVICE_ID_MAX)
       return message as Extract<WorkspaceClientMessage, { type: 'hello' }>
     case 'snapshot.get':
+      requireRawLength(raw, limits.maxSnapshotMessageChars)
       allowKeys(message, ['type', 'requestId', 'fileId', 'initialContent', 'observedPath'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       requireString(message, 'fileId', FILE_ID_MAX)
@@ -55,37 +73,59 @@ export function parseClientMessage(raw: string, limits: IngressLimits): Workspac
       optionalString(message, 'observedPath', PATH_MAX)
       return message as Extract<WorkspaceClientMessage, { type: 'snapshot.get' }>
     case 'events.since':
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'requestId', 'afterSeq'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       requireNonNegativeInteger(message, 'afterSeq')
       return message as Extract<WorkspaceClientMessage, { type: 'events.since' }>
     case 'tree.list':
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'requestId'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       return message as Extract<WorkspaceClientMessage, { type: 'tree.list' }>
     case 'opaque.get':
-      allowKeys(message, ['type', 'requestId', 'fileId'])
+      requireRawLength(raw, limits.maxControlMessageChars)
+      allowKeys(message, ['type', 'requestId', 'fileId', 'haveObjects', 'metadataOnly'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       requireString(message, 'fileId', FILE_ID_MAX)
+      optionalOpaqueHashArray(message.haveObjects, 'haveObjects')
+      optionalBoolean(message, 'metadataOnly')
       return message as Extract<WorkspaceClientMessage, { type: 'opaque.get' }>
     case 'presence.set':
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'stateJson'])
       requireString(message, 'stateJson', PRESENCE_STATE_JSON_MAX)
       requireJsonString(message, 'stateJson')
       return message as Extract<WorkspaceClientMessage, { type: 'presence.set' }>
     case 'presence.get':
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'requestId'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       return message as Extract<WorkspaceClientMessage, { type: 'presence.get' }>
     case 'opaque.submit':
-      allowKeys(message, ['type', 'fileId', 'observedPath', 'opId', 'baseHashHex', 'bytesB64'])
+      requireRawLength(raw, limits.maxOpaqueSubmitMessageChars)
+      allowKeys(message, [
+        'type',
+        'fileId',
+        'observedPath',
+        'opId',
+        'baseHashHex',
+        'hashHex',
+        'sizeBytes',
+        'manifest',
+        'objects',
+      ])
       requireString(message, 'fileId', FILE_ID_MAX)
       requireString(message, 'observedPath', PATH_MAX)
       requireString(message, 'opId', OP_ID_MAX)
       requireString(message, 'baseHashHex', 64, { allowEmpty: true })
-      requireString(message, 'bytesB64', limits.maxUpdateB64Chars, { allowEmpty: true })
+      requireString(message, 'hashHex', 64)
+      requireNonNegativeInteger(message, 'sizeBytes')
+      requireOpaqueManifest(message.manifest)
+      requireOpaqueObjects(message.objects, limits.maxOpaqueObjectB64Chars)
       return message as Extract<WorkspaceClientMessage, { type: 'opaque.submit' }>
     case 'content.submit':
+      requireRawLength(raw, limits.maxContentSubmitMessageChars)
       allowKeys(message, [
         'type',
         'fileId',
@@ -101,6 +141,7 @@ export function parseClientMessage(raw: string, limits: IngressLimits): Workspac
       requireString(message, 'loroUpdateB64', limits.maxUpdateB64Chars, { allowEmpty: true })
       return message as Extract<WorkspaceClientMessage, { type: 'content.submit' }>
     case 'batch.submit': {
+      requireRawLength(raw, limits.maxControlMessageChars)
       allowKeys(message, ['type', 'requestId', 'ops'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       const ops = message.ops
@@ -150,6 +191,35 @@ function allowKeys(message: Record<string, unknown>, allowed: readonly string[])
   }
 }
 
+function requireRawLength(raw: string, maxChars: number): void {
+  if (raw.length > maxChars) {
+    throw new Error('Message exceeds size limit')
+  }
+}
+
+function hintedRawLimit(raw: string, limits: IngressLimits): number | undefined {
+  const match = /"type"\s*:\s*"([^"]+)"/.exec(raw.slice(0, 4096))
+  if (!match) return undefined
+  switch (match[1]) {
+    case 'opaque.submit':
+      return limits.maxOpaqueSubmitMessageChars
+    case 'content.submit':
+      return limits.maxContentSubmitMessageChars
+    case 'snapshot.get':
+      return limits.maxSnapshotMessageChars
+    case 'hello':
+    case 'events.since':
+    case 'tree.list':
+    case 'opaque.get':
+    case 'presence.set':
+    case 'presence.get':
+    case 'batch.submit':
+      return limits.maxControlMessageChars
+    default:
+      return limits.maxControlMessageChars
+  }
+}
+
 function requireString(
   message: Record<string, unknown>,
   key: string,
@@ -187,4 +257,63 @@ function requireJsonString(message: Record<string, unknown>, key: string): void 
 function optionalString(message: Record<string, unknown>, key: string, maxChars: number): void {
   if (message[key] === undefined) return
   requireString(message, key, maxChars)
+}
+
+function optionalBoolean(message: Record<string, unknown>, key: string): void {
+  if (message[key] === undefined) return
+  if (typeof message[key] !== 'boolean') {
+    throw new Error(`Expected boolean field: ${key}`)
+  }
+}
+
+function requireOpaqueManifest(value: unknown): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Expected object field: manifest')
+  }
+  const manifest = value as Record<string, unknown>
+  allowKeys(manifest, ['chunks'])
+  const chunks = manifest.chunks
+  if (!Array.isArray(chunks) || chunks.length > OPAQUE_CHUNKS_MAX) {
+    throw new Error('Field out of bounds: manifest.chunks')
+  }
+  for (const raw of chunks) {
+    requireOpaqueChunk(raw)
+  }
+}
+
+function requireOpaqueObjects(value: unknown, maxBytesB64Chars: number): void {
+  if (!Array.isArray(value) || value.length > OPAQUE_CHUNKS_MAX) {
+    throw new Error('Field out of bounds: objects')
+  }
+  for (const raw of value) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error('Expected object in opaque objects')
+    }
+    const object = raw as Record<string, unknown>
+    allowKeys(object, ['hashB64', 'bytesB64'])
+    requireString(object, 'hashB64', OPAQUE_HASH_B64_MAX)
+    requireString(object, 'bytesB64', maxBytesB64Chars, { allowEmpty: true })
+  }
+}
+
+function optionalOpaqueHashArray(value: unknown, key: string): void {
+  if (value === undefined) return
+  if (!Array.isArray(value) || value.length > OPAQUE_CHUNKS_MAX) {
+    throw new Error(`Field out of bounds: ${key}`)
+  }
+  for (const raw of value) {
+    if (typeof raw !== 'string' || raw.length === 0 || raw.length > OPAQUE_HASH_B64_MAX) {
+      throw new Error(`Invalid opaque hash in ${key}`)
+    }
+  }
+}
+
+function requireOpaqueChunk(value: unknown): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Expected object in manifest.chunks')
+  }
+  const chunk = value as Record<string, unknown>
+  allowKeys(chunk, ['hashB64', 'size'])
+  requireString(chunk, 'hashB64', OPAQUE_HASH_B64_MAX)
+  requireNonNegativeInteger(chunk, 'size')
 }
