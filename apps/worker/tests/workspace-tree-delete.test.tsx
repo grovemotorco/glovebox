@@ -5,7 +5,12 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WorkspaceTreeEntry } from '@glovebox/api'
 import { bytesToBase64, LoroFileDoc } from '@glovebox/sync/loro'
-import { useRoom, useWorkspace, WorkspaceProvider, type RoomHandle } from '../src/state/workspace.tsx'
+import {
+  useRoom,
+  useWorkspace,
+  WorkspaceProvider,
+  type RoomHandle,
+} from '../src/state/workspace.tsx'
 
 const apiMock = vi.hoisted(() => ({
   treeEntries: [] as WorkspaceTreeEntry[],
@@ -47,6 +52,7 @@ describe('WorkspaceProvider remote tree delete handling', () => {
     globalThis.IS_REACT_ACT_ENVIRONMENT = true
     latest = null
     FakeWebSocket.instances = []
+    FakeWebSocket.eventsSinceMode = 'empty'
     apiMock.treeEntries = [entry('file-1', 'docs/a.md', 1)]
     apiMock.treeSeq = 1
     apiMock.workspaces.create.mockReset()
@@ -153,10 +159,7 @@ describe('WorkspaceProvider remote tree delete handling', () => {
           seq: 2,
         })
       })
-      expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual([
-        'file-1',
-        'file-2',
-      ])
+      expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual(['file-1', 'file-2'])
 
       apiMock.treeEntries = []
       apiMock.treeSeq = 1
@@ -164,16 +167,57 @@ describe('WorkspaceProvider remote tree delete handling', () => {
         await latest?.workspace.refreshTree()
       })
 
-      expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual([
-        'file-1',
-        'file-2',
-      ])
+      expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual(['file-1', 'file-2'])
     } finally {
       await act(async () => root.unmount())
     }
   })
 
-  it('refreshes authoritative tree state after a gapped event', async () => {
+  it('applies a tree event after a content edit WITHOUT a full refetch (ISSUE-0048 Phase B)', async () => {
+    const root = await renderWorkspace()
+    try {
+      const socket = await connectWorkspace()
+      const refetchesAfterConnect = apiMock.workspaces.tree.mock.calls.length
+
+      // A content edit advances the engine's single cursor (seq 2). Under the
+      // old two-cursor model the next tree op looked like a gap and forced a
+      // full refetch; the engine now forwards it gap-free.
+      await act(async () => {
+        socket.receive({
+          type: 'content.loroUpdate',
+          fileId: 'file-1',
+          loroUpdateB64: 'AA==',
+          contentVersionB64: '',
+          seq: 2,
+        })
+      })
+
+      // A tree create at the very next seq (3) is applied incrementally.
+      await act(async () => {
+        socket.receive({
+          type: 'create',
+          fileId: 'file-2',
+          path: 'docs/b.md',
+          entry: entry('file-2', 'docs/b.md', 3),
+          seq: 3,
+        })
+      })
+
+      await waitFor(() => latest?.workspace.tree.some((item) => item.fileId === 'file-2') === true)
+      expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual(['file-1', 'file-2'])
+      // The content-induced gap did NOT trigger any extra authoritative refetch.
+      expect(apiMock.workspaces.tree.mock.calls.length).toBe(refetchesAfterConnect)
+    } finally {
+      await act(async () => root.unmount())
+    }
+  })
+
+  it('recovers authoritative tree state after a gap via the engine tree-resync', async () => {
+    // ISSUE-0048 Phase B: a real seq gap (a missed structural event) is
+    // recovered by the engine's single cursor, not the worker. The gapped
+    // live event drives engine.#pull → events.since; a lost replay window
+    // answers snapshot-required, so the engine emits tree-resync and the
+    // worker does its one legitimate full refetch (not a per-event refetch).
     const root = await renderWorkspace()
     try {
       const socket = await connectWorkspace()
@@ -183,6 +227,7 @@ describe('WorkspaceProvider remote tree delete handling', () => {
         entry('file-3', 'docs/c.md', 4),
       ]
       apiMock.treeSeq = 4
+      FakeWebSocket.eventsSinceMode = 'snapshot-required'
 
       await act(async () => {
         socket.receive({
@@ -194,9 +239,7 @@ describe('WorkspaceProvider remote tree delete handling', () => {
         })
       })
 
-      await waitFor(() =>
-        latest?.workspace.tree.some((item) => item.fileId === 'file-2') === true
-      )
+      await waitFor(() => latest?.workspace.tree.some((item) => item.fileId === 'file-2') === true)
       expect(latest?.workspace.tree.map((item) => item.fileId).sort()).toEqual([
         'file-1',
         'file-2',
@@ -291,6 +334,10 @@ class FakeWebSocket extends EventTarget {
   static readonly CLOSING = 2
   static readonly CLOSED = 3
   static instances: FakeWebSocket[] = []
+  // How the fake server answers the engine's events.since catch-up. Default
+  // 'empty' keeps the engine quiet; 'snapshot-required' models a lost replay
+  // window so the engine emits tree-resync (ISSUE-0048 Phase B).
+  static eventsSinceMode: 'empty' | 'snapshot-required' = 'empty'
 
   readyState = FakeWebSocket.CONNECTING
   readonly url: string
@@ -307,10 +354,19 @@ class FakeWebSocket extends EventTarget {
     this.#sent.push(text)
     const message = JSON.parse(text) as { type?: string; requestId?: string }
     if (message.type === 'events.since' && message.requestId) {
+      const requestId = message.requestId
       queueMicrotask(() => {
+        if (FakeWebSocket.eventsSinceMode === 'snapshot-required') {
+          this.receive({
+            type: 'events.snapshot-required',
+            requestId,
+            currentSeq: apiMock.treeSeq,
+          })
+          return
+        }
         this.receive({
           type: 'events.batch',
-          requestId: message.requestId,
+          requestId,
           currentSeq: apiMock.treeSeq,
           events: [],
         })

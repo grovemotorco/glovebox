@@ -187,6 +187,14 @@ export class DaemonSyncEngine {
   /** Files whose submit was deferred with history-pruned — repaired in push. */
   readonly #needsRepair = new Set<string>()
   /**
+   * Remote renames (fileId → newPath) that bailed because another tracked
+   * view still held the destination (ISSUE-0050 A): never collapse two
+   * identities onto one path. Retried each cycle once the holder vacates
+   * (it is pushed and server-suffixed, freeing the path). In-memory: a crash
+   * mid-bail leaves only a cosmetic path divergence, never a byte swap.
+   */
+  readonly #renameReconcile = new Map<string, string>()
+  /**
    * Opaque submit retransmission state (in-memory): byte-identical retries
    * reuse the opId so the server's idempotency store dedupes; any change to
    * the bytes or the base mints a fresh op.
@@ -330,6 +338,9 @@ export class DaemonSyncEngine {
       this.#needsAdoption = false
     }
     await this.#pull()
+    // A bailed remote rename (ISSUE-0050 A) re-applies once this cycle's
+    // pull has relocated the tracked view that held its destination.
+    await this.#retryRenameReconcile()
     await this.#checkoutCleanFiles()
     await this.#scan()
     await this.#propagateTreeOps()
@@ -603,10 +614,10 @@ export class DaemonSyncEngine {
     }
     const diskHash = await this.#fs.hash(path).catch(() => null)
     if (diskHash !== null) {
-      if (entry && entry.contentHash === diskHash) {
-        // The exact bytes already sit at the path: this is our own create
-        // replayed after a crash between the server-side create and the
-        // local persist (or an identical concurrent create). Re-creating
+      if (entry && (await this.#diskMatchesEntry(entry, path, diskHash))) {
+        // The entry's content already sits at the path: this is our own
+        // create replayed after a crash between the server-side create and
+        // the local persist (or an identical concurrent create). Re-creating
         // would suffix-duplicate the file — bind by path instead.
         await this.#bindTreeEntry(entry)
         return
@@ -645,11 +656,35 @@ export class DaemonSyncEngine {
     await this.#persistMarkdown(event.fileId)
   }
 
+  /**
+   * Do the bytes at `path` already hold the server entry's content? Exact
+   * for opaque (raw disk bytes). For markdown the server's `contentHash` is
+   * over `normalizeEol`-d (LF) text (workspace-store), so a CRLF working
+   * copy fails the raw-hash compare and must be normalized first — otherwise
+   * the adopt-by-hash bind never fires for CRLF files and they
+   * suffix-duplicate (ISSUE-0050 C, defeating ISSUE-0047 C for CRLF).
+   */
+  async #diskMatchesEntry(
+    entry: WorkspaceTreeEntry,
+    path: string,
+    diskHash: string,
+  ): Promise<boolean> {
+    if (entry.contentHash === diskHash) return true
+    if (entry.contentKind === 'opaque') return false
+    const text = await this.#fs.readFile(path).catch(() => null)
+    if (text === null) return false
+    return sha256Hex(normalizeEol(text)) === entry.contentHash
+  }
+
+  /**
+   * Relocate an unrelated local file occupying a path we need, preserving
+   * its bytes at a free suffix (INV-2). One atomic move (ISSUE-0050 B):
+   * never read→write-suffix→delete, where a crash between the write and the
+   * delete leaves BOTH copies — the untracked leftover then re-registers as
+   * a propagated duplicate (triplicate after re-pull), never self-healing.
+   */
   async #moveUnknownLocalCollision(path: string): Promise<void> {
-    const bytes = await this.#fs.readFileBytes(path)
-    const nextPath = await this.#nextLocalSuffixPath(path)
-    await this.#fs.writeFileBytes(nextPath, bytes)
-    await this.#fs.deletePath(path)
+    await this.#fs.move(path, await this.#nextLocalSuffixPath(path))
   }
 
   async #nextLocalSuffixPath(path: string): Promise<string> {
@@ -662,32 +697,83 @@ export class DaemonSyncEngine {
   }
 
   /**
+   * Make `newPath` safe to repoint a view onto, BEFORE any `view.path` write
+   * (ISSUE-0050 A). Returns false — the caller bails, leaving the view at
+   * its old path — when ANOTHER tracked view already owns `newPath`: two
+   * identities must never collapse onto one path (`scanMount` would key both
+   * by the same path, see the loser as missing → delete-intent → silent
+   * content loss). Otherwise it frees the path and returns true: an
+   * unrelated untracked local file there is unseen user data, relocated to a
+   * suffix (INV-2) exactly as #applyRemoteCreate handles an occupied create
+   * target; a free path, or one already holding this view's own bytes (a
+   * crash-replayed move / echo), is left untouched.
+   */
+  async #clearRenameDestination(view: EngineFileView, newPath: string): Promise<boolean> {
+    for (const other of this.#views.values()) {
+      if (other !== view && other.path === newPath) return false
+    }
+    const destHash = await this.#fs.hash(newPath).catch(() => null)
+    if (destHash === null || destHash === view.lastWrittenHash) return true
+    await this.#moveUnknownLocalCollision(newPath)
+    return true
+  }
+
+  /**
+   * Re-attempt remote renames that bailed because their destination was held
+   * by another tracked view (ISSUE-0050 A). The holder vacates once it is
+   * pushed and the server suffixes its create (the `create` broadcast
+   * re-enters as a rename and relocates it), freeing the path for this
+   * retry; a still-held destination re-arms the entry, an absent/already-
+   * moved view drops it.
+   */
+  async #retryRenameReconcile(): Promise<void> {
+    if (this.#renameReconcile.size === 0) return
+    for (const [fileId, newPath] of Array.from(this.#renameReconcile)) {
+      this.#renameReconcile.delete(fileId)
+      const view = this.#views.get(fileId)
+      if (!view || view.path === newPath) continue
+      await this.#applyRemoteRename({ type: 'rename', fileId, newPath } as WireWorkspaceEvent)
+    }
+  }
+
+  /**
    * A remote replica's accepted rename: move the local view and disk file,
    * re-deriving the content kind when the path crossed the md↔opaque
-   * boundary (ISSUE-0043).
+   * boundary (ISSUE-0043). The destination is cleared first
+   * (#clearRenameDestination) so the view is never repointed onto unrelated
+   * local bytes — an unconditional repoint there folds foreign bytes into
+   * this fileId's doc and swaps content server-side (ISSUE-0050 A).
    */
   async #applyRemoteRename(event: WireWorkspaceEvent): Promise<void> {
     const view = this.#views.get(event.fileId)
     if (!view || !event.newPath) return
-    if (view.path === event.newPath) return // Our own rename echoing back.
-    const newKind = isMarkdownFile(event.newPath) ? 'markdown' : 'opaque'
-
-    // Never move ONTO an occupied destination — an untracked local file
-    // at the target path is unseen user data (scan adjudicates it).
-    const destOccupied = (await this.#fs.hash(event.newPath).catch(() => null)) !== null
+    if (view.path === event.newPath) {
+      this.#renameReconcile.delete(event.fileId)
+      return // Our own rename echoing back.
+    }
+    const newPath = event.newPath
+    const newKind = isMarkdownFile(newPath) ? 'markdown' : 'opaque'
 
     if (view.contentKind === 'opaque') {
-      // Move the disk bytes only when they are exactly ours (INV-5 analog);
-      // a dirty or absent file keeps the user's state at the old path.
+      // The opaque watermark is the disk-byte hash, so the same clean-bytes
+      // test recognizes an already-moved / echoed destination as ours.
       const oldPath = view.path
       const diskHash = await this.#fs.hash(oldPath).catch(() => null)
-      view.path = event.newPath
-      if (!destOccupied && diskHash !== null && diskHash === view.lastWrittenHash) {
+      if (!(await this.#clearRenameDestination(view, newPath))) {
+        this.#renameReconcile.set(event.fileId, newPath)
+        return
+      }
+      this.#renameReconcile.delete(event.fileId)
+      view.path = newPath
+      // Move the disk bytes only when they are exactly ours (INV-5 analog);
+      // a dirty or absent file keeps the user's state at the old path. The
+      // destination is provably free-or-ours now, so no occupancy guard.
+      if (diskHash !== null && diskHash === view.lastWrittenHash) {
         const bytes = await this.#fs.readFileBytes(oldPath).catch(() => null)
         if (bytes !== null) {
-          const writtenHash = await this.#fs.writeFileBytes(event.newPath, bytes)
+          const writtenHash = await this.#fs.writeFileBytes(newPath, bytes)
           await this.#fs.deletePath(oldPath)
-          const stat = await this.#fs.stat(event.newPath)
+          const stat = await this.#fs.stat(newPath)
           Object.assign(view, {
             lastWrittenHash: writtenHash,
             sizeBytes: bytes.byteLength,
@@ -705,16 +791,22 @@ export class DaemonSyncEngine {
 
     const client = this.#clients.get(event.fileId)
     // An unseen local edit at the old path is absorbed (anchored) before
-    // the move so the rename can never discard it (INV-2).
+    // the move so the rename can never discard it (INV-2). It runs on the
+    // old path, before #clearRenameDestination touches the destination.
     await this.#absorbDiskIfDirty(event.fileId)
     const oldPath = view.path
     const diskHash = await this.#fs.hash(oldPath).catch(() => null)
-    view.path = event.newPath
-    if (!destOccupied && client && diskHash !== null && diskHash === view.lastWrittenHash) {
+    if (!(await this.#clearRenameDestination(view, newPath))) {
+      this.#renameReconcile.set(event.fileId, newPath)
+      return
+    }
+    this.#renameReconcile.delete(event.fileId)
+    view.path = newPath
+    if (client && diskHash !== null && diskHash === view.lastWrittenHash) {
       const text = client.getTextContent()
-      const writtenHash = await this.#fs.writeFile(event.newPath, text)
+      const writtenHash = await this.#fs.writeFile(newPath, text)
       await this.#fs.deletePath(oldPath)
-      const stat = await this.#fs.stat(event.newPath)
+      const stat = await this.#fs.stat(newPath)
       Object.assign(view, {
         lastWrittenHash: writtenHash,
         lastWrittenVV: client.getDoc().contentVersion(),
@@ -1485,6 +1577,7 @@ export class DaemonSyncEngine {
     this.#needsRepair.delete(fileId)
     this.#opaqueInFlight.delete(fileId)
     this.#opaqueRefused.delete(fileId)
+    this.#renameReconcile.delete(fileId)
     await this.#store.removeFile(fileId)
   }
 

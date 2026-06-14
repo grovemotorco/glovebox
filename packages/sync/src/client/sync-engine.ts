@@ -70,6 +70,20 @@ export interface SyncEngineOptions {
 export type SyncEngineChange =
   | { type: 'file-changed'; fileId: string; reason: 'local-edit' | 'remote-update' | 'hydrated' }
   | { type: 'repair'; fileId: string; reason: 'history-pruned' | 'import-pending' }
+  /**
+   * A structural event (create/rename/delete) forwarded in the engine's
+   * single-cursor seq order — gap-free, because a real seq gap is filled by
+   * `#pull` before any later event is emitted. The tree consumer applies it
+   * incrementally instead of refetching on a content-induced seq jump
+   * (ISSUE-0048 Phase B).
+   */
+  | { type: 'tree-event'; event: WireWorkspaceEvent }
+  /**
+   * The replay window was lost (snapshot-required): the consumer does its
+   * one legitimate full tree refetch. This is the only structural refetch
+   * the engine asks for.
+   */
+  | { type: 'tree-resync' }
 
 export class WorkspaceSyncEngine {
   readonly #options: SyncEngineOptions
@@ -293,6 +307,9 @@ export class WorkspaceSyncEngine {
       }
       this.#state.lastAckedSeq = result.currentSeq
       await this.#store.setLastAckedSeq(result.currentSeq)
+      // The window is gone — structural events may have been missed too; the
+      // tree consumer does its one legitimate full refetch (ISSUE-0048).
+      this.#emit({ type: 'tree-resync' })
       return
     }
 
@@ -302,6 +319,11 @@ export class WorkspaceSyncEngine {
         const bucket = updatesByFile.get(event.fileId) ?? []
         bucket.push(base64ToBytes(event.loroUpdateB64))
         updatesByFile.set(event.fileId, bucket)
+      } else if (event.type === 'create' || event.type === 'rename' || event.type === 'delete') {
+        // Forward structural events in seq order; this replay already filled
+        // the gap that triggered it, so they reach the tree consumer
+        // gap-free and apply incrementally (ISSUE-0048 Phase B).
+        this.#emit({ type: 'tree-event', event })
       }
     }
 
@@ -343,6 +365,11 @@ export class WorkspaceSyncEngine {
         }
         await this.#persistFile(event.fileId)
       }
+    } else if (event.type === 'create' || event.type === 'rename' || event.type === 'delete') {
+      // Contiguous with the cursor (the gap branch above pulled otherwise),
+      // so this structural event reaches the tree consumer in seq order
+      // (ISSUE-0048 Phase B).
+      this.#emit({ type: 'tree-event', event })
     }
 
     this.#state.lastAckedSeq = event.seq

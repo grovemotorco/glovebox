@@ -115,9 +115,18 @@ export class MemoryFS implements LocalFS {
   }
 
   /**
-   * POSIX rename(2) semantics for simulated editors (not part of LocalFS —
-   * daemons never rename, editors do): the moved node keeps its identity
-   * (nodeId travels with it), an existing target is replaced atomically.
+   * Atomic move (LocalFS): the moved node keeps its identity (nodeId travels
+   * with it), an existing target is replaced atomically, parents are
+   * created. The daemon relocates a colliding local file with this single op
+   * so a crash can never leave both the original and the copy (ISSUE-0050 B).
+   */
+  async move(fromPath: string, toPath: string): Promise<void> {
+    await this.rename(fromPath, toPath)
+  }
+
+  /**
+   * POSIX rename(2) for simulated editors — identical nodeId-preserving
+   * semantics to `move`, kept as the name the editor-save corpus reads.
    */
   async rename(fromPath: string, toPath: string): Promise<void> {
     const fromNormalized = this.normalizePath(fromPath)

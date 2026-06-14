@@ -163,6 +163,10 @@ export function WorkspaceProvider({
   const engineReadyRef = useRef<Promise<void> | null>(null)
   const workspaceIdRef = useRef<string | null>(null)
   const treeDataRef = useRef<TreeData | null>(null)
+  // True once the socket has reached 'open' for the current connection, so a
+  // later 'open' is a reconnect — the engine re-pulls to recover broadcasts
+  // missed while the socket was down (ISSUE-0048 Phase B).
+  const socketReopenedRef = useRef(false)
   // One lazily-created mutable store for room state, so re-renders never
   // allocate throwaway Map/Set instances in initializers.
   const [roomStore] = useState(() => ({
@@ -283,6 +287,12 @@ export function WorkspaceProvider({
     [emitRooms, refreshTree, roomStore],
   )
 
+  // Driven by the engine's gap-free tree-event stream (ISSUE-0048 Phase B):
+  // the engine owns the single workspace-seq cursor and fills any real gap
+  // via events.since BEFORE forwarding, so a tree op after a content edit no
+  // longer reads as a gap here — the redundant full refetch is gone. The
+  // dedup against treeData.seq stays for idempotency (replayed/echoed ops);
+  // a genuine replay-window miss arrives as tree-resync, not through here.
   const handleTreeEvent = useCallback(
     (event: TreeWireEvent) => {
       if (!workspaceId || workspaceIdRef.current !== workspaceId) return
@@ -293,7 +303,6 @@ export function WorkspaceProvider({
       }
       if (event.seq <= current.seq) return
 
-      const hadGap = event.seq > current.seq + 1
       if (event.type === 'delete') {
         const handle = roomStore.rooms.get(event.fileId)
         if (handle && roomHasPendingChanges(handle)) {
@@ -323,9 +332,15 @@ export function WorkspaceProvider({
         }
       }
       if (roomsChanged) emitRooms()
-      if (hadGap) void refreshTree().catch(() => {})
     },
-    [commitTreeData, emitRooms, refreshTree, resurrectRoomFromPendingDelete, roomStore, workspaceId],
+    [
+      commitTreeData,
+      emitRooms,
+      refreshTree,
+      resurrectRoomFromPendingDelete,
+      roomStore,
+      workspaceId,
+    ],
   )
 
   // Load the basics on workspace switch. No reset needed: the keyed
@@ -345,8 +360,10 @@ export function WorkspaceProvider({
   const invites = inviteData?.workspaceId === workspaceId ? inviteData.value : EMPTY_INVITES
   const recovery = recoveryData?.workspaceId === workspaceId ? recoveryData.value : EMPTY_RECOVERY
 
-  // Tree broadcasts are the fast path; polling is the full-state backstop
-  // for missed events and content-edit metadata.
+  // The engine's tree-event/tree-resync stream is the fast path and the
+  // miss-recovery path (gap→pull, reconnect→pull); this slow poll is kept
+  // only as a bounded backstop for content-edit row metadata (size/mtime),
+  // which rides no structural event (ISSUE-0048 Phase B decision).
   useEffect(() => {
     if (!workspaceId || !autoSync) return
     const timer = window.setInterval(() => {
@@ -365,9 +382,20 @@ export function WorkspaceProvider({
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const baseUrl = `${wsProtocol}//${window.location.host}/ws/${encodeURIComponent(workspaceId)}`
+    socketReopenedRef.current = false
     const transport = new WorkspaceSocketTransport({
       deviceId,
-      onStatus: setSocketStatus,
+      onStatus: (status) => {
+        setSocketStatus(status)
+        if (status === 'open') {
+          // A reconnect (open after a prior open) may have missed broadcasts
+          // while down; re-pull through the engine's single cursor so missed
+          // structural events recover via tree-event/tree-resync. The first
+          // open is covered by engine.start()'s own pull.
+          if (socketReopenedRef.current) void engineRef.current?.pull().catch(() => {})
+          socketReopenedRef.current = true
+        }
+      },
       getUrl: async () => {
         try {
           const minted = await api.auth.mintWorkspaceSocketToken({ workspaceId })
@@ -397,7 +425,23 @@ export function WorkspaceProvider({
     })
     const presence = new WorkspacePresence({ transport })
     const unsubscribePresence = presence.subscribe(() => setPeers(presence.peers()))
+    // Structural broadcasts drive the tree SYNCHRONOUSLY (ISSUE-0048 Phase B):
+    // `handleTreeEvent` applies create/rename/delete in arriving (seq) order
+    // with NO content-induced refetch (the old `hadGap` poll is gone). The
+    // delete-vs-edit resurrect (INV-2) MUST stay on this synchronous path —
+    // routing it through the engine's async queue let a concurrent ack clear
+    // the room's pending-edit flag before the resurrect ran, dropping the edit
+    // under load (regression caught by the live gate's
+    // s_browser_delete_vs_edit_resurrect cell).
     const unsubscribeTreeEvents = transport.subscribeTreeEvents(handleTreeEvent)
+    // The engine is the single-cursor authority for GAP RECOVERY: it advances
+    // one workspace-seq cursor over every event type and, when the replay
+    // window is lost, asks for the one legitimate full tree refetch via
+    // tree-resync. (It also forwards gap-free tree-events for future use; the
+    // tree map is React-owned in this variant.)
+    const unsubscribeEngine = engine.onChange((change) => {
+      if (change.type === 'tree-resync') void refreshTree().catch(() => {})
+    })
     let cancelled = false
     void presence
       .start()
@@ -412,6 +456,7 @@ export function WorkspaceProvider({
       cancelled = true
       unsubscribePresence()
       unsubscribeTreeEvents()
+      unsubscribeEngine()
       presence.stop()
       engine.stop()
       engineRef.current = null
@@ -436,6 +481,7 @@ export function WorkspaceProvider({
     roomStore,
     emitRooms,
     handleTreeEvent,
+    refreshTree,
   ])
 
   const openFile = useCallback(
