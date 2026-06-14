@@ -723,7 +723,7 @@ describe('WorkspaceStore', () => {
 
     const created = store.createOpaqueFile(
       'assets/icon.png',
-      bytes,
+      { contentHash: sha256Hex(bytes), sizeBytes: bytes.byteLength },
       { modifiedBy: 'daemon' },
       'fixed-file-id',
     )
@@ -735,7 +735,7 @@ describe('WorkspaceStore', () => {
       sizeBytes: bytes.byteLength,
       version: 1,
     })
-    expect(store.readFileBytesById('fixed-file-id')).toEqual(bytes)
+    expect(store.readFileBytesById('fixed-file-id')).toBeNull()
     expect(store.getTreeEntryByFileId('fixed-file-id')).toMatchObject({
       fileId: 'fixed-file-id',
       path: 'assets/icon.png',
@@ -746,7 +746,10 @@ describe('WorkspaceStore', () => {
     // an idempotent replay must not double-create or clobber bytes.
     const duplicate = store.createOpaqueFile(
       'assets/icon.png',
-      new TextEncoder().encode('other bytes'),
+      {
+        contentHash: sha256Hex(new TextEncoder().encode('other bytes')),
+        sizeBytes: new TextEncoder().encode('other bytes').byteLength,
+      },
       { modifiedBy: 'browser' },
       'other-file-id',
     )
@@ -757,29 +760,44 @@ describe('WorkspaceStore', () => {
       sizeBytes: bytes.byteLength,
       version: 1,
     })
-    expect(store.readFileBytesById('fixed-file-id')).toEqual(bytes)
+    expect(store.readFileBytesById('fixed-file-id')).toBeNull()
     expect(store.getByFileId('other-file-id')).toBeNull()
   })
 
-  test('transitionContentKind round-trips md→opaque→md preserving UTF-8 content', () => {
+  test('content-kind transitions keep opaque rows metadata-only', () => {
     const store = createStore()
     const created = store.createFile('docs/notes.md', '# hello\n', { modifiedBy: 'daemon' })
     const utf8 = new TextEncoder().encode('# hello\n')
 
     // Same-kind and missing rows are no-ops.
-    expect(store.transitionContentKind(created.fileId, 'markdown')).toBe(false)
-    expect(store.transitionContentKind('missing-file', 'opaque')).toBe(false)
+    expect(store.transitionOpaqueToMarkdown(created.fileId, '# hello\n')).toBe(false)
+    expect(
+      store.transitionMarkdownToOpaque('missing-file', {
+        contentHash: sha256Hex(utf8),
+        sizeBytes: utf8.byteLength,
+      }),
+    ).toBe(false)
 
-    expect(store.transitionContentKind(created.fileId, 'opaque')).toBe(true)
+    expect(
+      store.transitionMarkdownToOpaque(created.fileId, {
+        contentHash: sha256Hex(utf8),
+        sizeBytes: utf8.byteLength,
+      }),
+    ).toBe(true)
     expect(store.getTreeEntryByFileId(created.fileId)).toMatchObject({
       contentKind: 'opaque',
       contentHash: sha256Hex(utf8),
       sizeBytes: utf8.byteLength,
     })
-    expect(store.readFileBytesById(created.fileId)).toEqual(utf8)
-    expect(store.transitionContentKind(created.fileId, 'opaque')).toBe(false)
+    expect(store.readFileBytesById(created.fileId)).toBeNull()
+    expect(
+      store.transitionMarkdownToOpaque(created.fileId, {
+        contentHash: sha256Hex(utf8),
+        sizeBytes: utf8.byteLength,
+      }),
+    ).toBe(false)
 
-    expect(store.transitionContentKind(created.fileId, 'markdown')).toBe(true)
+    expect(store.transitionOpaqueToMarkdown(created.fileId, '# hello\n')).toBe(true)
     const entry = store.getTreeEntryByFileId(created.fileId)!
     // Markdown is the implicit kind — entries only carry contentKind when opaque.
     expect(entry.contentKind).toBeUndefined()

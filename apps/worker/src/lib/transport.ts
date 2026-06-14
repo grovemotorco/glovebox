@@ -6,6 +6,7 @@ import {
   type SubmitUpdateInput,
   type SubmitUpdateResult,
 } from '@glovebox/sync/loro'
+import type { OpaqueManifest } from '@glovebox/core'
 import type {
   EventsSinceResult,
   WireWorkspaceEvent,
@@ -257,8 +258,9 @@ export class WorkspaceSocketTransport
       | {
           type: 'content.opaqueUpdate'
           fileId: string
-          bytesB64?: string
-          contentVersionB64?: string
+          hashHex: string
+          sizeBytes: number
+          manifest: OpaqueManifest
           originDeviceId?: string
           seq?: number
         }
@@ -509,7 +511,10 @@ export class WorkspaceSocketTransport
     const registeredSeed = this.#snapshotSeeds.get(fileId)
     const seed =
       observedPath !== undefined || initialContent !== undefined
-        ? { observedPath: observedPath ?? registeredSeed?.observedPath ?? `${fileId}.md`, initialContent }
+        ? {
+            observedPath: observedPath ?? registeredSeed?.observedPath ?? `${fileId}.md`,
+            initialContent,
+          }
         : registeredSeed
     this.#sendWhenReady({
       type: 'snapshot.get',

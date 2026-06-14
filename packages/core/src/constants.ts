@@ -15,6 +15,7 @@ export const PERSISTENCE = {
 export const LIMITS = {
   maxUpdateBytes: 1_048_576,
   maxMarkdownBytes: 1_048_576,
+  maxOpaqueBytes: 10 * 1024 * 1024,
 } as const
 
 export const SYNC = {

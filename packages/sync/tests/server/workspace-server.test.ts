@@ -1,9 +1,11 @@
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
+import { Database as DofsDatabase, readRangeSync, stat as dofsStat } from '@glovebox/dofs'
 import { LoroFileDoc } from '../../src/loro/file-doc.ts'
 import { sha256Hex } from '../../src/server/hash.ts'
 import { base64ToBytes, bytesToBase64 } from '../../src/loro/base64.ts'
 import { SqliteLoroFileStore } from '../../src/server/sqlite-loro-store.ts'
+import { assembleOpaqueWirePayload, buildOpaqueWirePayload } from '../../src/opaque-wire.ts'
 import {
   WorkspaceServer,
   type WorkspaceConnectionClaims,
@@ -273,6 +275,50 @@ async function submitEdit(
   return message
 }
 
+function opaqueSubmitMessage(input: {
+  fileId: string
+  observedPath: string
+  opId: string
+  baseHashHex: string
+  bytes: Uint8Array
+}): WorkspaceClientMessage {
+  return {
+    type: 'opaque.submit',
+    fileId: input.fileId,
+    observedPath: input.observedPath,
+    opId: input.opId,
+    baseHashHex: input.baseHashHex,
+    ...buildOpaqueWirePayload(input.bytes),
+  }
+}
+
+function opaqueResponseBytes(
+  response: Extract<WorkspaceServerMessage, { type: 'opaque.response' }>,
+): Uint8Array | undefined {
+  if (
+    response.hashHex === undefined ||
+    response.sizeBytes === undefined ||
+    response.manifest === undefined ||
+    response.objects === undefined
+  ) {
+    return undefined
+  }
+  return assembleOpaqueWirePayload({
+    hashHex: response.hashHex,
+    sizeBytes: response.sizeBytes,
+    manifest: response.manifest,
+    objects: response.objects,
+  })
+}
+
+function patternedOpaqueBytes(size: number): Uint8Array {
+  const bytes = new Uint8Array(size)
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    bytes[i] = (i * 31 + Math.floor(i / 257)) % 251
+  }
+  return bytes
+}
+
 function tableRowCount(host: FakeHost, table: string): number {
   const exists = host.storage.sql
     .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table)
@@ -280,6 +326,15 @@ function tableRowCount(host: FakeHost, table: string): number {
   if (exists.length === 0) return 0
   const row = host.storage.sql.exec(`SELECT COUNT(*) AS count FROM ${table}`).toArray()[0]
   return Number(row?.count ?? 0)
+}
+
+function readDofsFile(host: FakeHost, path: string): Uint8Array {
+  const db = new DofsDatabase({
+    sql: host.storage.sql,
+    transactionSync: (closure) => host.storage.sql.transactionSync(closure),
+  } as ConstructorParameters<typeof DofsDatabase>[0])
+  const size = dofsStat(db, path).size
+  return readRangeSync(db, path, 0, size)
 }
 
 describe('WorkspaceServer test transaction harness', () => {
@@ -575,13 +630,13 @@ describe('WorkspaceServer hibernation safety', () => {
 
   it('rejects raw messages over the pre-decode length cap without parsing', async () => {
     const host = new FakeHost({
-      limits: { maxUpdateBytes: 1024 },
+      limits: { maxUpdateBytes: 1024, maxOpaqueBytes: 1024 },
     })
     const socket = await host.connect()
 
-    // Over the envelope cap (maxUpdateB64Chars + 8192) and deliberately not
-    // valid JSON — the length gate must fire before any decode.
-    const oversized = '{'.repeat(16 * 1024)
+    // Over the absolute envelope cap and deliberately not valid JSON — the
+    // length gate must fire before any decode.
+    const oversized = '{'.repeat(2 * 1024 * 1024)
     await host.server.handleMessage(socket, oversized)
 
     const errors = socket.received('error')
@@ -829,14 +884,16 @@ describe('WorkspaceServer hibernation safety', () => {
         reason: 'forbidden',
       })
 
-      await host.send(socket, {
-        type: 'opaque.submit',
-        fileId: 'opaque-role',
-        observedPath: 'asset.bin',
-        opId: `opaque-${role}`,
-        baseHashHex: '',
-        bytesB64: bytesToBase64(new TextEncoder().encode('asset')),
-      })
+      await host.send(
+        socket,
+        opaqueSubmitMessage({
+          fileId: 'opaque-role',
+          observedPath: 'asset.bin',
+          opId: `opaque-${role}`,
+          baseHashHex: '',
+          bytes: new TextEncoder().encode('asset'),
+        }),
+      )
       expect(socket.received('submit.rejected').at(-1)).toMatchObject({
         opId: `opaque-${role}`,
         reason: 'forbidden',
@@ -1100,18 +1157,66 @@ describe('WorkspaceServer hibernation safety', () => {
 
     // Opaque submit on a markdown path is refused — markdown can never
     // reach the dofs LWW write path.
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-md',
-      observedPath: 'docs/note.md',
-      opId: 'op-opaque-guard',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('hi')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-md',
+        observedPath: 'docs/note.md',
+        opId: 'op-opaque-guard',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('hi'),
+      }),
+    )
     expect(socket.received('submit.rejected').at(-1)).toMatchObject({
       opId: 'op-opaque-guard',
       reason: 'invalid-path',
     })
+  })
+
+  it('preserves refused opaque bytes by DOFS reference when the row is markdown', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+
+    await fetchSnapshot(host, socket, 'f-md-row', '# markdown\n', 'docs/note.md')
+
+    const refused = new TextEncoder().encode('refused binary bytes')
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-md-row',
+        observedPath: 'assets/note.bin',
+        opId: 'op-kind-refused',
+        baseHashHex: '',
+        bytes: refused,
+      }),
+    )
+
+    expect(socket.received('submit.rejected').at(-1)).toMatchObject({
+      opId: 'op-kind-refused',
+      reason: 'invalid-path',
+    })
+    const records = host.server.listRecoveryRecords({ pendingOnly: true })
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      fileId: 'f-md-row',
+      opId: 'op-kind-refused',
+      reason: 'kind-mismatch-rejected',
+      observedPath: 'assets/note.bin',
+    })
+    const payload = JSON.parse(records[0]!.payload) as {
+      hashHex: string
+      sizeBytes: number
+      dofsPath: string
+    }
+    expect(payload.hashHex).toBe(sha256Hex(refused))
+    expect(payload.sizeBytes).toBe(refused.byteLength)
+    expect(readDofsFile(host, payload.dofsPath)).toEqual(refused)
+
+    const tree = await host.server.listTree()
+    const row = tree.entries.find((entry) => entry.fileId === 'f-md-row')!
+    expect(row.contentKind).toBeUndefined()
+    expect(row.path).toBe('docs/note.md')
   })
 
   it('stores opaque files through dofs with LWW + recovery record for the loser (INV-2)', async () => {
@@ -1123,54 +1228,62 @@ describe('WorkspaceServer hibernation safety', () => {
     await helloPeerId(host, writerB, 'device-b')
 
     const v1 = new TextEncoder().encode('binary v1')
-    await host.send(writerA, {
-      type: 'opaque.submit',
-      fileId: 'f-bin',
-      observedPath: 'assets/data.bin',
-      opId: 'op-bin-1',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(v1),
-    })
+    await host.send(
+      writerA,
+      opaqueSubmitMessage({
+        fileId: 'f-bin',
+        observedPath: 'assets/data.bin',
+        opId: 'op-bin-1',
+        baseHashHex: '',
+        bytes: v1,
+      }),
+    )
     const ack1 = writerA.received('opaque.ack').at(-1)!
     expect(ack1.conflict).toBe(false)
 
     // Duplicate replays the original ack.
-    await host.send(writerA, {
-      type: 'opaque.submit',
-      fileId: 'f-bin',
-      observedPath: 'assets/data.bin',
-      opId: 'op-bin-1',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(v1),
-    })
+    await host.send(
+      writerA,
+      opaqueSubmitMessage({
+        fileId: 'f-bin',
+        observedPath: 'assets/data.bin',
+        opId: 'op-bin-1',
+        baseHashHex: '',
+        bytes: v1,
+      }),
+    )
     expect(writerA.received('opaque.ack')).toHaveLength(2)
     expect(writerA.received('opaque.ack').at(-1)).toEqual(ack1)
     expect(observer.received('content.opaqueUpdate')).toHaveLength(1)
 
     // Writer B saw v1 and writes v2 — clean LWW, no conflict.
     const v2 = new TextEncoder().encode('binary v2')
-    await host.send(writerB, {
-      type: 'opaque.submit',
-      fileId: 'f-bin',
-      observedPath: 'assets/data.bin',
-      opId: 'op-bin-2',
-      baseHashHex: ack1.hashHex,
-      bytesB64: bytesToBase64(v2),
-    })
+    await host.send(
+      writerB,
+      opaqueSubmitMessage({
+        fileId: 'f-bin',
+        observedPath: 'assets/data.bin',
+        opId: 'op-bin-2',
+        baseHashHex: ack1.hashHex,
+        bytes: v2,
+      }),
+    )
     const ack2 = writerB.received('opaque.ack').at(-1)!
     expect(ack2.conflict).toBe(false)
 
     // Writer A writes again from the stale v1 watermark: it wins (last
     // writer), but v2 must survive as a recovery record, not vanish.
     const v3 = new TextEncoder().encode('binary v3 from stale base')
-    await host.send(writerA, {
-      type: 'opaque.submit',
-      fileId: 'f-bin',
-      observedPath: 'assets/data.bin',
-      opId: 'op-bin-3',
-      baseHashHex: ack1.hashHex,
-      bytesB64: bytesToBase64(v3),
-    })
+    await host.send(
+      writerA,
+      opaqueSubmitMessage({
+        fileId: 'f-bin',
+        observedPath: 'assets/data.bin',
+        opId: 'op-bin-3',
+        baseHashHex: ack1.hashHex,
+        bytes: v3,
+      }),
+    )
     const ack3 = writerA.received('opaque.ack').at(-1)!
     expect(ack3.conflict).toBe(true)
 
@@ -1182,9 +1295,14 @@ describe('WorkspaceServer hibernation safety', () => {
       reason: 'opaque-conflict-loser',
       observedPath: 'assets/data.bin',
     })
-    const payload = JSON.parse(records[0]!.payload) as { bytesB64: string; hashHex: string }
-    expect(new TextDecoder().decode(base64ToBytes(payload.bytesB64))).toBe('binary v2')
+    const payload = JSON.parse(records[0]!.payload) as {
+      hashHex: string
+      sizeBytes: number
+      dofsPath: string
+    }
+    expect(payload.sizeBytes).toBe(v2.byteLength)
     expect(payload.hashHex).toBe(ack2.hashHex)
+    expect(readDofsFile(host, payload.dofsPath)).toEqual(v2)
 
     // The first write registered a tree row (its 'create' event took seq 1)
     // so the binary is visible to the tree authority and pulling replicas;
@@ -1201,6 +1319,189 @@ describe('WorkspaceServer hibernation safety', () => {
     expect(row.contentKind).toBe('opaque')
     expect(row.contentHash).toBe(ack3.hashHex)
     expect(host.server.acknowledgeRecoveryRecord(records[0]!.recordId)).toBe(true)
+    expect(() => readDofsFile(host, payload.dofsPath)).toThrow()
+  })
+
+  it('records conflict-loser recovery atomically with the loser blob and winning write', async () => {
+    const host = new FakeHost()
+    const writerA = await host.connect('alice')
+    const writerB = await host.connect('bob')
+    await helloPeerId(host, writerA, 'device-a')
+    await helloPeerId(host, writerB, 'device-b')
+
+    const v1 = new TextEncoder().encode('base binary')
+    await host.send(
+      writerA,
+      opaqueSubmitMessage({
+        fileId: 'f-atomic',
+        observedPath: 'atomic.bin',
+        opId: 'op-atomic-1',
+        baseHashHex: '',
+        bytes: v1,
+      }),
+    )
+    const ack1 = writerA.received('opaque.ack').at(-1)!
+
+    const v2 = new TextEncoder().encode('server loser candidate')
+    await host.send(
+      writerB,
+      opaqueSubmitMessage({
+        fileId: 'f-atomic',
+        observedPath: 'atomic.bin',
+        opId: 'op-atomic-2',
+        baseHashHex: ack1.hashHex,
+        bytes: v2,
+      }),
+    )
+    const ack2 = writerB.received('opaque.ack').at(-1)!
+
+    host.storage.sql.failNext((query) => query.startsWith('INSERT INTO workspace_recovery_records'))
+    const v3 = new TextEncoder().encode('would-be winning bytes')
+    await host.send(
+      writerA,
+      opaqueSubmitMessage({
+        fileId: 'f-atomic',
+        observedPath: 'atomic.bin',
+        opId: 'op-atomic-3',
+        baseHashHex: ack1.hashHex,
+        bytes: v3,
+      }),
+    )
+
+    expect(writerA.received('submit.rejected').at(-1)).toMatchObject({
+      opId: 'op-atomic-3',
+    })
+    expect(writerA.received('opaque.ack').filter((ack) => ack.opId === 'op-atomic-3')).toEqual([])
+    expect(host.server.listRecoveryRecords({ pendingOnly: true })).toEqual([])
+    expect(() =>
+      readDofsFile(host, `/.glovebox/recovery/${sha256Hex('f-atomic:op-atomic-3')}`),
+    ).toThrow()
+
+    await host.send(writerA, { type: 'opaque.get', requestId: 'rq-atomic', fileId: 'f-atomic' })
+    const current = writerA.received('opaque.response').at(-1)!
+    expect(current.hashHex).toBe(ack2.hashHex)
+    expect(opaqueResponseBytes(current)).toEqual(v2)
+  })
+
+  it('stores opaque bytes only in DOFS chunks and filters known objects on get', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+    const bytes = new Uint8Array(700_000)
+    bytes.fill(7)
+
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-a',
+        observedPath: 'a.bin',
+        opId: 'op-a',
+        baseHashHex: '',
+        bytes,
+      }),
+    )
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-b',
+        observedPath: 'b.bin',
+        opId: 'op-b',
+        baseHashHex: '',
+        bytes,
+      }),
+    )
+
+    const rows = host.storage.sql
+      .exec(
+        "SELECT file_id, content, content_hash, size_bytes FROM workspace_files WHERE file_id IN ('f-a', 'f-b') ORDER BY file_id",
+      )
+      .toArray()
+    expect(rows).toHaveLength(2)
+    expect(rows.every((row) => row.content === null)).toBe(true)
+    expect(rows.map((row) => row.content_hash)).toEqual([sha256Hex(bytes), sha256Hex(bytes)])
+    expect(rows.map((row) => row.size_bytes)).toEqual([bytes.byteLength, bytes.byteLength])
+
+    // Two identical files share the same two fixed-size chunks.
+    const blobCount = host.storage.sql.exec('SELECT COUNT(*) AS count FROM vfs_blobs').toArray()[0]!
+    expect(Number(blobCount.count)).toBe(2)
+
+    const payloads = host.storage.sql
+      .exec("SELECT payload FROM workspace_changes WHERE type = 'content.opaqueUpdate'")
+      .toArray()
+      .map((row) => JSON.parse(row.payload as string) as Record<string, unknown>)
+    expect(payloads).toHaveLength(2)
+    expect(payloads.every((payload) => payload.bytesB64 === undefined)).toBe(true)
+    expect(payloads.every((payload) => typeof payload.hashHex === 'string')).toBe(true)
+
+    await host.send(socket, { type: 'opaque.get', requestId: 'rq-full', fileId: 'f-a' })
+    const full = socket.received('opaque.response').at(-1)!
+    expect(full.objects).toHaveLength(2)
+    expect(opaqueResponseBytes(full)).toEqual(bytes)
+
+    await host.send(socket, {
+      type: 'opaque.get',
+      requestId: 'rq-meta',
+      fileId: 'f-a',
+      metadataOnly: true,
+    })
+    const metadataOnly = socket.received('opaque.response').at(-1)!
+    expect(metadataOnly).toMatchObject({
+      requestId: 'rq-meta',
+      found: true,
+      contentKind: 'opaque',
+      hashHex: sha256Hex(bytes),
+      sizeBytes: bytes.byteLength,
+    })
+    expect(metadataOnly.manifest?.chunks).toHaveLength(2)
+    expect(metadataOnly.objects).toBeUndefined()
+
+    await host.send(socket, {
+      type: 'opaque.get',
+      requestId: 'rq-missing',
+      fileId: 'f-a',
+      haveObjects: [full.manifest!.chunks[0]!.hashB64],
+    })
+    const missing = socket.received('opaque.response').at(-1)!
+    expect(missing.objects).toHaveLength(1)
+    expect(missing.objects![0]!.hashB64).toBe(full.manifest!.chunks[1]!.hashB64)
+  })
+
+  it('round-trips a 4 MiB opaque submit through DOFS chunks and opaque.get', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+    const bytes = patternedOpaqueBytes(4 * 1024 * 1024)
+
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-large',
+        observedPath: 'large.bin',
+        opId: 'op-large',
+        baseHashHex: '',
+        bytes,
+      }),
+    )
+    const ack = socket.received('opaque.ack').at(-1)!
+    expect(ack).toMatchObject({
+      fileId: 'f-large',
+      hashHex: sha256Hex(bytes),
+      sizeBytes: bytes.byteLength,
+      conflict: false,
+    })
+
+    await host.send(socket, { type: 'opaque.get', requestId: 'rq-large', fileId: 'f-large' })
+    const response = socket.received('opaque.response').at(-1)!
+    expect(response).toMatchObject({
+      requestId: 'rq-large',
+      found: true,
+      contentKind: 'opaque',
+      hashHex: sha256Hex(bytes),
+      sizeBytes: bytes.byteLength,
+    })
+    expect(response.manifest?.chunks).toHaveLength(8)
+    expect(response.objects).toHaveLength(8)
+    expect(opaqueResponseBytes(response)).toEqual(bytes)
   })
 
   it('broadcasts to sockets restored from hibernation without a reconnect', async () => {
@@ -1630,14 +1931,16 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     await helloPeerId(host, socket, 'device-a')
 
     await fetchSnapshot(host, socket, 'f-md', '# hello\n', 'docs/note.md')
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-bin',
-      observedPath: 'assets/img.png',
-      opId: 'op-bin-create',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('pixels')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-bin',
+        observedPath: 'assets/img.png',
+        opId: 'op-bin-create',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('pixels'),
+      }),
+    )
     expect(socket.received('opaque.ack').at(-1)).toMatchObject({
       opId: 'op-bin-create',
       conflict: false,
@@ -1668,14 +1971,16 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     const socket = await host.connect('alice')
     await helloPeerId(host, socket, 'device-a')
 
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-raw',
-      observedPath: 'assets/raw.bin',
-      opId: 'op-raw-1',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('pixels')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-raw',
+        observedPath: 'assets/raw.bin',
+        opId: 'op-raw-1',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('pixels'),
+      }),
+    )
     const ack = socket.received('opaque.ack').at(-1)!
     expect(ack.conflict).toBe(false)
 
@@ -1688,13 +1993,13 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
       path: 'assets/raw.bin',
       hashHex: ack.hashHex,
     })
-    expect(new TextDecoder().decode(base64ToBytes(response.bytesB64!))).toBe('pixels')
+    expect(new TextDecoder().decode(opaqueResponseBytes(response)!)).toBe('pixels')
 
     // Unknown fileId is simply not found — opaque.get has no create surface.
     await host.send(socket, { type: 'opaque.get', requestId: 'rq-ghost', fileId: 'f-ghost' })
     const missing = socket.received('opaque.response').at(-1)!
     expect(missing).toMatchObject({ requestId: 'rq-ghost', fileId: 'f-ghost', found: false })
-    expect(missing.bytesB64).toBeUndefined()
+    expect(missing.objects).toBeUndefined()
 
     // A markdown row answers found WITH its kind but never serves bytes —
     // a behind-the-window replica must distinguish "the row crossed the
@@ -1710,7 +2015,7 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
       contentKind: 'markdown',
       path: 'doc.md',
     })
-    expect(mdResponse.bytesB64).toBeUndefined()
+    expect(mdResponse.objects).toBeUndefined()
   })
 
   it('submit gates validate against the ROW kind after a boundary rename', async () => {
@@ -1767,14 +2072,16 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
       .entries.find((entry) => entry.path === 'note.png')!
     expect(row.contentKind).toBe('opaque')
 
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-row',
-      observedPath: 'note.png',
-      opId: 'op-opaque-clean',
-      baseHashHex: row.contentHash,
-      bytesB64: bytesToBase64(new TextEncoder().encode('seed v2')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-row',
+        observedPath: 'note.png',
+        opId: 'op-opaque-clean',
+        baseHashHex: row.contentHash,
+        bytes: new TextEncoder().encode('seed v2'),
+      }),
+    )
     expect(socket.received('opaque.ack').at(-1)).toMatchObject({
       opId: 'op-opaque-clean',
       conflict: false,
@@ -1786,14 +2093,16 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     const socket = await host.connect('alice')
     await helloPeerId(host, socket, 'device-a')
 
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-real',
-      observedPath: 'data.bin',
-      opId: 'op-bin-seed',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('real content')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-real',
+        observedPath: 'data.bin',
+        opId: 'op-bin-seed',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('real content'),
+      }),
+    )
     expect(socket.received('opaque.ack').at(-1)!.conflict).toBe(false)
 
     await host.send(socket, { type: 'tree.list', requestId: 'rq-head' })
@@ -1830,14 +2139,16 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     const socket = await host.connect('alice')
     await helloPeerId(host, socket, 'device-a')
 
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-pic',
-      observedPath: 'pic.png',
-      opId: 'op-pic',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('pixels')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-pic',
+        observedPath: 'pic.png',
+        opId: 'op-pic',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('pixels'),
+      }),
+    )
     expect(socket.received('opaque.ack').at(-1)!.conflict).toBe(false)
 
     // A seed-less snapshot.get (a browser clicking the binary in the tree)
@@ -1874,24 +2185,28 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     // submit must be REJECTED (an ack would advance the daemon watermark
     // and a later refresh would silently revert its disk).
     const longPath = `${'a'.repeat(1024 - 4)}.bin`
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-long-1',
-      observedPath: longPath,
-      opId: 'op-long-1',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('first')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-long-1',
+        observedPath: longPath,
+        opId: 'op-long-1',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('first'),
+      }),
+    )
     expect(socket.received('opaque.ack').at(-1)!.fileId).toBe('f-long-1')
 
-    await host.send(socket, {
-      type: 'opaque.submit',
-      fileId: 'f-long-2',
-      observedPath: longPath,
-      opId: 'op-long-2',
-      baseHashHex: '',
-      bytesB64: bytesToBase64(new TextEncoder().encode('second')),
-    })
+    await host.send(
+      socket,
+      opaqueSubmitMessage({
+        fileId: 'f-long-2',
+        observedPath: longPath,
+        opId: 'op-long-2',
+        baseHashHex: '',
+        bytes: new TextEncoder().encode('second'),
+      }),
+    )
     const rejection = socket
       .received('submit.rejected')
       .find((message) => message.opId === 'op-long-2')

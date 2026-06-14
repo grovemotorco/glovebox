@@ -350,7 +350,7 @@ describe('WsDaemonTransport failure-model hardening (review findings)', () => {
   })
 
   it('an uncorrelatable error reply rejects opId-keyed submits too', async () => {
-    const host = await startHost()
+    const host = await startHost({ limits: { maxUpdateBytes: 1024, maxOpaqueBytes: 1024 } })
     const transport = makeTransport({ url: () => host.wsUrl() })
     await transport.fetchSnapshot('f1', 'seed\n', 'notes/a.md')
 

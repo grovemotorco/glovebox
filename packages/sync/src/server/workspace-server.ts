@@ -1,4 +1,9 @@
-import { LIMITS, type WorkspaceChangeEvent, type WorkspaceTreeEntry } from '@glovebox/core'
+import {
+  LIMITS,
+  type OpaqueManifest,
+  type WorkspaceChangeEvent,
+  type WorkspaceTreeEntry,
+} from '@glovebox/core'
 import { EphemeralStore } from 'loro-crdt'
 import { LoroFileDoc, versionDominates } from '../loro/file-doc.ts'
 import { LoroFileService, LoroFileTooLargeError } from '../loro/file-store.ts'
@@ -24,11 +29,25 @@ import { WorkspaceIdempotencyStore } from './batch-idempotency-store.ts'
 import { isMarkdownFile } from '../fs/file-kind.ts'
 import { sha256Hex } from './hash.ts'
 import {
+  mkdir,
   Database as DofsDatabase,
   initializeSchema,
+  readRangeSync,
+  ROOT_INODE,
+  rm as dofsRm,
+  stat as dofsStat,
   WorkspaceFilesystem,
+  writeFileSync,
   type SQLStorageLike,
 } from '@glovebox/dofs'
+import {
+  assembleOpaqueWirePayload,
+  buildOpaqueWirePayload,
+  contentRefFromPayload,
+  OPAQUE_CHUNK_SIZE,
+  type OpaqueObjectPayload,
+  type OpaqueWirePayload,
+} from '../opaque-wire.ts'
 
 /**
  * Structural (tree-level) ops on the wire. Content stays on `content.submit`
@@ -71,7 +90,13 @@ export type WorkspaceClientMessage =
    * Current opaque bytes for one file (the opaque analog of snapshot.get,
    * minus the create surface — an unknown fileId is simply not found).
    */
-  | { type: 'opaque.get'; requestId: string; fileId: string }
+  | {
+      type: 'opaque.get'
+      requestId: string
+      fileId: string
+      haveObjects?: string[]
+      metadataOnly?: boolean
+    }
   | { type: 'batch.submit'; requestId: string; ops: WorkspaceBatchWireOp[] }
   /**
    * Opaque (non-markdown) file write through the dofs chunk store.
@@ -86,7 +111,10 @@ export type WorkspaceClientMessage =
       observedPath: string
       opId: string
       baseHashHex: string
-      bytesB64: string
+      hashHex: string
+      sizeBytes: number
+      manifest: OpaqueManifest
+      objects: OpaqueObjectPayload[]
     }
   | {
       type: 'content.submit'
@@ -174,14 +202,18 @@ export type WorkspaceServerMessage =
       found: boolean
       contentKind?: 'markdown' | 'opaque'
       path?: string
-      bytesB64?: string
       hashHex?: string
+      sizeBytes?: number
+      manifest?: OpaqueManifest
+      objects?: OpaqueObjectPayload[]
     }
   | {
       type: 'opaque.ack'
       opId: string
       fileId: string
       hashHex: string
+      sizeBytes: number
+      manifest: OpaqueManifest
       conflict: boolean
       /** Canonical row path (suffixed on create collision). */
       path?: string
@@ -306,6 +338,8 @@ export interface WorkspaceSqlStorage {
 export interface WorkspaceServerLimits {
   /** Cap on decoded Loro update bytes per submit. */
   maxUpdateBytes: number
+  /** Cap on decoded opaque bytes per submit/get materialization. */
+  maxOpaqueBytes: number
   /** Cap on a file's materialized markdown text, in UTF-8 bytes. */
   maxTextBytes: number
   /** Max submit attempts per identity inside the sliding window. */
@@ -415,6 +449,7 @@ export type WorkspaceTextPushResult =
 
 const DEFAULT_LIMITS: WorkspaceServerLimits = {
   maxUpdateBytes: LIMITS.maxUpdateBytes,
+  maxOpaqueBytes: LIMITS.maxOpaqueBytes,
   maxTextBytes: LIMITS.maxMarkdownBytes,
   // Realtime editors submit serially (one flight per round trip), so even
   // fast typing stays well under 10/sec sustained; floods do not.
@@ -427,6 +462,8 @@ const KEY_AUTH_EPOCH = 'meta:authEpoch'
 const KEY_DELETED = 'meta:workspaceDeleted'
 
 const DEFAULT_INITIAL_MARKDOWN = '# Glovebox\n\nStart typing in another tab.'
+const OPAQUE_DOFS_ROOT = '/.glovebox/opaque'
+const OPAQUE_RECOVERY_DOFS_ROOT = '/.glovebox/recovery'
 const ANONYMOUS_CONNECTION_CLAIMS: WorkspaceConnectionClaims = {
   principalId: 'anonymous',
   principalType: 'human',
@@ -454,6 +491,7 @@ export class WorkspaceServer {
   readonly #recovery: WorkspaceRecoveryStore
   readonly #trim: TrimCoordinator
   readonly #baseCache: TextBaseCache
+  readonly #dofsDb: DofsDatabase
   readonly #dofs: WorkspaceFilesystem
   readonly #workspace: WorkspaceStore
   readonly #applier: WorkspaceBatchApplier
@@ -516,12 +554,17 @@ export class WorkspaceServer {
     }
     const batchIdempotency = new WorkspaceIdempotencyStore(sqlLike)
     batchIdempotency.ensureInitialized()
-    this.#applier = new WorkspaceBatchApplier(this.#workspace, batchLoro, batchIdempotency)
+    this.#applier = new WorkspaceBatchApplier(this.#workspace, batchLoro, batchIdempotency, {
+      transitionContentKind: (fileId, oldPath, newPath) => {
+        this.#transitionContentKindForRename(fileId, oldPath, newPath)
+      },
+    })
     const dofsDb = new DofsDatabase({
       sql: options.sql as unknown as SQLStorageLike,
-      transactionSync: options.transactionSync,
+      transactionSync: this.#transactionSync,
     })
     initializeSchema(dofsDb, now)
+    this.#dofsDb = dofsDb
     this.#dofs = new WorkspaceFilesystem(dofsDb, { now })
     this.#limits = { ...DEFAULT_LIMITS, ...options.limits }
     this.#rateLimiter = new SubmitRateLimiter(
@@ -539,15 +582,33 @@ export class WorkspaceServer {
       if (this.#presenceRelayMuted) return
       this.#broadcast({ type: 'presence.update', dataB64: bytesToBase64(update) })
     })
-    // The field cap is a pre-decode DoS bound at 2x the semantic limit; an
-    // update between the two gets an opId-correlated `submit.rejected`
-    // (decoded-bytes check below) instead of a bare protocol error.
-    const maxUpdateB64Chars = (Math.ceil(this.#limits.maxUpdateBytes / 3) * 4 + 4) * 2
+    // Field caps are transport DoS bounds; semantic decoded-byte limits
+    // still live in the handlers. Keep markdown/Loro capped to the markdown
+    // tier instead of inheriting the larger opaque envelope.
+    const maxUpdateB64Chars = base64CharCap(this.#limits.maxUpdateBytes) * 2
+    const maxOpaqueObjectB64Chars = base64CharCap(
+      Math.min(this.#limits.maxOpaqueBytes, OPAQUE_CHUNK_SIZE),
+    )
+    const opaqueChunkCount = Math.ceil(this.#limits.maxOpaqueBytes / OPAQUE_CHUNK_SIZE)
+    const maxOpaqueSubmitMessageChars =
+      base64CharCap(this.#limits.maxOpaqueBytes) + opaqueChunkCount * 256 + 16_384
+    const maxContentSubmitMessageChars = maxUpdateB64Chars + 262_144 + 8192
+    const maxSnapshotMessageChars = this.#limits.maxTextBytes + 8192
+    const maxControlMessageChars = Math.max(262_144, maxSnapshotMessageChars)
     this.#ingressLimits = {
       maxUpdateB64Chars,
+      maxOpaqueObjectB64Chars,
+      maxContentSubmitMessageChars,
+      maxOpaqueSubmitMessageChars,
+      maxSnapshotMessageChars,
+      maxControlMessageChars,
       maxInitialContentChars: this.#limits.maxTextBytes,
-      // Envelope = largest payload field plus key/ID overhead.
-      maxMessageChars: maxUpdateB64Chars + 8192,
+      maxMessageChars: Math.max(
+        maxOpaqueSubmitMessageChars,
+        maxContentSubmitMessageChars,
+        maxSnapshotMessageChars,
+        maxControlMessageChars,
+      ),
     }
   }
 
@@ -674,7 +735,7 @@ export class WorkspaceServer {
         this.#handleTreeList(socket, parsed)
         return
       case 'opaque.get':
-        this.#handleOpaqueGet(socket, parsed)
+        await this.#handleOpaqueGet(socket, parsed)
         return
       case 'content.submit':
         await this.#handleContentSubmit(socket, parsed)
@@ -1393,21 +1454,54 @@ export class WorkspaceServer {
       return
     }
 
+    const originalAck = this.#idempotency.get(message.opId)
+    if (originalAck) {
+      this.#send(socket, originalAck)
+      return
+    }
+
+    const payload: OpaqueWirePayload = {
+      hashHex: message.hashHex,
+      sizeBytes: message.sizeBytes,
+      manifest: message.manifest,
+      objects: message.objects,
+    }
+    let bytes: Uint8Array
+    try {
+      bytes = assembleOpaqueWirePayload(payload)
+    } catch {
+      this.#send(socket, {
+        type: 'submit.rejected',
+        opId: message.opId,
+        fileId: message.fileId,
+        reason: 'invalid-path',
+      })
+      return
+    }
+    if (bytes.byteLength > this.#limits.maxOpaqueBytes) {
+      this.#send(socket, {
+        type: 'submit.rejected',
+        opId: message.opId,
+        fileId: message.fileId,
+        reason: 'too-large',
+      })
+      return
+    }
+
     // Markdown content merges through Loro; it must never reach the dofs
     // LWW write path (contentKind routing, spec §3.1). The ROW kind is the
     // authority once a row exists (re-derived on boundary renames,
     // ISSUE-0043); observedPath is only trusted for first contact.
     if (this.#isMarkdownTarget(message.fileId, message.observedPath)) {
-      // Preserve the refused bytes when the rejection is a row-kind
-      // mismatch — the submitter may never get to resubmit them (INV-2).
       if (this.#workspace.getByFileId(message.fileId)) {
-        this.#recovery.record({
+        this.#recordOpaqueRecoveryObject({
           fileId: message.fileId,
           opId: message.opId,
           reason: 'kind-mismatch-rejected',
           deviceId: attachment?.deviceId ?? 'unknown',
           observedPath: message.observedPath,
-          payload: JSON.stringify({ bytesB64: message.bytesB64 }),
+          bytes,
+          content: contentRefFromPayload(payload),
         })
       }
       this.#send(socket, {
@@ -1419,44 +1513,36 @@ export class WorkspaceServer {
       return
     }
 
-    const bytes = base64ToBytes(message.bytesB64)
-    if (bytes.byteLength > this.#limits.maxUpdateBytes) {
-      this.#send(socket, {
-        type: 'submit.rejected',
-        opId: message.opId,
-        fileId: message.fileId,
-        reason: 'too-large',
-      })
-      return
-    }
+    // LWW base check against the canonical current DOFS bytes. With a
+    // clean-db wire break there is no path-keyed legacy mirror fallback.
+    const currentEntry = this.#workspace.getTreeEntryByFileId(message.fileId)
+    const conflict =
+      currentEntry?.contentKind === 'opaque' && currentEntry.contentHash !== message.baseHashHex
+    const current = conflict ? await this.#readOpaqueByFileId(message.fileId) : null
 
-    const originalAck = this.#idempotency.get(message.opId)
-    if (originalAck) {
-      this.#send(socket, originalAck)
-      return
-    }
+    const recovery =
+      conflict && current !== null
+        ? {
+            path: opaqueRecoveryDofsPath(message.fileId, message.opId),
+            bytes: current,
+            payload: contentRefFromPayload(buildOpaqueWirePayload(current)),
+            opId: message.opId,
+            reason: 'opaque-conflict-loser',
+            deviceId: attachment?.deviceId ?? 'unknown',
+            observedPath: message.observedPath,
+          }
+        : undefined
 
-    // LWW base check against the canonical current bytes: the tree row
-    // (path-independent, survives renames) when one exists, else the
-    // path-keyed dofs store for pre-row legacy binaries. Detect only —
-    // the recovery record is written after the roll succeeds.
-    const dofsPath = `/${message.observedPath}`
-    const current = this.#workspace.getByFileId(message.fileId)
-      ? this.#workspace.readFileBytesById(message.fileId)
-      : await this.#readOpaque(dofsPath)
-    const conflict = current !== null && sha256Hex(current) !== message.baseHashHex
-
-    // Roll the tree authority BEFORE acking — the row is the canonical
-    // byte store (reads, LWW bases, replica checkouts come from it), so a
-    // refused row write (workspace quota, path policy) must surface as a
-    // rejection. A swallowed failure here acks bytes the canon never
-    // took: the submitter's watermark advances and a later refresh
-    // silently reverts its disk to the stale row (data loss).
+    // Roll DOFS bytes and tree metadata in one SQL transaction before
+    // acking. A refused metadata write must never acknowledge bytes that
+    // the canonical tree row cannot name.
     const rolled = this.#rollOpaqueFile(
       message.fileId,
       message.observedPath,
+      contentRefFromPayload(payload),
       bytes,
       attachment?.principalId ?? 'anonymous',
+      recovery,
     )
     if (!rolled.ok) {
       this.#send(socket, {
@@ -1468,38 +1554,13 @@ export class WorkspaceServer {
       return
     }
 
-    if (conflict && current !== null) {
-      // Last writer wins; the overwritten bytes survive as a recovery
-      // record instead of silently dropping (INV-2).
-      this.#recovery.record({
-        fileId: message.fileId,
-        opId: message.opId,
-        reason: 'opaque-conflict-loser',
-        deviceId: attachment?.deviceId ?? 'unknown',
-        observedPath: message.observedPath,
-        payload: JSON.stringify({
-          bytesB64: bytesToBase64(current),
-          hashHex: sha256Hex(current),
-        }),
-      })
-    }
-
-    // Legacy path-keyed mirror; never canonical, so failures don't gate.
-    try {
-      const slash = dofsPath.lastIndexOf('/')
-      if (slash > 0) {
-        await this.#dofs.mkdir(dofsPath.slice(0, slash), { recursive: true })
-      }
-      await this.#dofs.writeFile(dofsPath, bytes)
-    } catch {
-      // The row holds the canon; the dofs mirror catches up next write.
-    }
-
     const ack: WorkspaceServerMessage = {
       type: 'opaque.ack',
       opId: message.opId,
       fileId: message.fileId,
-      hashHex: sha256Hex(bytes),
+      hashHex: payload.hashHex,
+      sizeBytes: payload.sizeBytes,
+      manifest: payload.manifest,
       conflict,
       // Canonical row path — differs from observedPath when the create
       // collided and was suffixed; the daemon adopts it.
@@ -1508,7 +1569,12 @@ export class WorkspaceServer {
     this.#idempotency.put(message.opId, ack)
     this.#send(socket, ack)
 
-    const body = { bytesB64: message.bytesB64, originDeviceId: attachment?.deviceId }
+    const body = {
+      hashHex: payload.hashHex,
+      sizeBytes: payload.sizeBytes,
+      manifest: payload.manifest,
+      originDeviceId: attachment?.deviceId,
+    }
     let seq: number
     if (rolled.seq === null) {
       seq = this.#events.append('content.opaqueUpdate', message.fileId, JSON.stringify(body))
@@ -1543,20 +1609,83 @@ export class WorkspaceServer {
   #rollOpaqueFile(
     fileId: string,
     observedPath: string,
+    content: { hashHex: string; sizeBytes: number; manifest: OpaqueManifest },
     bytes: Uint8Array,
     modifiedBy: string,
+    recovery?: {
+      path: string
+      bytes: Uint8Array
+      payload: { hashHex: string; sizeBytes: number; manifest: OpaqueManifest }
+      opId: string
+      reason: string
+      deviceId: string
+      observedPath: string
+    },
   ): { ok: true; seq: number | null; path: string } | { ok: false } {
     try {
-      if (!this.#workspace.getByFileId(fileId)) {
-        const path = this.#registerOpaqueFile(fileId, observedPath, bytes, modifiedBy)
-        return { ok: true, seq: null, path }
-      }
-      this.#workspace.writeFileBytesById(fileId, bytes, { modifiedBy })
-      const entry = this.#workspace.getTreeEntryByFileId(fileId)
-      return { ok: true, seq: entry?.seq ?? null, path: entry?.path ?? observedPath }
+      return this.#transactionSync(() => {
+        this.#ensureOpaqueDofsDirs(recovery !== undefined)
+        if (recovery) {
+          writeFileSync(this.#dofsDb, recovery.path, recovery.bytes, {}, this.#now)
+        }
+        writeFileSync(this.#dofsDb, opaqueDofsPath(fileId), bytes, {}, this.#now)
+        if (!this.#workspace.getByFileId(fileId)) {
+          const path = this.#registerOpaqueFile(fileId, observedPath, content, modifiedBy)
+          return { ok: true, seq: null, path }
+        }
+        this.#workspace.writeOpaqueMetadataById(
+          fileId,
+          { contentHash: content.hashHex, sizeBytes: content.sizeBytes },
+          { modifiedBy },
+        )
+        const entry = this.#workspace.getTreeEntryByFileId(fileId)
+        if (recovery) {
+          // Last writer wins; the overwritten bytes survive as a recovery
+          // object reference instead of an event-log or recovery base64 blob.
+          this.#recovery.record({
+            fileId,
+            opId: recovery.opId,
+            reason: recovery.reason,
+            deviceId: recovery.deviceId,
+            observedPath: recovery.observedPath,
+            payload: JSON.stringify({
+              ...recovery.payload,
+              dofsPath: recovery.path,
+            }),
+          })
+        }
+        return { ok: true, seq: entry?.seq ?? null, path: entry?.path ?? observedPath }
+      })
     } catch {
       return { ok: false }
     }
+  }
+
+  #recordOpaqueRecoveryObject(input: {
+    fileId: string
+    opId: string
+    reason: string
+    deviceId: string
+    observedPath: string
+    bytes: Uint8Array
+    content: { hashHex: string; sizeBytes: number; manifest: OpaqueManifest }
+  }): void {
+    const path = opaqueRecoveryDofsPath(input.fileId, input.opId)
+    this.#transactionSync(() => {
+      this.#ensureOpaqueDofsDirs(true)
+      writeFileSync(this.#dofsDb, path, input.bytes, {}, this.#now)
+      this.#recovery.record({
+        fileId: input.fileId,
+        opId: input.opId,
+        reason: input.reason,
+        deviceId: input.deviceId,
+        observedPath: input.observedPath,
+        payload: JSON.stringify({
+          ...input.content,
+          dofsPath: path,
+        }),
+      })
+    })
   }
 
   /**
@@ -1567,11 +1696,16 @@ export class WorkspaceServer {
   #registerOpaqueFile(
     fileId: string,
     observedPath: string,
-    bytes: Uint8Array,
+    content: { hashHex: string; sizeBytes: number },
     modifiedBy: string,
   ): string {
     const path = this.#freePath(observedPath)
-    this.#workspace.createOpaqueFile(path, bytes, { modifiedBy }, fileId)
+    this.#workspace.createOpaqueFile(
+      path,
+      { contentHash: content.hashHex, sizeBytes: content.sizeBytes },
+      { modifiedBy },
+      fileId,
+    )
     const entry = this.#workspace.getTreeEntryByFileId(fileId)
     if (!entry || entry.seq === undefined) return path
     const body = { path: entry.path, entry }
@@ -1592,14 +1726,17 @@ export class WorkspaceServer {
     })
   }
 
-  #handleOpaqueGet(
+  async #handleOpaqueGet(
     socket: WorkspaceSocket,
     message: Extract<WorkspaceClientMessage, { type: 'opaque.get' }>,
-  ): void {
+  ): Promise<void> {
     const entry = this.#workspace.getTreeEntryByFileId(message.fileId)
     if (entry && entry.contentKind === 'opaque') {
-      const bytes = this.#workspace.readFileBytesById(message.fileId)
-      if (bytes) {
+      const payload = this.#readOpaqueWirePayload(entry, {
+        includeObjects: message.metadataOnly !== true,
+        haveObjects: message.haveObjects,
+      })
+      if (payload) {
         this.#send(socket, {
           type: 'opaque.response',
           requestId: message.requestId,
@@ -1607,11 +1744,20 @@ export class WorkspaceServer {
           found: true,
           contentKind: 'opaque',
           path: entry.path,
-          bytesB64: bytesToBase64(bytes),
-          hashHex: sha256Hex(bytes),
+          hashHex: payload.hashHex,
+          sizeBytes: payload.sizeBytes,
+          manifest: payload.manifest,
+          ...(message.metadataOnly === true ? {} : { objects: payload.objects }),
         })
         return
       }
+      this.#send(socket, {
+        type: 'opaque.response',
+        requestId: message.requestId,
+        fileId: message.fileId,
+        found: false,
+      })
+      return
     }
     if (entry) {
       // The row is alive but MARKDOWN (it crossed the kind boundary) —
@@ -1637,6 +1783,10 @@ export class WorkspaceServer {
     })
   }
 
+  async #readOpaqueByFileId(fileId: string): Promise<Uint8Array | null> {
+    return this.#readOpaque(opaqueDofsPath(fileId))
+  }
+
   async #readOpaque(path: string): Promise<Uint8Array | null> {
     let stream: ReadableStream<Uint8Array>
     try {
@@ -1660,6 +1810,105 @@ export class WorkspaceServer {
       offset += chunk.byteLength
     }
     return out
+  }
+
+  #readOpaqueWirePayload(
+    entry: WorkspaceTreeEntry,
+    options: { includeObjects: boolean; haveObjects?: string[] },
+  ): OpaqueWirePayload | null {
+    const inode = this.#resolveDofsFileInode(opaqueDofsPath(entry.fileId))
+    if (inode === null) return null
+    const chunkRows = this.#dofsDb.all<{ hash: Uint8Array; size: number }>(
+      'SELECT hash, size FROM vfs_chunks WHERE inode = ? ORDER BY idx',
+      inode,
+    )
+    const totalSize = chunkRows.reduce((sum, row) => sum + row.size, 0)
+    if (totalSize !== entry.sizeBytes) return null
+    const manifest: OpaqueManifest = {
+      chunks: chunkRows.map((row) => ({ hashB64: bytesToBase64(row.hash), size: row.size })),
+    }
+    const objects: OpaqueObjectPayload[] = []
+    if (options.includeObjects) {
+      const have = new Set(options.haveObjects ?? [])
+      for (const row of chunkRows) {
+        const hashB64 = bytesToBase64(row.hash)
+        if (have.has(hashB64)) continue
+        const blob = this.#dofsDb.one<{ bytes: Uint8Array }>(
+          'SELECT bytes FROM vfs_blob_bytes WHERE hash = ?',
+          row.hash,
+        )
+        if (!blob) return null
+        objects.push({ hashB64, bytesB64: bytesToBase64(blob.bytes) })
+      }
+    }
+    return {
+      hashHex: entry.contentHash,
+      sizeBytes: entry.sizeBytes,
+      manifest,
+      objects,
+    }
+  }
+
+  #resolveDofsFileInode(path: string): number | null {
+    const parts = path.split('/').filter(Boolean)
+    if (parts.length === 0) return null
+    let parentInode = ROOT_INODE
+    for (let idx = 0; idx < parts.length; idx += 1) {
+      const row = this.#dofsDb.one<{ inode: number; type: 'file' | 'dir' | 'symlink' }>(
+        `SELECT n.inode AS inode, n.type AS type
+           FROM vfs_dirents d
+           JOIN vfs_nodes n ON n.inode = d.child_inode
+          WHERE d.parent_inode = ? AND d.name = ?`,
+        parentInode,
+        parts[idx],
+      )
+      if (!row) return null
+      const final = idx === parts.length - 1
+      if (final) return row.type === 'file' ? row.inode : null
+      if (row.type !== 'dir') return null
+      parentInode = row.inode
+    }
+    return null
+  }
+
+  #ensureOpaqueDofsDirs(includeRecovery: boolean): void {
+    mkdir(this.#dofsDb, '/.glovebox', { recursive: true }, this.#now)
+    mkdir(this.#dofsDb, '/.glovebox/opaque', { recursive: true }, this.#now)
+    if (includeRecovery) {
+      mkdir(this.#dofsDb, '/.glovebox/recovery', { recursive: true }, this.#now)
+    }
+  }
+
+  #transitionContentKindForRename(fileId: string, oldPath: string, newPath: string): void {
+    const oldIsMarkdown = isMarkdownFile(oldPath)
+    const newIsMarkdown = isMarkdownFile(newPath)
+    if (oldIsMarkdown === newIsMarkdown) return
+
+    if (!newIsMarkdown) {
+      const text = this.#workspace.readFileById(fileId) ?? ''
+      const bytes = new TextEncoder().encode(text)
+      const payload = buildOpaqueWirePayload(bytes)
+      this.#ensureOpaqueDofsDirs(false)
+      writeFileSync(this.#dofsDb, opaqueDofsPath(fileId), bytes, {}, this.#now)
+      const transitioned = this.#workspace.transitionMarkdownToOpaque(fileId, {
+        contentHash: payload.hashHex,
+        sizeBytes: payload.sizeBytes,
+      })
+      if (!transitioned) {
+        throw new Error('Failed to transition markdown file to opaque')
+      }
+      return
+    }
+
+    const path = opaqueDofsPath(fileId)
+    const size = dofsStat(this.#dofsDb, path).size
+    const bytes = readRangeSync(this.#dofsDb, path, 0, size)
+    const text = new TextDecoder().decode(bytes)
+    const transitioned = this.#workspace.transitionOpaqueToMarkdown(fileId, text)
+    if (!transitioned) {
+      throw new Error('Failed to transition opaque file to markdown')
+    }
+    dofsRm(this.#dofsDb, path, { force: true })
   }
 
   /**
@@ -1853,7 +2102,27 @@ export class WorkspaceServer {
   }
 
   acknowledgeRecoveryRecord(recordId: string): boolean {
-    return this.#recovery.acknowledge(recordId)
+    return this.#transactionSync(() => {
+      const record = this.#recovery.get(recordId)
+      const acknowledged = this.#recovery.acknowledge(recordId)
+      if (acknowledged && record) {
+        this.#deleteRecoveryDofsPayload(record.payload)
+      }
+      return acknowledged
+    })
+  }
+
+  #deleteRecoveryDofsPayload(payload: string): void {
+    let dofsPath: unknown
+    try {
+      dofsPath = (JSON.parse(payload) as { dofsPath?: unknown }).dofsPath
+    } catch {
+      return
+    }
+    if (typeof dofsPath !== 'string' || !dofsPath.startsWith(`${OPAQUE_RECOVERY_DOFS_ROOT}/`)) {
+      return
+    }
+    dofsRm(this.#dofsDb, dofsPath, { force: true })
   }
 
   #handleEventsSince(
@@ -2080,4 +2349,16 @@ function extractRequestId(message: string | ArrayBuffer): string | undefined {
 
 function unreachableBatchLoro(method: string): never {
   throw new Error(`BatchApplierLoroStore.${method} is unreachable for structural batch ops`)
+}
+
+function base64CharCap(decodedBytes: number): number {
+  return Math.ceil(decodedBytes / 3) * 4 + 4
+}
+
+function opaqueDofsPath(fileId: string): string {
+  return `${OPAQUE_DOFS_ROOT}/${sha256Hex(fileId)}`
+}
+
+function opaqueRecoveryDofsPath(fileId: string, opId: string): string {
+  return `${OPAQUE_RECOVERY_DOFS_ROOT}/${sha256Hex(`${fileId}:${opId}`)}`
 }

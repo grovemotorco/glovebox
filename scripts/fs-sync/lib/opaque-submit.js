@@ -1,34 +1,45 @@
-// Send an opaque.submit with decoded bytes just over LIMITS.maxOpaqueBytes.
-// Placeholders: __WSID__, __FILEID__, __PATH__, __OPID__.
+// Send one opaque.submit using the DOFS-style manifest/object wire shape.
+// Placeholders:
+//   __WSID__, __FILEID__, __PATH__, __OPID__, __BASE_HASH_HEX__, __BYTES_B64__.
 ;(async () => {
   const WSID = '__WSID__'
   const fileId = '__FILEID__'
   const observedPath = '__PATH__'
   const opId = '__OPID__'
-  const bytes = new Uint8Array(10 * 1024 * 1024 + 1)
+  const baseHashHex = '__BASE_HASH_HEX__'
+  const bytesB64 = '__BYTES_B64__'
   const chunkSize = 512 * 1024
-  for (let i = 0; i < bytes.length; i += 1) bytes[i] = i % 251
 
-  function bytesToBase64(value) {
+  function base64ToBytes(value) {
+    const binary = atob(value)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return bytes
+  }
+
+  function bytesToBase64(bytes) {
     let binary = ''
-    for (let i = 0; i < value.length; i += 0x8000) {
-      binary += String.fromCharCode(...value.subarray(i, i + 0x8000))
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
     }
     return btoa(binary)
   }
 
-  function bytesToHex(value) {
+  function bytesToHex(bytes) {
     let hex = ''
-    for (const byte of value) {
+    for (const byte of bytes) {
       hex += byte.toString(16).padStart(2, '0')
     }
     return hex
   }
 
-  async function sha256(value) {
-    return new Uint8Array(await crypto.subtle.digest('SHA-256', value))
+  async function sha256(bytes) {
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
   }
 
+  const bytes = base64ToBytes(bytesB64)
   const chunks = []
   const objects = []
   for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
@@ -42,10 +53,7 @@
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://'
   const sock = new WebSocket(proto + location.host + '/ws/' + WSID)
   const result = await new Promise((resolve) => {
-    const timer = setTimeout(
-      () => resolve({ err: 'timeout waiting for oversize rejection' }),
-      15000,
-    )
+    const timer = setTimeout(() => resolve({ err: 'timeout waiting for opaque ack' }), 10000)
     sock.onmessage = (ev) => {
       let m
       try {
@@ -66,7 +74,7 @@
           fileId,
           observedPath,
           opId,
-          baseHashHex: '',
+          baseHashHex,
           hashHex,
           sizeBytes: bytes.byteLength,
           manifest: { chunks },

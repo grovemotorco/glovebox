@@ -148,7 +148,7 @@ describe('WorkspaceBatchApplier.apply (ported loro-2 applyLocalBatch corpus)', (
     expect(stored).toBe('# hello')
   })
 
-  it('creates an empty opaque file and returns readable byte content', async () => {
+  it('defers opaque file.create; opaque bytes use opaque.submit instead of batch.submit', async () => {
     const room = makeDO()
     const result = await room.applyLocalBatch(
       'ws-1',
@@ -156,11 +156,8 @@ describe('WorkspaceBatchApplier.apply (ported loro-2 applyLocalBatch corpus)', (
       'user-1',
     )
 
-    const fileId = result.acceptedOps[0]!.binding!.fileId
-    expect(result.deferredOps).toHaveLength(0)
-    expect(result.opaqueContents).toHaveLength(1)
-    expect(result.opaqueContents[0]?.contentBytes.byteLength).toBe(0)
-    expect(await room.readFileBytesById('ws-1', fileId)).toEqual(new Uint8Array())
+    expect(result.acceptedOps).toEqual([])
+    expect(result.deferredOps).toEqual([{ opId: 'op-empty-opaque', reason: 'unsupported-op' }])
   })
 
   it('suffixes a path collision deterministically', async () => {
@@ -259,11 +256,11 @@ describe('WorkspaceBatchApplier.apply (ported loro-2 applyLocalBatch corpus)', (
     expect(result.deferredOps).toEqual([{ opId: 'op-x', reason: 'file-not-found' }])
   })
 
-  it('uses the submitting device id as originDeviceId for opaque update events', async () => {
+  it('defers opaque content updates; event bytes are no longer batch-carried', async () => {
     const room = makeDO()
     const create = await room.applyLocalBatch(
       'ws-1',
-      baseInput('ws-1', [localOpaqueCreate('op-create-opaque', 'blob.bin', new Uint8Array([1]))]),
+      baseInput('ws-1', [localFileCreate('op-create-md', 'blob.md', 'seed')]),
       'user-1',
     )
     const fileId = create.acceptedOps[0]!.binding!.fileId
@@ -287,12 +284,9 @@ describe('WorkspaceBatchApplier.apply (ported loro-2 applyLocalBatch corpus)', (
       'user-1',
     )
 
-    const opaqueEvent = update.events.find((event) => event.type === 'content.opaqueUpdate')
-    expect(opaqueEvent).toMatchObject({
-      type: 'content.opaqueUpdate',
-      fileId,
-      originDeviceId: 'device-opaque',
-    })
+    expect(update.acceptedOps).toEqual([])
+    expect(update.events).toEqual([])
+    expect(update.deferredOps).toEqual([{ opId: 'op-opaque-update', reason: 'unsupported-op' }])
   })
 
   it('accepts a lexically-later file.rename when the file is unchanged since baseSeq', async () => {
@@ -508,17 +502,35 @@ describe('WorkspaceBatchApplier kind-boundary renames (ISSUE-0043)', () => {
     states.push(fixture)
     const workspace = new WorkspaceStore(fixture.sqlLike)
     const loro = new WorkspaceLoroStore(fixture.sqlLike)
+    const opaqueBytes = new Map<string, Uint8Array>()
     const applier = new WorkspaceBatchApplier(
       workspace,
       loro,
       new WorkspaceIdempotencyStore(fixture.sqlLike),
+      {
+        transitionContentKind: (fileId, oldPath, newPath) => {
+          if (oldPath.endsWith('.md') && !newPath.endsWith('.md')) {
+            const bytes = new TextEncoder().encode(workspace.readFileById(fileId) ?? '')
+            opaqueBytes.set(fileId, bytes)
+            workspace.transitionMarkdownToOpaque(fileId, {
+              contentHash: sha256Hex(bytes),
+              sizeBytes: bytes.byteLength,
+            })
+            return
+          }
+
+          const bytes = opaqueBytes.get(fileId) ?? new Uint8Array()
+          workspace.transitionOpaqueToMarkdown(fileId, new TextDecoder().decode(bytes))
+          opaqueBytes.delete(fileId)
+        },
+      },
     )
     const apply = (ops: readonly LocalSyncOp[]) =>
       applier.apply(
         { workspaceId: 'ws-1', mountId: 'mount-1', deviceId: 'device-1', baseSeq: 0, ops },
         { userId: 'user-1', deviceId: 'device-1' },
       )
-    return { workspace, loro, apply }
+    return { workspace, loro, opaqueBytes, apply }
   }
 
   function markdownCreate(opId: string, path: string, initialText: string): LocalSyncOp {
@@ -529,17 +541,6 @@ describe('WorkspaceBatchApplier kind-boundary renames (ISSUE-0043)', () => {
       localFileId: `local-${opId}`,
       path,
       initialContent: { loroSnapshot: seed.exportSnapshot() },
-      observedAt: 1,
-    }
-  }
-
-  function opaqueCreate(opId: string, path: string, bytes: Uint8Array): LocalSyncOp {
-    return {
-      type: 'file.create',
-      opId,
-      localFileId: `local-${opId}`,
-      path,
-      initialContent: { kind: 'opaque', contentB64: Buffer.from(bytes).toString('base64') },
       observedAt: 1,
     }
   }
@@ -555,7 +556,7 @@ describe('WorkspaceBatchApplier kind-boundary renames (ISSUE-0043)', () => {
   }
 
   it('rename across the kind boundary transitions the row', () => {
-    const { workspace, loro, apply } = makeStores()
+    const { workspace, loro, opaqueBytes, apply } = makeStores()
 
     // md→opaque: the row's bytes become canonical (UTF-8 of the old text)
     // and the Loro doc is dropped — the LWW path owns content from here.
@@ -571,18 +572,24 @@ describe('WorkspaceBatchApplier kind-boundary renames (ISSUE-0043)', () => {
       path: 'docs/pic.png',
       contentKind: 'opaque',
     })
-    expect(workspace.readFileBytesById(fileId)).toEqual(new TextEncoder().encode('# old text'))
+    expect(opaqueBytes.get(fileId)).toEqual(new TextEncoder().encode('# old text'))
+    expect(workspace.readFileBytesById(fileId)).toBeNull()
     expect(loro.readSnapshot(fileId)).toBeNull()
 
     // opaque→md: the row re-derives as markdown (the implicit kind — tree
     // entries only carry contentKind when opaque) and the bytes decode as
     // UTF-8 text.
-    const createBin = apply([
-      opaqueCreate('op-create-bin', 'assets/blob.bin', new TextEncoder().encode('plain payload')),
-    ])
-    const binId = createBin.acceptedOps[0]!.binding!.fileId
+    const payloadBytes = new TextEncoder().encode('plain payload')
+    const createdBin = workspace.createOpaqueFile(
+      'assets/blob.bin',
+      { contentHash: sha256Hex(payloadBytes), sizeBytes: payloadBytes.byteLength },
+      { modifiedBy: 'user-1' },
+      'bin-file-id',
+    )
+    opaqueBytes.set(createdBin.fileId, payloadBytes)
+    const binId = createdBin.fileId
     const toMarkdown = apply([
-      rename('op-to-md', binId, createBin.currentSeq, 'assets/blob.bin', 'assets/blob.md'),
+      rename('op-to-md', binId, workspace.currentSequence(), 'assets/blob.bin', 'assets/blob.md'),
     ])
     expect(toMarkdown.deferredOps).toHaveLength(0)
     const entry = workspace.getTreeEntryByFileId(binId)!

@@ -109,19 +109,12 @@ interface BatchSnapshot {
   textContent: string
 }
 
-interface BatchOpaqueContent {
-  fileId: string
-  contentBytes: Uint8Array<ArrayBuffer>
-  contentHash: string
-}
-
 export interface ApplyLocalBatchResult {
   acceptedOps: BatchAcceptedOp[]
   deferredOps: BatchDeferredOp[]
   currentSeq: number
   events: WorkspaceChangeEvent[]
   snapshots: BatchSnapshot[]
-  opaqueContents: BatchOpaqueContent[]
 }
 
 interface BatchApplierOptions {
@@ -129,6 +122,10 @@ interface BatchApplierOptions {
   userId: string
   /** Caller deviceId; used for echo suppression in content broadcasts. */
   deviceId: string
+}
+
+interface WorkspaceBatchApplierOptions {
+  transitionContentKind?: (fileId: string, oldPath: string, newPath: string) => void
 }
 
 /**
@@ -145,15 +142,18 @@ export class WorkspaceBatchApplier {
   readonly #workspace: WorkspaceStore
   readonly #loro: BatchApplierLoroStore
   readonly #idempotency: WorkspaceIdempotencyStore
+  readonly #transitionContentKind?: (fileId: string, oldPath: string, newPath: string) => void
 
   constructor(
     workspace: WorkspaceStore,
     loro: BatchApplierLoroStore,
     idempotency: WorkspaceIdempotencyStore,
+    options: WorkspaceBatchApplierOptions = {},
   ) {
     this.#workspace = workspace
     this.#loro = loro
     this.#idempotency = idempotency
+    this.#transitionContentKind = options.transitionContentKind
   }
 
   apply(input: ApplyLocalBatchInput, options: BatchApplierOptions): ApplyLocalBatchResult {
@@ -163,7 +163,6 @@ export class WorkspaceBatchApplier {
       currentSeq: this.#workspace.currentSequence(),
       events: [],
       snapshots: [],
-      opaqueContents: [],
     }
 
     for (const op of input.ops) {
@@ -174,7 +173,6 @@ export class WorkspaceBatchApplier {
         // idempotency row, so a retry only reconstructs the ack surface.
         result.acceptedOps.push(cached.acceptedOp ?? { opId: op.opId })
         result.snapshots.push(...cached.snapshots)
-        result.opaqueContents.push(...(cached.opaqueContents ?? []))
         continue
       }
 
@@ -194,15 +192,11 @@ export class WorkspaceBatchApplier {
         events: eventsToRecord,
         acceptedOp,
         snapshots: opOutcome.snapshot ? [opOutcome.snapshot] : [],
-        opaqueContents: opOutcome.opaqueContent ? [opOutcome.opaqueContent] : [],
       })
       result.acceptedOps.push(acceptedOp)
       result.events.push(...eventsToRecord)
       if (opOutcome.snapshot) {
         result.snapshots.push(opOutcome.snapshot)
-      }
-      if (opOutcome.opaqueContent) {
-        result.opaqueContents.push(opOutcome.opaqueContent)
       }
     }
 
@@ -222,7 +216,6 @@ export class WorkspaceBatchApplier {
     outcome: {
       events: WorkspaceChangeEvent[]
       snapshot?: BatchSnapshot
-      opaqueContent?: BatchOpaqueContent
       binding?: BatchAcceptedOp['binding']
     } & { deferred: false },
     originDeviceId: string,
@@ -344,35 +337,7 @@ export class WorkspaceBatchApplier {
 
   #applyCreate(op: Extract<LocalSyncOp, { type: 'file.create' }>, userId: string): OpOutcome {
     if (op.initialContent && 'contentB64' in op.initialContent) {
-      const contentBytes = base64ToBytes(op.initialContent.contentB64)
-      let created
-      try {
-        created = this.#workspace.createOpaqueFileOrSuffix(op.path, contentBytes, {
-          modifiedBy: userId,
-        })
-      } catch {
-        return { deferred: true, reason: 'file-too-large' }
-      }
-
-      const entry = this.#workspace.getTreeEntryByFileId(created.fileId)
-      const events: WorkspaceChangeEvent[] = entry
-        ? [{ type: 'create', path: entry.path, entry, seq: entry.seq }]
-        : []
-
-      return {
-        deferred: false,
-        events,
-        binding: {
-          localFileId: op.localFileId,
-          fileId: created.fileId,
-          path: created.path,
-        },
-        opaqueContent: {
-          fileId: created.fileId,
-          contentBytes: new Uint8Array(contentBytes),
-          contentHash: created.contentHash,
-        },
-      }
+      return { deferred: true, reason: 'unsupported-op' }
     }
 
     let initialText = ''
@@ -435,48 +400,21 @@ export class WorkspaceBatchApplier {
     userId: string,
     originDeviceId: string,
   ): OpOutcome {
-    const file = this.#workspace.getByFileId(op.fileId)
-    if (!file) {
-      return { deferred: true, reason: 'file-not-found' }
-    }
-
-    const contentBytes = base64ToBytes(op.contentB64)
-    const updated = this.#workspace.writeFileBytesById(op.fileId, contentBytes, {
-      modifiedBy: userId,
-    })
-    if (!updated) {
-      return { deferred: true, reason: 'file-not-found' }
-    }
-
-    const entry = this.#workspace.getTreeEntryByFileId(op.fileId)
-    const events: WorkspaceChangeEvent[] = entry
-      ? [
-          { type: 'update', path: entry.path, entry, seq: entry.seq },
-          {
-            type: 'content.opaqueUpdate',
-            fileId: op.fileId,
-            bytesB64: op.contentB64,
-            originDeviceId,
-            seq: entry.seq,
-          },
-        ]
-      : []
-
-    return {
-      deferred: false,
-      events,
-      opaqueContent: {
-        fileId: op.fileId,
-        contentBytes: new Uint8Array(contentBytes),
-        contentHash: updated.contentHash,
-      },
-    }
+    void op
+    void userId
+    void originDeviceId
+    return { deferred: true, reason: 'unsupported-op' }
   }
 
   #applyRename(op: Extract<LocalSyncOp, { type: 'file.rename' }>, userId: string): OpOutcome {
     const currentEntry = this.#workspace.getTreeEntryByFileId(op.fileId)
     if (!currentEntry) {
       return { deferred: true, reason: 'file-not-found' }
+    }
+
+    const crossesContentBoundary = isMarkdownFile(op.fromPath) !== isMarkdownFile(op.toPath)
+    if (crossesContentBoundary && !this.#transitionContentKind) {
+      return { deferred: true, reason: 'unsupported-op' }
     }
 
     const fileSeq = currentEntry.seq ?? 0
@@ -521,7 +459,10 @@ export class WorkspaceBatchApplier {
       isMarkdownFile(renamed.oldPath) !== isMarkdownFile(renamed.newPath)
     ) {
       const kind = isMarkdownFile(renamed.newPath) ? 'markdown' : 'opaque'
-      this.#workspace.transitionContentKind(op.fileId, kind)
+      if (!this.#transitionContentKind) {
+        return { deferred: true, reason: 'unsupported-op' }
+      }
+      this.#transitionContentKind(op.fileId, renamed.oldPath, renamed.newPath)
       if (kind === 'opaque') {
         this.#loro.delete(op.fileId)
       }
@@ -596,11 +537,5 @@ type OpOutcome =
       events: WorkspaceChangeEvent[]
       binding?: BatchAcceptedOp['binding']
       snapshot?: BatchSnapshot
-      opaqueContent?: BatchOpaqueContent
     }
   | { deferred: true; reason: BatchDeferredOp['reason'] }
-
-function base64ToBytes(value: string): Uint8Array {
-  if (!value) return new Uint8Array()
-  return new Uint8Array(Buffer.from(value, 'base64'))
-}

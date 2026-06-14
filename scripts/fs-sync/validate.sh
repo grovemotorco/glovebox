@@ -106,6 +106,13 @@ recovery_list() { api "$SA" documents/recoveryList "{\"workspaceId\":\"$(wsid)\"
 
 ws_batch() { page "$1" ws-batch.js "__WSID__=$(wsid)" "__OPS__=$2"; }
 ws_raw() { page "$1" ws-raw.js "__WSID__=$(wsid)" "__MSG__=$2"; }
+opaque_submit_b64() {
+  page "$1" opaque-submit.js "__WSID__=$(wsid)" "__FILEID__=$2" "__PATH__=$3" "__OPID__=$4" "__BASE_HASH_HEX__=$5" "__BYTES_B64__=$6"
+}
+opaque_submit_text() {
+  local b64; b64="$(printf '%s' "$6" | base64 | tr -d '\n')"
+  opaque_submit_b64 "$1" "$2" "$3" "$4" "$5" "$b64"
+}
 opaque_oversize() { page "$1" opaque-oversize.js "__WSID__=$(wsid)" "__FILEID__=$2" "__PATH__=$3" "__OPID__=$4"; }
 
 type_text() { page "$1" type-text.js "__TEXT__=$2" "__WHERE__=${3:-start}"; }
@@ -378,8 +385,7 @@ s_binary_daemon_sync() {
   check_poll "$CONVERGE_S" "binary overwrite propagates" \
     sh -c "[ \"\$($0 __entry_field bin-$n.png contentHash)\" = '$h2' ]"
   # Reverse leg: a wire-created binary gets a tree row AND lands on disk.
-  local bytes; bytes="$(printf 'wire-bytes-%s' "$n" | base64)"
-  ws_raw "$SB" "{\"type\":\"opaque.submit\",\"fileId\":\"binw_$n\",\"observedPath\":\"binw-$n.dat\",\"opId\":\"bw-$n\",\"baseHashHex\":\"\",\"bytesB64\":\"$bytes\"}" >/dev/null
+  opaque_submit_text "$SB" "binw_$n" "binw-$n.dat" "bw-$n" "" "wire-bytes-$n" >/dev/null
   check_poll "$CONVERGE_S" "wire-created binary lands a tree row" sh -c "$0 __server_has binw-$n.dat"
   check_poll "$CONVERGE_S" "wire-created binary materializes on disk" \
     sh -c "grep -q 'wire-bytes-$n' '$MOUNT/binw-$n.dat'"
@@ -389,23 +395,22 @@ s_binary_daemon_sync() {
     sh -c "! $0 __server_has bin-$n.png"
 }
 
-# Server-side opaque semantics (LWW + recovery store + conflict flag) hold and
-# are validated over the wire; only the daemon leg is missing (see canary).
+# Server-side opaque semantics (LWW + recovery store + conflict flag) are
+# validated over the manifest/object wire path.
 s_binary_lww_recovery() {
   local n fid; n="$(nonce)"; fid="op_$n"
-  local b1 b2 b3 h1 h2
-  b1="$(printf 'v1-%s' "$n" | base64)"; h1="$(printf 'v1-%s' "$n" | shasum -a 256 | cut -d' ' -f1)"
-  b2="$(printf 'v2-%s' "$n" | base64)"; h2="$(printf 'v2-%s' "$n" | shasum -a 256 | cut -d' ' -f1)"
-  b3="$(printf 'v3-%s' "$n" | base64)"
+  local h1 h2
+  h1="$(printf 'v1-%s' "$n" | shasum -a 256 | cut -d' ' -f1)"
+  h2="$(printf 'v2-%s' "$n" | shasum -a 256 | cut -d' ' -f1)"
   local a1 a2 a3 c1 c2 c3
-  a1="$(ws_raw "$SB" "{\"type\":\"opaque.submit\",\"fileId\":\"$fid\",\"observedPath\":\"lww-$n.bin\",\"opId\":\"l1-$n\",\"baseHashHex\":\"\",\"bytesB64\":\"$b1\"}")"
+  a1="$(opaque_submit_text "$SB" "$fid" "lww-$n.bin" "l1-$n" "" "v1-$n")"
   c1="$(echo "$a1" | pyj "d.get('conflict')")"
   check "fresh opaque write acked clean (conflict=$c1)" sh -c "[ '$c1' = 'False' ]"
-  a2="$(ws_raw "$SA" "{\"type\":\"opaque.submit\",\"fileId\":\"$fid\",\"observedPath\":\"lww-$n.bin\",\"opId\":\"l2-$n\",\"baseHashHex\":\"$h1\",\"bytesB64\":\"$b2\"}")"
+  a2="$(opaque_submit_text "$SA" "$fid" "lww-$n.bin" "l2-$n" "$h1" "v2-$n")"
   c2="$(echo "$a2" | pyj "d.get('conflict')")"
   check "up-to-date overwrite (base=v1) acked clean (conflict=$c2)" sh -c "[ '$c2' = 'False' ]"
   # Stale writer: base hash is still v1 but current is v2 -> LWW, v2 preserved.
-  a3="$(ws_raw "$SB" "{\"type\":\"opaque.submit\",\"fileId\":\"$fid\",\"observedPath\":\"lww-$n.bin\",\"opId\":\"l3-$n\",\"baseHashHex\":\"$h1\",\"bytesB64\":\"$b3\"}")"
+  a3="$(opaque_submit_text "$SB" "$fid" "lww-$n.bin" "l3-$n" "$h1" "v3-$n")"
   c3="$(echo "$a3" | pyj "d.get('conflict')")"
   check "stale overwrite wins LWW but acks conflict:true (conflict=$c3)" sh -c "[ '$c3' = 'True' ]"
   check_poll "$CONVERGE_S" "loser (v2) preserved in recovery store, not dropped" \
@@ -417,7 +422,7 @@ s_op_kind_rejection() {
   local r1 r2
   r1="$(ws_raw "$SB" "{\"type\":\"content.submit\",\"fileId\":\"k1f-$n\",\"observedPath\":\"kind-$n.dat\",\"opId\":\"k1-$n\",\"baseContentVersionB64\":\"\",\"loroUpdateB64\":\"\"}")"
   check "content.submit on opaque path rejected (invalid-path)" sh -c "echo '$r1' | grep -q 'submit.rejected' && echo '$r1' | grep -q 'invalid-path'"
-  r2="$(ws_raw "$SB" "{\"type\":\"opaque.submit\",\"fileId\":\"k2f-$n\",\"observedPath\":\"kind-$n.md\",\"opId\":\"k2-$n\",\"baseHashHex\":\"\",\"bytesB64\":\"\"}")"
+  r2="$(opaque_submit_text "$SB" "k2f-$n" "kind-$n.md" "k2-$n" "" "")"
   check "opaque.submit on markdown path rejected (invalid-path)" sh -c "echo '$r2' | grep -q 'submit.rejected' && echo '$r2' | grep -q 'invalid-path'"
 }
 
@@ -572,7 +577,7 @@ s_open_file_rename_delete_room() {
 s_opaque_oversize_rejected() {
   local n out; n="$(nonce)"
   out="$(opaque_oversize "$SB" "big_$n" "big-$n.bin" "big-$n")"
-  check "opaque >1MiB rejected as too-large" \
+  check "opaque >10MiB rejected as too-large" \
     sh -c "echo '$out' | grep -q 'submit.rejected' && echo '$out' | grep -q 'too-large'"
   check "oversize opaque row not created" sh -c "! $0 __server_has big-$n.bin"
   check "oversize opaque bytes not materialized on disk" sh -c "test ! -f '$MOUNT/big-$n.bin'"

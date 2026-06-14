@@ -1,4 +1,4 @@
-import type { WorkspaceTreeEntry } from '@glovebox/core'
+import type { OpaqueManifest, WorkspaceTreeEntry } from '@glovebox/core'
 import { LoroFileDoc } from '../loro/file-doc.ts'
 import { base64ToBytes, bytesToBase64 } from '../loro/base64.ts'
 import {
@@ -28,7 +28,9 @@ export interface WireWorkspaceEvent {
   fileId: string
   seq?: number
   loroUpdateB64?: string
-  bytesB64?: string
+  hashHex?: string
+  sizeBytes?: number
+  manifest?: OpaqueManifest
   contentVersionB64?: string
   originDeviceId?: string
   /** Tree-event payload (create/rename/delete). The browser V1 engine only
