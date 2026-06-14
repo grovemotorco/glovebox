@@ -1,7 +1,10 @@
 import type { WorkspaceTreeEntry } from '@glovebox/api'
 import type { WorkspaceServerMessage } from '@glovebox/sync/server'
 
-export type TreeWireEvent = Extract<WorkspaceServerMessage, { type: 'create' | 'rename' | 'delete' }>
+export type TreeWireEvent = Extract<
+  WorkspaceServerMessage,
+  { type: 'create' | 'rename' | 'delete' }
+>
 
 export interface TreeSnapshot {
   seq: number
@@ -28,11 +31,7 @@ export function applyTreeWireEvent(snapshot: TreeSnapshot, event: TreeWireEvent)
   }
 }
 
-function upsertEntry(
-  snapshot: TreeSnapshot,
-  seq: number,
-  entry: WorkspaceTreeEntry,
-): TreeSnapshot {
+function upsertEntry(snapshot: TreeSnapshot, seq: number, entry: WorkspaceTreeEntry): TreeSnapshot {
   const entries = snapshot.entries.filter((candidate) => candidate.fileId !== entry.fileId)
   if (!entry.tombstone) entries.push(entry)
   return { seq, entries }

@@ -31,6 +31,13 @@ export interface LocalFS {
   writeFileBytes(relativePath: string, content: Uint8Array): Promise<string>
   deletePath(relativePath: string): Promise<void>
   mkdir(relativePath: string): Promise<void>
+  /**
+   * Atomic move (rename(2) under the hood): the node keeps its identity
+   * (nodeId travels), an existing target is replaced, parents are created.
+   * The daemon relocates a colliding local file with this single op so a
+   * crash can never leave both the original and the copy (ISSUE-0050 B).
+   */
+  move(fromPath: string, toPath: string): Promise<void>
 
   hash(relativePath: string): Promise<string>
   scan(predicate: (name: string) => boolean): Promise<ScanResult[]>

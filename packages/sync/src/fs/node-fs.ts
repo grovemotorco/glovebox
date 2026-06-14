@@ -188,11 +188,13 @@ export class NodeFS implements LocalFS {
   }
 
   /**
-   * POSIX rename(2) semantics for editor-save simulation (not part of
-   * `LocalFS` — daemons never rename, editors do): the moved node keeps its
-   * identity (nodeId travels), an existing target is replaced atomically.
+   * Atomic move (rename(2)): the moved node keeps its identity (nodeId
+   * travels), an existing target is replaced atomically, parents are
+   * created. The daemon uses this to relocate a colliding local file in a
+   * single syscall (ISSUE-0050 B) — never read+write+unlink, which a crash
+   * could leave half-done (both copies on disk).
    */
-  async rename(fromPath: string, toPath: string): Promise<void> {
+  async move(fromPath: string, toPath: string): Promise<void> {
     const fromAbsolute = await this.validateAndResolve(fromPath)
     const toAbsolute = await this.validateAndResolve(toPath)
     try {
@@ -201,6 +203,14 @@ export class NodeFS implements LocalFS {
     } catch (error) {
       throw this.mapIOError(fromPath, error, 'file')
     }
+  }
+
+  /**
+   * POSIX rename(2) for editor-save simulation — identical semantics to
+   * `move`, kept as the name the editor-save corpus reads.
+   */
+  async rename(fromPath: string, toPath: string): Promise<void> {
+    await this.move(fromPath, toPath)
   }
 
   async deletePath(relativePath: string): Promise<void> {

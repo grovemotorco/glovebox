@@ -90,10 +90,6 @@ export class WorkspaceSocketTransport
   #readyResolve: ((peerId: bigint) => void) | null = null
   #closed = false
   #reconnectTimer: number | null = null
-  #catchingUp = false
-  #hasOpened = false
-  /** Last workspace seq seen on any broadcast event. */
-  #lastWorkspaceSeq: number | null = null
 
   constructor(options: TransportOptions) {
     this.#options = options
@@ -312,12 +308,12 @@ export class WorkspaceSocketTransport
       | { type: 'error'; message: string; requestId?: string }
 
     if (message.type === 'ready') {
-      const wasReconnect = this.#hasOpened
-      this.#hasOpened = true
+      // Reconnect recovery is the engine's job: the worker re-pulls through
+      // the single workspace-seq cursor on reopen (ISSUE-0048 Phase B). The
+      // old per-file snapshot catch-up is gone — the engine owns imports.
       this.#options.onStatus('open')
       this.#readyResolve?.(BigInt(message.sessionPeerId))
       this.#flushOutbox()
-      if (wasReconnect) void this.#catchUpSubscribedFiles().catch(() => {})
       return
     }
 
@@ -354,20 +350,17 @@ export class WorkspaceSocketTransport
     }
 
     if (message.type === 'content.loroUpdate') {
-      this.#noteWorkspaceSeq(message.seq)
       this.#dispatchEvent(message)
       this.#dispatch(message)
       return
     }
 
     if (message.type === 'content.opaqueUpdate') {
-      this.#noteWorkspaceSeq(message.seq)
       this.#dispatchEvent(message)
       return
     }
 
     if (isTreeWireEvent(message)) {
-      this.#noteWorkspaceSeq(message.seq)
       this.#dispatchEvent(message)
       this.#dispatchTree(message)
       return
@@ -523,47 +516,6 @@ export class WorkspaceSocketTransport
       ...(seed ? { observedPath: seed.observedPath, initialContent: seed.initialContent } : {}),
     })
     return promise
-  }
-
-  async #catchUpSubscribedFiles(): Promise<void> {
-    if (this.#catchingUp) return
-    if (this.#ws?.readyState !== WebSocket.OPEN) return
-
-    this.#catchingUp = true
-    try {
-      await this.#waitUntilReady()
-      for (const fileId of this.#subscribers.keys()) {
-        await this.#catchUpFile(fileId)
-      }
-    } catch {
-      // Opportunistic; the next reconnect (or seq gap) retries.
-    } finally {
-      this.#catchingUp = false
-    }
-  }
-
-  /** Re-snapshot one file and replay it through the normal update path. */
-  async #catchUpFile(fileId: string): Promise<void> {
-    const snapshot = await this.#requestSnapshot(fileId)
-    this.#dispatch({
-      type: 'content.loroUpdate',
-      fileId,
-      loroUpdateB64: bytesToBase64(snapshot),
-      contentVersionB64: '',
-    })
-  }
-
-  /**
-   * The wire log is a single workspace seq domain. A gap means at least one
-   * broadcast was missed; it does not imply the current file missed content.
-   */
-  #noteWorkspaceSeq(seq: number | undefined): void {
-    if (typeof seq !== 'number') return
-    const last = this.#lastWorkspaceSeq
-    this.#lastWorkspaceSeq = Math.max(this.#lastWorkspaceSeq ?? 0, seq)
-    if (last !== null && seq > last + 1 && this.#subscribers.size > 0) {
-      void this.#catchUpSubscribedFiles().catch(() => {})
-    }
   }
 
   #dispatch(event: LoroUpdateWireEvent): void {

@@ -4,7 +4,11 @@ import {
   assembleOpaqueWirePayload,
   buildOpaqueWirePayload,
   sha256Hex,
+  type DirEntry,
+  type FileStat,
+  type LocalFS,
   type OpaqueObjectPayload,
+  type ScanResult,
 } from '@glovebox/sync'
 import {
   WorkspaceServer,
@@ -1601,5 +1605,277 @@ describe('remount adoption (ISSUE-0044)', () => {
     await daemon.engine.runCycle()
     expect(treeCalls).toBe(0) // adoptedAt persisted — no second adoption pass
     expect((await readState()).adoptedAt).toBe(adoptedAt)
+  })
+})
+
+// --- ISSUE-0050: remote-structural-op collision hardening ---------------------
+
+/** Fixed-round drain for the small two-daemon scenarios below (deterministic;
+ *  no kernel watcher — runCycle is the unit of progress). */
+async function runUntilQuiet(daemons: DaemonFixture[], rounds = 8): Promise<void> {
+  for (let round = 0; round < rounds; round += 1) {
+    for (const daemon of daemons) await daemon.engine.runCycle()
+  }
+}
+
+/**
+ * LocalFS that delegates to a MemoryFS but can be armed to throw on the Nth
+ * call of a chosen mutating op — process death mid-write. Used to prove the
+ * collision relocation is a SINGLE atomic move (ISSUE-0050 B): the old
+ * read→write-suffix→delete would be split by a crash on the delete, leaving
+ * both copies; the atomic move never issues that delete.
+ */
+class CrashingFS implements LocalFS {
+  readonly mountDir: string
+  #arm: { op: string; remaining: number } | null = null
+
+  constructor(readonly inner: MemoryFS) {
+    this.mountDir = inner.mountDir
+  }
+
+  /** Throw on the `nth` (1-indexed) future call of `op`. */
+  armCrashOn(op: 'writeFileBytes' | 'writeFile' | 'deletePath' | 'move', nth: number): void {
+    this.#arm = { op, remaining: nth }
+  }
+
+  #checkpoint(op: string): void {
+    if (!this.#arm || this.#arm.op !== op) return
+    this.#arm.remaining -= 1
+    if (this.#arm.remaining <= 0) {
+      this.#arm = null
+      throw new Error(`CrashingFS: simulated crash on ${op}`)
+    }
+  }
+
+  readFile(p: string): Promise<string> {
+    return this.inner.readFile(p)
+  }
+  readFileBytes(p: string): Promise<Uint8Array> {
+    return this.inner.readFileBytes(p)
+  }
+  stat(p: string): Promise<FileStat | null> {
+    return this.inner.stat(p)
+  }
+  exists(p: string): Promise<boolean> {
+    return this.inner.exists(p)
+  }
+  readdir(p: string): Promise<DirEntry[]> {
+    return this.inner.readdir(p)
+  }
+  async writeFile(p: string, content: string): Promise<string> {
+    this.#checkpoint('writeFile')
+    return this.inner.writeFile(p, content)
+  }
+  async writeFileBytes(p: string, content: Uint8Array): Promise<string> {
+    this.#checkpoint('writeFileBytes')
+    return this.inner.writeFileBytes(p, content)
+  }
+  async deletePath(p: string): Promise<void> {
+    this.#checkpoint('deletePath')
+    return this.inner.deletePath(p)
+  }
+  mkdir(p: string): Promise<void> {
+    return this.inner.mkdir(p)
+  }
+  async move(from: string, to: string): Promise<void> {
+    this.#checkpoint('move')
+    return this.inner.move(from, to)
+  }
+  hash(p: string): Promise<string> {
+    return this.inner.hash(p)
+  }
+  scan(predicate: (name: string) => boolean): Promise<ScanResult[]> {
+    return this.inner.scan(predicate)
+  }
+  resolve(p: string): string {
+    return this.inner.resolve(p)
+  }
+  toRelative(p: string): string | null {
+    return this.inner.toRelative(p)
+  }
+}
+
+describe('ISSUE-0050 A: remote rename onto an occupied destination', () => {
+  it('relocates an untracked occupant instead of swapping content server-side', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({ 'notes.md': 'NOTES CONTENT\n' })
+    const fsB = MemoryFS.from({})
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB, { deviceId: 'daemon-B' })
+
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+    expect(fsB.getFile('notes.md')).toBe('NOTES CONTENT\n')
+    const fileId = onlyFileId(daemonB)
+
+    // B holds an UNRELATED untracked file at the rename destination.
+    fsB.putFile('archive.md', 'OCCUPANT CONTENT\n')
+
+    // A renames notes.md -> archive.md; the server accepts (archive.md is
+    // free server-side) and broadcasts the rename.
+    await fsA.rename('notes.md', 'archive.md')
+    await daemonA.engine.runCycle()
+
+    // B applies the rename: the occupant must be RELOCATED, never swapped.
+    await daemonB.engine.runCycle()
+    expect(fsB.getFile('archive.md')).toBe('NOTES CONTENT\n') // renamed file kept its bytes
+    expect(fsB.getFile('archive-2.md')).toBe('OCCUPANT CONTENT\n') // occupant preserved
+    expect(fsB.getFile('notes.md')).toBeNull()
+    const paths = daemonB.engine.files().map((file) => file.path)
+    expect(new Set(paths).size).toBe(paths.length) // no two views share a path
+
+    await runUntilQuiet([daemonA, daemonB])
+
+    // No server-side content swap: the renamed fileId STILL holds NOTES.
+    expect(await host.serverText(fileId)).toBe('NOTES CONTENT\n')
+    // The occupant survived as its own file on both replicas (INV-2).
+    expect(fsA.getFile('archive.md')).toBe('NOTES CONTENT\n')
+    expect(fsA.getFile('archive-2.md')).toBe('OCCUPANT CONTENT\n')
+    expect(fsB.getFile('archive.md')).toBe('NOTES CONTENT\n')
+    expect(fsB.getFile('archive-2.md')).toBe('OCCUPANT CONTENT\n')
+  })
+
+  it('bails — never collapses — when the destination is held by another tracked view', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({ 'doc.bin': 'A-NOTES' })
+    const fsB = MemoryFS.from({})
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB, { deviceId: 'daemon-B' })
+
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+    expect(fsB.getFile('doc.bin')).toBe('A-NOTES')
+    const xId = onlyFileId(daemonB)
+
+    // B mints a LOCAL-ONLY tracked view at the future rename destination: its
+    // push fails (offline), so the server never learns archive.bin is taken.
+    fsB.putFile('archive.bin', 'B-ARCHIVE')
+    daemonB.transport.failSubmits = true
+    await daemonB.engine.runCycle()
+    expect(
+      daemonB.engine
+        .files()
+        .map((file) => file.path)
+        .sort(),
+    ).toEqual(['archive.bin', 'doc.bin'])
+
+    // A renames doc.bin -> archive.bin; the server accepts (B never registered
+    // its local archive.bin) and broadcasts the rename.
+    await fsA.rename('doc.bin', 'archive.bin')
+    await daemonA.engine.runCycle()
+
+    // B pulls a rename onto a path its OWN second view occupies -> bail.
+    await daemonB.engine.runCycle()
+    const heldPaths = daemonB.engine
+      .files()
+      .map((file) => file.path)
+      .sort()
+    expect(heldPaths).toEqual(['archive.bin', 'doc.bin']) // no collapse
+    expect(fsB.getFile('doc.bin')).toBe('A-NOTES') // X's bytes intact at old path
+    expect(fsB.getFile('archive.bin')).toBe('B-ARCHIVE') // Y's bytes intact
+
+    // Back online: the local-only view is pushed + server-suffixed, freeing
+    // the destination; the bailed rename reconciles and everything converges.
+    daemonB.transport.failSubmits = false
+    await runUntilQuiet([daemonA, daemonB])
+
+    const bPaths = daemonB.engine.files().map((file) => file.path)
+    expect(new Set(bPaths).size).toBe(bPaths.length)
+    expect(fsB.getFile('archive.bin')).toBe('A-NOTES') // X reconciled to the dest
+    expect(fsB.getFile('archive-2.bin')).toBe('B-ARCHIVE') // Y suffixed aside
+    expect(fsB.getFile('doc.bin')).toBeNull()
+    // X kept its identity AND content through the bail + reconcile.
+    expect(daemonB.engine.files().find((file) => file.fileId === xId)?.path).toBe('archive.bin')
+    // A converges to the same shape.
+    expect(fsA.getFile('archive.bin')).toBe('A-NOTES')
+    expect(fsA.getFile('archive-2.bin')).toBe('B-ARCHIVE')
+  })
+})
+
+describe('ISSUE-0050 B: atomic collision relocation', () => {
+  it('relocates a colliding occupant atomically — never both copies', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({})
+    const fsB = new CrashingFS(MemoryFS.from({}))
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB as unknown as MemoryFS, { deviceId: 'daemon-B' })
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+
+    // B has an untracked file at the path a remote create will claim, with
+    // DIFFERENT bytes (so adopt-by-hash can't bind it -> relocation).
+    fsB.inner.putFile('doc.md', 'B LOCAL\n')
+    fsA.putFile('doc.md', 'A REMOTE\n')
+    await daemonA.engine.runCycle()
+
+    // Arm a crash on the deletePath the OLD non-atomic relocation issued AFTER
+    // writing the suffix copy. The atomic move never reaches it, so the cycle
+    // completes and exactly one copy of the occupant survives.
+    fsB.armCrashOn('deletePath', 1)
+    await daemonB.engine.runCycle()
+
+    expect(fsB.inner.getFile('doc.md')).toBe('A REMOTE\n')
+    expect(fsB.inner.getFile('doc-2.md')).toBe('B LOCAL\n')
+    const occupantCopies = fsB.inner.allPaths().filter((p) => fsB.inner.getFile(p) === 'B LOCAL\n')
+    expect(occupantCopies).toEqual(['doc-2.md']) // never both doc.md and doc-2.md
+
+    await runUntilQuiet([daemonA, daemonB])
+    // No propagated duplicate: the occupant is exactly one file everywhere.
+    expect(fsA.allPaths().filter((p) => fsA.getFile(p) === 'B LOCAL\n')).toHaveLength(1)
+    expect(fsB.inner.allPaths().filter((p) => fsB.inner.getFile(p) === 'B LOCAL\n')).toHaveLength(1)
+  })
+
+  it('survives a crash + restart during a collision relocation with no triplicate', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({})
+    const fsB = new CrashingFS(MemoryFS.from({}))
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB as unknown as MemoryFS, { deviceId: 'daemon-B' })
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+
+    fsB.inner.putFile('doc.md', 'B LOCAL\n')
+    fsA.putFile('doc.md', 'A REMOTE\n')
+    await daemonA.engine.runCycle()
+
+    // Crash on the checkout write that follows the (already-atomic) relocation.
+    fsB.armCrashOn('writeFile', 1)
+    await expect(daemonB.engine.runCycle()).rejects.toThrow(/simulated crash/)
+    await daemonB.restart()
+
+    await runUntilQuiet([daemonA, daemonB])
+    expect(fsB.inner.getFile('doc.md')).toBe('A REMOTE\n')
+    expect(fsB.inner.allPaths().filter((p) => fsB.inner.getFile(p) === 'B LOCAL\n')).toHaveLength(1)
+    expect(fsA.allPaths().filter((p) => fsA.getFile(p) === 'B LOCAL\n')).toHaveLength(1)
+  })
+})
+
+describe('ISSUE-0050 C: adopt-by-hash binds CRLF markdown', () => {
+  it('binds a replayed create over a CRLF working copy instead of suffix-duplicating', async () => {
+    const host = new ServerHost()
+    const fsA = MemoryFS.from({})
+    const fsB = MemoryFS.from({})
+    const daemonA = await bootDaemon(host, fsA, { deviceId: 'daemon-A' })
+    const daemonB = await bootDaemon(host, fsB, { deviceId: 'daemon-B' })
+    await daemonA.engine.runCycle()
+    await daemonB.engine.runCycle()
+
+    // B has an untracked CRLF working copy at shared.md (no view yet — B has
+    // not scanned it). Its NORMALIZED content matches what A is about to push.
+    fsB.putFile('shared.md', 'line one\r\nline two\r\n')
+
+    // A creates shared.md with LF content; the server's content_hash is over
+    // the normalized (LF) text.
+    fsA.putFile('shared.md', 'line one\nline two\n')
+    await daemonA.engine.runCycle()
+    const fileId = onlyFileId(daemonA)
+
+    // B pulls the create. The raw CRLF disk hash != entry.contentHash (LF), but
+    // the EOL-normalized compare matches -> bind by path, no suffix duplicate.
+    await daemonB.engine.runCycle()
+
+    expect(daemonB.engine.files().map((file) => file.path)).toEqual(['shared.md'])
+    expect(onlyFileId(daemonB)).toBe(fileId) // same identity — bound, not re-created
+    expect(fsB.getFile('shared-2.md')).toBeNull() // no suffix duplicate
   })
 })

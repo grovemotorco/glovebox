@@ -184,6 +184,25 @@ for (const target of TARGETS) {
       await expect(fs.rename('missing.md', 'c.md')).rejects.toBeInstanceOf(LocalFSError)
     })
 
+    it('move is atomic: identity travels, target replaced, parents created (ISSUE-0050 B)', async () => {
+      const { fs } = await target.make()
+      await fs.writeFile('src/a.md', 'payload\n')
+      const original = (await fs.stat('src/a.md'))!.nodeId
+
+      // Moves into a fresh nested directory the parent of which does not exist.
+      await fs.move('src/a.md', 'dst/deep/b.md')
+      expect(await fs.exists('src/a.md')).toBe(false)
+      expect(await fs.readFile('dst/deep/b.md')).toBe('payload\n')
+      expect((await fs.stat('dst/deep/b.md'))!.nodeId).toBe(original)
+
+      // Move ONTO an occupied destination replaces it; never leaves both.
+      await fs.writeFile('dst/c.md', 'occupant\n')
+      await fs.move('dst/deep/b.md', 'dst/c.md')
+      expect(await fs.exists('dst/deep/b.md')).toBe(false)
+      expect(await fs.readFile('dst/c.md')).toBe('payload\n')
+      expect((await fs.stat('dst/c.md'))!.nodeId).toBe(original)
+    })
+
     describe('editor-save syscall matrix (ISSUE-0026) on this FS', () => {
       const TARGET_FILE = 'notes/a.md'
       const BEFORE = 'original content\n'

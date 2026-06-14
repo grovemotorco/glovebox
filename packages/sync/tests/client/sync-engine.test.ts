@@ -5,10 +5,12 @@ import { MemoryClientStorage } from '../../src/client/workspace-state.ts'
 import {
   WorkspaceSyncEngine,
   type EventsSinceResult,
+  type SyncEngineChange,
   type WireWorkspaceEvent,
   type WorkspaceSyncTransport,
 } from '../../src/client/sync-engine.ts'
 import type { SubmitUpdateInput, SubmitUpdateResult } from '../../src/loro/room-client.ts'
+import { LoroFileDoc } from '../../src/loro/file-doc.ts'
 import {
   WorkspaceServer,
   type WorkspaceServerMessage,
@@ -438,5 +440,163 @@ describe('WorkspaceSyncEngine against the real server core', () => {
     })
     expect(b2.engine.getText(FILE)).toBe('w5\n')
     expect(b2.engine.lastAckedSeq()).toBe(a.engine.lastAckedSeq())
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ISSUE-0048 Phase B: the engine is the single-cursor authority for tree-event
+// ORDERING. It forwards create/rename/delete as gap-free `tree-event` changes
+// in cursor order (so a tree op after a content edit is no longer mistaken for
+// a content gap), fills real gaps via events.since, and asks for the one
+// legitimate full refetch as `tree-resync` when the replay window is gone.
+// ---------------------------------------------------------------------------
+
+/** Transport with a captured live handler + a programmable events.since, for
+ *  deterministic control over ordering, gaps, and the lost-window path. */
+class FakeTreeTransport implements WorkspaceSyncTransport {
+  #handler: ((event: WireWorkspaceEvent) => void) | null = null
+  readonly eventsSinceQueue: EventsSinceResult[] = []
+  defaultEventsSince: EventsSinceResult = { ok: true, currentSeq: 0, events: [] }
+
+  async fetchSnapshot(): Promise<Uint8Array> {
+    return LoroFileDoc.empty('').exportSnapshot()
+  }
+  async eventsSince(): Promise<EventsSinceResult> {
+    return this.eventsSinceQueue.shift() ?? this.defaultEventsSince
+  }
+  async submitUpdate(): Promise<SubmitUpdateResult> {
+    return { type: 'ack', applied: true, contentVersionB64: '' }
+  }
+  subscribeEvents(handler: (event: WireWorkspaceEvent) => void): () => void {
+    this.#handler = handler
+    return () => {
+      this.#handler = null
+    }
+  }
+  /** Inject a live broadcast exactly as the socket would. */
+  emit(event: WireWorkspaceEvent): void {
+    this.#handler?.(event)
+  }
+}
+
+function treeWire(
+  type: 'create' | 'rename' | 'delete',
+  fileId: string,
+  seq: number,
+  paths: { path?: string; newPath?: string } = {},
+): WireWorkspaceEvent {
+  return { type, fileId, seq, ...paths }
+}
+
+function contentWire(fileId: string, seq: number): WireWorkspaceEvent {
+  return { type: 'content.loroUpdate', fileId, seq, loroUpdateB64: 'AA==' }
+}
+
+describe('WorkspaceSyncEngine tree-event ordering (ISSUE-0048 Phase B)', () => {
+  async function bootTreeEngine(transport: FakeTreeTransport): Promise<{
+    engine: WorkspaceSyncEngine
+    changes: SyncEngineChange[]
+  }> {
+    const engine = new WorkspaceSyncEngine({
+      workspaceId: 'ws-1',
+      deviceId: 'device-tree',
+      storage: new MemoryClientStorage(),
+      transport,
+    })
+    const changes: SyncEngineChange[] = []
+    engine.onChange((change) => changes.push(change))
+    await engine.start() // initial pull -> empty, cursor 0
+    return { engine, changes }
+  }
+
+  function treeSeqs(changes: SyncEngineChange[]): [string, number | undefined][] {
+    return changes
+      .filter((change) => change.type === 'tree-event')
+      .map((change) => [change.event.type, change.event.seq])
+  }
+
+  it('forwards tree ops interleaved with content under one cursor, gap-free', async () => {
+    const transport = new FakeTreeTransport()
+    const { engine, changes } = await bootTreeEngine(transport)
+
+    transport.emit(treeWire('create', 'f1', 1, { path: 'a.md' }))
+    await engine.flush()
+    transport.emit(contentWire('f1', 2)) // a content edit advances the cursor
+    await engine.flush()
+    transport.emit(treeWire('rename', 'f1', 3, { newPath: 'b.md' }))
+    await engine.flush()
+    transport.emit(treeWire('delete', 'f1', 4))
+    await engine.flush()
+
+    // The content edit at seq 2 did NOT read as a gap for the tree op at seq 3:
+    // every structural event was forwarded once, in cursor order.
+    expect(treeSeqs(changes)).toEqual([
+      ['create', 1],
+      ['rename', 3],
+      ['delete', 4],
+    ])
+    expect(engine.lastAckedSeq()).toBe(4)
+  })
+
+  it('fills a real gap via events.since, replaying missed tree ops in seq order', async () => {
+    const transport = new FakeTreeTransport()
+    const { engine, changes } = await bootTreeEngine(transport)
+
+    transport.emit(treeWire('create', 'f1', 1, { path: 'a.md' }))
+    await engine.flush()
+
+    // delete@3 with the cursor at 1 is a gap (3 > 1+1): the engine pulls, and
+    // the replay carries the missed rename@2 + delete@3.
+    transport.eventsSinceQueue.push({
+      ok: true,
+      currentSeq: 3,
+      events: [treeWire('rename', 'f1', 2, { newPath: 'b.md' }), treeWire('delete', 'f1', 3)],
+    })
+    transport.emit(treeWire('delete', 'f1', 3))
+    await engine.flush()
+
+    // Replayed in order, and delete@3 is NOT double-emitted.
+    expect(treeSeqs(changes)).toEqual([
+      ['create', 1],
+      ['rename', 2],
+      ['delete', 3],
+    ])
+    expect(engine.lastAckedSeq()).toBe(3)
+  })
+
+  it('emits tree-resync (not tree-event) when the replay window is lost', async () => {
+    const transport = new FakeTreeTransport()
+    const { engine, changes } = await bootTreeEngine(transport)
+
+    transport.eventsSinceQueue.push({ ok: false, reason: 'snapshot-required', currentSeq: 5 })
+    transport.emit(treeWire('create', 'f9', 5, { path: 'z.md' })) // gap -> pull -> lost window
+    await engine.flush()
+
+    expect(changes.filter((change) => change.type === 'tree-resync')).toHaveLength(1)
+    expect(treeSeqs(changes)).toEqual([]) // no per-event forward; the resync covers it
+    expect(engine.lastAckedSeq()).toBe(5)
+  })
+
+  it('recovers a missed tail event through an explicit pull() (reconnect)', async () => {
+    const transport = new FakeTreeTransport()
+    const { engine, changes } = await bootTreeEngine(transport)
+
+    // Nothing arrives live (the tail broadcast was dropped while disconnected);
+    // a reconnect pull replays it.
+    transport.eventsSinceQueue.push({
+      ok: true,
+      currentSeq: 2,
+      events: [
+        treeWire('create', 'f1', 1, { path: 'a.md' }),
+        treeWire('create', 'f2', 2, { path: 'b.md' }),
+      ],
+    })
+    await engine.pull()
+
+    expect(treeSeqs(changes)).toEqual([
+      ['create', 1],
+      ['create', 2],
+    ])
+    expect(engine.lastAckedSeq()).toBe(2)
   })
 })
