@@ -15,6 +15,7 @@ import type {
   WorkspaceSyncTransport,
 } from '@glovebox/sync/client'
 import type { BatchAcceptedOp, BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
+import { randomUuid } from './random.ts'
 import { isTreeWireEvent, type TreeWireEvent } from './tree-events.ts'
 
 export type ConnectionStatus = 'connecting' | 'open' | 'closed'
@@ -120,7 +121,7 @@ export class WorkspaceSocketTransport
 
   async eventsSince(afterSeq: number): Promise<EventsSinceResult> {
     await this.#waitUntilReady()
-    const requestId = crypto.randomUUID()
+    const requestId = randomUuid()
     const promise = new Promise<EventsSinceResult>((resolve, reject) => {
       this.#pendingEvents.set(requestId, { resolve, reject })
     })
@@ -151,7 +152,7 @@ export class WorkspaceSocketTransport
    */
   async submitBatch(ops: WorkspaceBatchWireOp[]): Promise<BatchSubmitResult> {
     await this.#waitUntilReady()
-    const requestId = crypto.randomUUID()
+    const requestId = randomUuid()
     const promise = new Promise<BatchSubmitResult>((resolve, reject) => {
       this.#pendingBatches.set(requestId, { resolve, reject })
     })
@@ -175,7 +176,7 @@ export class WorkspaceSocketTransport
 
   async fetchPresenceState(): Promise<Uint8Array> {
     await this.#waitUntilReady()
-    const requestId = crypto.randomUUID()
+    const requestId = randomUuid()
     const promise = new Promise<Uint8Array>((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject })
     })
@@ -497,7 +498,7 @@ export class WorkspaceSocketTransport
     initialContent?: string,
     observedPath?: string,
   ): Promise<Uint8Array> {
-    const requestId = crypto.randomUUID()
+    const requestId = randomUuid()
     const promise = new Promise<Uint8Array>((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject })
     })

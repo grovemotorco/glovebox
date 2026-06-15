@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { CommentThread, DocumentVersion, Suggestion, WorkspaceTreeEntry } from '@glovebox/api'
 import { api, errorMessage } from '../lib/api.ts'
+import { randomUuid } from '../lib/random.ts'
 import { readRoomText, useWorkspace, type RoomHandle } from '../state/workspace.tsx'
 
 type PanelTab = 'comments' | 'suggestions' | 'versions' | 'recovery'
@@ -116,7 +117,7 @@ export function CollaborationPanel({
         fileId,
         newText: current.text,
         baseHashHex: current.hashHex,
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey: randomUuid(),
       })
       await refreshReviewData()
     })

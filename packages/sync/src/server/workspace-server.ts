@@ -1,5 +1,6 @@
 import {
   LIMITS,
+  normalizeWorkspaceRelativePath,
   type OpaqueManifest,
   type WorkspaceChangeEvent,
   type WorkspaceTreeEntry,
@@ -1460,6 +1461,17 @@ export class WorkspaceServer {
       return
     }
 
+    const observedPath = normalizeWorkspaceRelativePath(message.observedPath)
+    if (!observedPath) {
+      this.#send(socket, {
+        type: 'submit.rejected',
+        opId: message.opId,
+        fileId: message.fileId,
+        reason: 'invalid-path',
+      })
+      return
+    }
+
     const payload: OpaqueWirePayload = {
       hashHex: message.hashHex,
       sizeBytes: message.sizeBytes,
@@ -1492,14 +1504,14 @@ export class WorkspaceServer {
     // LWW write path (contentKind routing, spec §3.1). The ROW kind is the
     // authority once a row exists (re-derived on boundary renames,
     // ISSUE-0043); observedPath is only trusted for first contact.
-    if (this.#isMarkdownTarget(message.fileId, message.observedPath)) {
+    if (this.#isMarkdownTarget(message.fileId, observedPath)) {
       if (this.#workspace.getByFileId(message.fileId)) {
         this.#recordOpaqueRecoveryObject({
           fileId: message.fileId,
           opId: message.opId,
           reason: 'kind-mismatch-rejected',
           deviceId: attachment?.deviceId ?? 'unknown',
-          observedPath: message.observedPath,
+          observedPath,
           bytes,
           content: contentRefFromPayload(payload),
         })
@@ -1529,7 +1541,7 @@ export class WorkspaceServer {
             opId: message.opId,
             reason: 'opaque-conflict-loser',
             deviceId: attachment?.deviceId ?? 'unknown',
-            observedPath: message.observedPath,
+            observedPath,
           }
         : undefined
 
@@ -1538,7 +1550,7 @@ export class WorkspaceServer {
     // the canonical tree row cannot name.
     const rolled = this.#rollOpaqueFile(
       message.fileId,
-      message.observedPath,
+      observedPath,
       contentRefFromPayload(payload),
       bytes,
       attachment?.principalId ?? 'anonymous',

@@ -13,7 +13,8 @@
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "paths": {
-      "#app-shell": ["./src/components/AppShell.client.tsx"]
+      "#app-shell": ["./src/components/AppShell.client.tsx"],
+      "#dev-app-shell": ["./src/dev-app-shell.ts"]
     },
     "noEmit": true,
 

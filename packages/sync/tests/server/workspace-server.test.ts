@@ -2217,6 +2217,42 @@ describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-004
     expect(tree.entries.filter((entry) => entry.fileId === 'f-long-2')).toHaveLength(0)
   })
 
+  it('rejects invalid opaque observed paths as invalid-path before row registration', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+
+    const invalidPaths = [
+      { fileId: 'f-bad-rel', observedPath: '../evil.bin', opId: 'op-bad-rel' },
+      { fileId: 'f-bad-abs', observedPath: '/tmp/evil.bin', opId: 'op-bad-abs' },
+    ]
+
+    for (const invalid of invalidPaths) {
+      await host.send(
+        socket,
+        opaqueSubmitMessage({
+          ...invalid,
+          baseHashHex: '',
+          bytes: new TextEncoder().encode('evil'),
+        }),
+      )
+
+      expect(
+        socket.received('submit.rejected').find((message) => message.opId === invalid.opId),
+      ).toMatchObject({
+        fileId: invalid.fileId,
+        reason: 'invalid-path',
+      })
+      expect(
+        socket.received('opaque.ack').filter((ack) => ack.fileId === invalid.fileId),
+      ).toHaveLength(0)
+      expect(() => readDofsFile(host, `/.glovebox/opaque/${sha256Hex(invalid.fileId)}`)).toThrow()
+    }
+
+    const tree = await host.server.listTree()
+    expect(tree.entries.filter((entry) => entry.fileId.startsWith('f-bad-'))).toHaveLength(0)
+  })
+
   it('first-contact markdown registration falls back from a refused observedPath', async () => {
     const host = new FakeHost()
     const socket = await host.connect('alice')

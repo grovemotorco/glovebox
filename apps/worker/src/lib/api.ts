@@ -1,6 +1,7 @@
 import { createGloveboxClient, type GloveboxClient } from '@glovebox/api'
 import { magicLinkClient } from 'better-auth/client/plugins'
 import { createAuthClient } from 'better-auth/react'
+import { randomUuid } from './random.ts'
 
 /**
  * Client-side singletons for the app shell. This module lives behind the
@@ -29,7 +30,7 @@ export function getOrCreateDeviceId(): string {
   const key = 'glovebox.deviceId'
   const existing = localStorage.getItem(key)
   if (existing) return existing
-  const next = crypto.randomUUID()
+  const next = randomUuid()
   localStorage.setItem(key, next)
   return next
 }
