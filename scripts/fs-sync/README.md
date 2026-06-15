@@ -2,8 +2,8 @@
 
 Validates that the CLI filesystem mount (`glovebox run` daemon) and the
 browser editor stay convergent on a **live stack**: real worker, two real
-`agent-browser` sessions in one workspace, real daemon syncing a real
-directory. Companion report (matrix, defects, gotchas):
+`agent-browser` sessions in one workspace, and two real daemons syncing two
+real directories. Companion report (matrix, defects, gotchas):
 `.docs/context/ref-fs-sync-validation-v1.md`.
 
 ## Quick start
@@ -12,7 +12,7 @@ directory. Companion report (matrix, defects, gotchas):
 vp run dev:worker &                      # https://api.glovebox.test
 scripts/fs-sync/validate.sh warm         # dev server crashes if hit cold
 scripts/fs-sync/validate.sh setup fresh  # sign in sessions a+b, NEW workspace,
-                                         # empty mount, daemon under fast timers
+                                         # empty mounts, daemons under fast timers
 scripts/fs-sync/validate.sh run all      # the regression gate; nonzero on FAIL
 ```
 
@@ -21,13 +21,13 @@ Prereqs: `agent-browser`, `node`, `python3` on PATH; CLI built
 
 ## Commands
 
-| Command                | What it does                                                                                                                                                                                          |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `warm`                 | retried curls until the worker serves 200s                                                                                                                                                            |
-| `setup [fresh]`        | sign in both sessions (sign-up on first run), discover or (`fresh`) create the workspace, mount, start the daemon. `fresh` keeps a full pass hermetic and repoints both sessions at the new workspace |
-| `run <scenario…>\|all` | drive scenarios; `list` shows names/order                                                                                                                                                             |
-| `status`               | daemon status + live server tree                                                                                                                                                                      |
-| `teardown`             | SIGINT daemon + unmount (state under `/tmp/glovebox-fs-sync` kept)                                                                                                                                    |
+| Command                | What it does                                                                                                                                                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `warm`                 | retried curls until the worker serves 200s                                                                                                                                                                    |
+| `setup [fresh]`        | sign in both sessions (sign-up on first run), discover or (`fresh`) create the workspace, mount A + B, start both daemons. `fresh` keeps a full pass hermetic and repoints both sessions at the new workspace |
+| `run <scenario…>\|all` | drive scenarios; `list` shows names/order                                                                                                                                                                     |
+| `status`               | daemon status + live server tree                                                                                                                                                                              |
+| `teardown`             | SIGINT daemon + unmount (state under `/tmp/glovebox-fs-sync` kept)                                                                                                                                            |
 
 ## Layout
 
@@ -79,6 +79,7 @@ targets and the daemon on one live WorkspaceDO:
 ## Environment knobs
 
 `GLOVEBOX_URL`, `FS_SYNC_BASE` (default `/tmp/glovebox-fs-sync`),
+`FS_SYNC_MOUNT_A/B` (default `$FS_SYNC_BASE/mount-a|mount-b`),
 `FS_SYNC_SESSION_A/B` (default `a`/`b`), `FS_SYNC_EMAIL`/`FS_SYNC_PASS`
 (default email is run-unique: `fs-sync-<timestamp>@glovebox.test`).
 `setup fresh` clears cookies and browser storage before sign-in so both

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# FS-sync convergence harness: real worker + 2 real browser sessions + a real
-# `glovebox run` daemon against one workspace. Drives every cell of the
+# FS-sync convergence harness: real worker + 2 real browser sessions + two real
+# `glovebox run` daemons against one workspace. Drives every cell of the
 # convergence matrix from both sides and asserts convergence. See README.md.
 #
 # Preconditions:
@@ -11,16 +11,16 @@
 #
 # Commands:
 #   warm                 retried curls until the worker serves 200s
-#   setup                sign in sessions a+b (sign-up if needed), mount, start daemon
+#   setup                sign in sessions a+b (sign-up if needed), mount, start daemons
 #   run <scenario>|all   drive scenarios (see SCENARIO_ORDER below)
 #   list                 list scenario names
 #   status               daemon + tree snapshot
 #   teardown             stop daemon, unmount, keep user dirs
 #
 # State (all disposable): $FS_SYNC_BASE (default /tmp/glovebox-fs-sync)
-#   home/   GLOVEBOX_HOME (registry, state, locks, auth)
-#   mount/  the synced directory
-#   daemon.log daemon.pid wsid
+#   home/           GLOVEBOX_HOME (registry, state, locks, auth)
+#   mount-a|mount-b two synced directories bound to the same workspace
+#   daemon-a.log daemon-b.log daemon-a.pid daemon-b.pid wsid
 set -o pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,11 @@ URL="${GLOVEBOX_URL:-https://api.glovebox.test}"
 SA="${FS_SYNC_SESSION_A:-a}"
 SB="${FS_SYNC_SESSION_B:-b}"
 BASE="${FS_SYNC_BASE:-/tmp/glovebox-fs-sync}"
-MOUNT="$BASE/mount"
+MOUNT_A="${FS_SYNC_MOUNT_A:-$BASE/mount-a}"
+MOUNT_B="${FS_SYNC_MOUNT_B:-$BASE/mount-b}"
+# Most scenarios write through the primary mount; the secondary mount is kept
+# live for replica convergence checks and for cross-mount final sweeps.
+MOUNT="$MOUNT_A"
 EMAIL="${FS_SYNC_EMAIL:-fs-sync-$(date +%s)@glovebox.test}"
 PASS_WORD="${FS_SYNC_PASS:-fs-sync-pass-123}"
 CLI="$ROOT/apps/cli/dist/glovebox.mjs"
@@ -107,13 +111,13 @@ recovery_list() { api "$SA" documents/recoveryList "{\"workspaceId\":\"$(wsid)\"
 ws_batch() { page "$1" ws-batch.js "__WSID__=$(wsid)" "__OPS__=$2"; }
 ws_raw() { page "$1" ws-raw.js "__WSID__=$(wsid)" "__MSG__=$2"; }
 opaque_submit_b64() {
-  page "$1" opaque-submit.js "__WSID__=$(wsid)" "__FILEID__=$2" "__PATH__=$3" "__OPID__=$4" "__BASE_HASH_HEX__=$5" "__BYTES_B64__=$6"
+  node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "$5" "$6"
 }
 opaque_submit_text() {
   local b64; b64="$(printf '%s' "$6" | base64 | tr -d '\n')"
   opaque_submit_b64 "$1" "$2" "$3" "$4" "$5" "$b64"
 }
-opaque_oversize() { page "$1" opaque-oversize.js "__WSID__=$(wsid)" "__FILEID__=$2" "__PATH__=$3" "__OPID__=$4"; }
+opaque_oversize() { node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "" --oversize; }
 
 type_text() { page "$1" type-text.js "__TEXT__=$2" "__WHERE__=${3:-start}"; }
 editor_text() { page "$1" editor-text.js | pyj "d['text']"; }
@@ -136,20 +140,50 @@ create_file_ui() { # create_file_ui <session> <path> — the only file op the UI
   agent-browser --session "$s" press Enter >/dev/null 2>&1
 }
 
-gstatus() { node "$CLI" --json status "$MOUNT" 2>/dev/null; }
-daemon_pid() { gstatus | pyj "d['daemon']['pid'] if d['daemon']['running'] else ''"; }
-
-daemon_start() {
-  nohup node "$CLI" run "$MOUNT" >> "$BASE/daemon.log" 2>&1 &
-  echo $! > "$BASE/daemon.pid"
-  poll 15 "daemon running" sh -c "node '$CLI' --json status '$MOUNT' 2>/dev/null | grep -q '\"running\": true'"
+click_button_text() {
+  local s="$1" label="$2"
+  agent-browser --session "$s" eval "Array.from(document.querySelectorAll('button')).find((button) => button.textContent.trim() === '$label')?.click(); true" >/dev/null 2>&1
 }
 
-daemon_stop() { # graceful SIGINT
-  local pid; pid="$(daemon_pid)"
+gstatus() { node "$CLI" --json status "$MOUNT" 2>/dev/null; }
+daemon_pid_for() {
+  node "$CLI" --json status "$1" 2>/dev/null | pyj "d['daemon']['pid'] if d['daemon']['running'] else ''"
+}
+daemon_pid() { daemon_pid_for "$MOUNT"; }
+
+daemon_start_for() {
+  local dir="$1" name="$2" log="$3" pidfile="$4"
+  [ -n "$(daemon_pid_for "$dir")" ] && return 0
+  nohup node "$CLI" run "$dir" >> "$log" 2>&1 &
+  echo $! > "$pidfile"
+  poll 15 "daemon $name running" sh -c "node '$CLI' --json status '$dir' 2>/dev/null | grep -q '\"running\": true'"
+}
+
+daemon_start() {
+  daemon_start_for "$MOUNT_A" "A" "$BASE/daemon-a.log" "$BASE/daemon-a.pid"
+}
+
+daemon_start_secondary() {
+  daemon_start_for "$MOUNT_B" "B" "$BASE/daemon-b.log" "$BASE/daemon-b.pid"
+}
+
+daemon_start_all() {
+  daemon_start
+  daemon_start_secondary
+}
+
+daemon_stop_for() { # graceful SIGINT
+  local dir="$1" pid; pid="$(daemon_pid_for "$dir")"
   [ -n "$pid" ] || return 0
   kill -INT "$pid" 2>/dev/null
   poll 15 "daemon stopped" sh -c "! kill -0 $pid 2>/dev/null"
+}
+
+daemon_stop() { daemon_stop_for "$MOUNT_A"; }
+
+daemon_stop_all() {
+  daemon_stop_for "$MOUNT_A"
+  daemon_stop_for "$MOUNT_B"
 }
 
 daemon_kill9() {
@@ -190,12 +224,116 @@ contains() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 nonce() { echo "$(date +%s)$RANDOM"; }
 
+json_string() {
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+server_text_raw() { # exact bytes for markdown text, no print-added newline
+  local path_json
+  path_json="$(json_string "$1")"
+  api "$SA" workspaces/readText "{\"workspaceId\":\"$(wsid)\",\"path\":$path_json}" |
+    python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+v = json.loads(raw)
+if isinstance(v, str):
+    v = json.loads(v)
+sys.stdout.write(v["body"]["json"]["text"])
+'
+}
+
+server_manifest() {
+  tree_json | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+v = json.loads(raw)
+if isinstance(v, str):
+    v = json.loads(v)
+entries = v["body"]["json"]["entries"]
+for e in sorted((e for e in entries if not e.get("tombstone")), key=lambda e: e["path"]):
+    print("{}\t{}\t{}".format(e["path"], e.get("contentKind", ""), e.get("contentHash", "")))
+'
+}
+
+server_has_exact() {
+  tree_json | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+path = sys.argv[1]
+v = json.loads(raw)
+if isinstance(v, str):
+    v = json.loads(v)
+paths = {e["path"] for e in v["body"]["json"]["entries"] if not e.get("tombstone")}
+sys.exit(0 if path in paths else 1)
+' "$1"
+}
+
+mount_manifest() {
+  local dir="$1"
+  (cd "$dir" && find . -type f ! -name '.glovebox.json' -print | sed 's#^\./##' | LC_ALL=C sort)
+}
+
+convergence_once() {
+  local manifest server_paths a_paths b_paths expected id
+  id="$$-$RANDOM"
+  manifest="$TMP/manifest-$id.tsv"
+  server_paths="$TMP/server-paths-$id.txt"
+  a_paths="$TMP/mount-a-paths-$id.txt"
+  b_paths="$TMP/mount-b-paths-$id.txt"
+  expected="$TMP/server-text-$id.txt"
+  : > "$BASE/convergence-last.err"
+
+  server_manifest > "$manifest" || { echo "server manifest failed" > "$BASE/convergence-last.err"; return 1; }
+  cut -f1 "$manifest" | LC_ALL=C sort > "$server_paths"
+  mount_manifest "$MOUNT_A" > "$a_paths" || { echo "mount A manifest failed" > "$BASE/convergence-last.err"; return 1; }
+  mount_manifest "$MOUNT_B" > "$b_paths" || { echo "mount B manifest failed" > "$BASE/convergence-last.err"; return 1; }
+
+  if ! diff -u "$server_paths" "$a_paths" > "$BASE/convergence-last.diff"; then
+    echo "server path set differs from mount A" > "$BASE/convergence-last.err"
+    return 1
+  fi
+  if ! diff -u "$server_paths" "$b_paths" > "$BASE/convergence-last.diff"; then
+    echo "server path set differs from mount B" > "$BASE/convergence-last.err"
+    return 1
+  fi
+
+  local path kind hash ah bh
+  while IFS="$(printf '\t')" read -r path kind hash; do
+    [ -n "$path" ] || continue
+    [ -f "$MOUNT_A/$path" ] || { echo "mount A missing $path" > "$BASE/convergence-last.err"; return 1; }
+    [ -f "$MOUNT_B/$path" ] || { echo "mount B missing $path" > "$BASE/convergence-last.err"; return 1; }
+    if ! cmp -s "$MOUNT_A/$path" "$MOUNT_B/$path"; then
+      echo "mount A and B byte mismatch for $path" > "$BASE/convergence-last.err"
+      return 1
+    fi
+    if [ "$kind" = "markdown" ]; then
+      server_text_raw "$path" > "$expected" || { echo "server text read failed for $path" > "$BASE/convergence-last.err"; return 1; }
+      if ! cmp -s "$expected" "$MOUNT_A/$path"; then
+        echo "server markdown text differs from mounts for $path" > "$BASE/convergence-last.err"
+        return 1
+      fi
+    elif [ -n "$hash" ]; then
+      ah="$(shasum -a 256 "$MOUNT_A/$path" | cut -d' ' -f1)"
+      bh="$(shasum -a 256 "$MOUNT_B/$path" | cut -d' ' -f1)"
+      if [ "$ah" != "$hash" ] || [ "$bh" != "$hash" ]; then
+        echo "opaque hash mismatch for $path (server $hash, A $ah, B $bh)" > "$BASE/convergence-last.err"
+        return 1
+      fi
+    fi
+  done < "$manifest"
+}
+
+assert_convergence() {
+  local label="$1"
+  check_poll 25 "replicas converge after $label (server, browser API, mount A, mount B)" convergence_once
+}
+
 # -------------------------------------------------------------- lifecycle --
 
 cmd_warm() {
   local i code
   for i in 1 2 3 4 5 6; do
-    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$URL/" 2>/dev/null || echo 000)"
+    code="$(curl -s -k -o /dev/null -w '%{http_code}' --max-time 6 "$URL/" 2>/dev/null || echo 000)"
     echo "warm $i: HTTP $code"
     [ "$code" = "200" ] && sleep 1 || sleep 2
   done
@@ -216,12 +354,18 @@ ensure_signed_in() { # ensure_signed_in <session>
   agent-browser --session "$s" press Enter >/dev/null 2>&1
   if ! poll 15 "signed in" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'"; then
     echo "session $s: sign-in failed — creating account"
-    agent-browser --session "$s" find role button click --name "Create account" >/dev/null 2>&1
+    click_button_text "$s" "Create account"
     agent-browser --session "$s" fill "input[aria-label='Name']" "fs-sync validator" >/dev/null 2>&1
     agent-browser --session "$s" fill "input[aria-label='Email']" "$EMAIL" >/dev/null 2>&1
     agent-browser --session "$s" fill "input[aria-label='Password']" "$PASS_WORD" >/dev/null 2>&1
     agent-browser --session "$s" press Enter >/dev/null 2>&1
-    poll 15 "account created" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'" || return 1
+    if ! poll 15 "account created" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'"; then
+      click_button_text "$s" "Sign in"
+      agent-browser --session "$s" fill "input[aria-label='Email']" "$EMAIL" >/dev/null 2>&1
+      agent-browser --session "$s" fill "input[aria-label='Password']" "$PASS_WORD" >/dev/null 2>&1
+      agent-browser --session "$s" press Enter >/dev/null 2>&1
+      poll 15 "signed in after account creation" sh -c "agent-browser --session '$s' snapshot -i 2>/dev/null | grep -q 'Switch workspace'" || return 1
+    fi
   fi
 }
 
@@ -229,7 +373,7 @@ cmd_setup() { # setup [fresh] — fresh creates a NEW workspace + empty mount,
               # making a full `run all` hermetic (run-unique nonces keep
               # scenarios independent either way; fresh also repoints both
               # browser sessions at the new workspace).
-  mkdir -p "$BASE/mount"
+  mkdir -p "$MOUNT_A" "$MOUNT_B"
   if [ "${1:-}" = "fresh" ]; then
     local s
     for s in "$SA" "$SB"; do
@@ -258,9 +402,11 @@ cmd_setup() { # setup [fresh] — fresh creates a NEW workspace + empty mount,
       agent-browser --session "$s" open "$URL/" >/dev/null 2>&1
       agent-browser --session "$s" wait --load networkidle >/dev/null 2>&1
     done
-    daemon_stop
-    node "$CLI" unmount "$MOUNT" >/dev/null 2>&1
-    rm -rf "$MOUNT"; mkdir -p "$MOUNT"
+    daemon_stop_all
+    node "$CLI" unmount "$MOUNT_A" >/dev/null 2>&1
+    node "$CLI" unmount "$MOUNT_B" >/dev/null 2>&1
+    rm -rf "$MOUNT_A" "$MOUNT_B"
+    mkdir -p "$MOUNT_A" "$MOUNT_B"
   else
     # Reuse: first workspace of the account (both sessions share it).
     api "$SA" workspaces/list '{}' | pyj "d['body']['json']['workspaces'][0]['id']" > "$BASE/wsid"
@@ -268,23 +414,35 @@ cmd_setup() { # setup [fresh] — fresh creates a NEW workspace + empty mount,
   [ -s "$BASE/wsid" ] || { echo "setup: could not discover workspace id" >&2; exit 1; }
   echo "workspace: $(wsid)"
 
-  if ! node "$CLI" --json list 2>/dev/null | grep -q "$MOUNT"; then
-    node "$CLI" mount "$MOUNT" --workspace "$(wsid)" --server "$URL" || exit 1
+  if ! node "$CLI" --json list 2>/dev/null | grep -q "$MOUNT_A"; then
+    node "$CLI" mount "$MOUNT_A" --workspace "$(wsid)" --server "$URL" || exit 1
   fi
-  if [ -z "$(daemon_pid)" ]; then
-    daemon_start || { echo "setup: daemon failed to start (see $BASE/daemon.log)" >&2; exit 1; }
+  if ! node "$CLI" --json list 2>/dev/null | grep -q "$MOUNT_B"; then
+    node "$CLI" mount "$MOUNT_B" --workspace "$(wsid)" --server "$URL" || exit 1
   fi
-  echo "daemon: pid $(daemon_pid), log $BASE/daemon.log"
+  if [ -z "$(daemon_pid_for "$MOUNT_A")" ] || [ -z "$(daemon_pid_for "$MOUNT_B")" ]; then
+    daemon_start_all || { echo "setup: daemon failed to start (see $BASE/daemon-a.log / daemon-b.log)" >&2; exit 1; }
+  fi
+  echo "mount A: $MOUNT_A"
+  echo "mount B: $MOUNT_B"
+  echo "daemon A: pid $(daemon_pid_for "$MOUNT_A"), log $BASE/daemon-a.log"
+  echo "daemon B: pid $(daemon_pid_for "$MOUNT_B"), log $BASE/daemon-b.log"
 }
 
 cmd_teardown() {
-  daemon_stop
-  node "$CLI" unmount "$MOUNT" 2>/dev/null
-  echo "stopped daemon + unmounted ($BASE left in place)"
+  daemon_stop_all
+  node "$CLI" unmount "$MOUNT_A" 2>/dev/null
+  node "$CLI" unmount "$MOUNT_B" 2>/dev/null
+  echo "stopped daemons + unmounted ($BASE left in place)"
 }
 
 cmd_status() {
-  node "$CLI" status "$MOUNT"
+  echo "--- mount A ---"
+  node "$CLI" status "$MOUNT_A"
+  echo "--- mount B ---"
+  node "$CLI" status "$MOUNT_B"
+  echo "--- CLI list ---"
+  node "$CLI" --json list
   echo "--- server tree ---"
   live_paths
 }
@@ -365,6 +523,116 @@ s_create_collision() {
     sh -c "[ \$(ls '$MOUNT' | grep -c '^col-$n') -eq 2 ]"
   check_poll "$CONVERGE_S" "disk content survived the collision" \
     sh -c "cat '$MOUNT'/col-$n*.md | grep -q 'from disk $n'"
+}
+
+s_overwrite_truncate() {
+  local n; n="$(nonce)"
+  printf 'first line %s\nsecond line\nthird line\n' "$n" > "$MOUNT/ow-$n.md"
+  poll "$CONVERGE_S" "overwrite fixture synced" sh -c "$0 __server_has ow-$n.md" || { bad "overwrite fixture never synced"; return; }
+  printf 'short-%s' "$n" > "$MOUNT/ow-$n.md"
+  check_poll "$CONVERGE_S" "overwrite+truncate reaches server exactly" \
+    sh -c "[ \"\$($0 __server_text ow-$n.md)\" = 'short-$n' ]"
+  check_poll "$CONVERGE_S" "overwrite+truncate reaches secondary mount exactly" \
+    sh -c "[ \"\$(cat '$MOUNT_B/ow-$n.md')\" = 'short-$n' ]"
+}
+
+s_special_paths() {
+  local n long p
+  n="$(nonce)"
+  long="$(printf 'long-%080d' "$n")"
+  mkdir -p "$MOUNT/special-$n"
+  local paths=(
+    "special-$n/space name.multi.part.md"
+    "special-$n/.leading-dot.md"
+    "special-$n/shell chars [x] (y) & dollar$.md"
+    "special-$n/$long.markdown"
+  )
+  for p in "${paths[@]}"; do
+    printf 'path payload %s\n' "$p" > "$MOUNT/$p"
+  done
+  for p in "${paths[@]}"; do
+    check_poll "$CONVERGE_S" "special path reaches server: $p" server_has_exact "$p"
+    check_poll "$CONVERGE_S" "special path reaches mount B: $p" test -f "$MOUNT_B/$p"
+  done
+}
+
+s_directory_move_delete() {
+  local n; n="$(nonce)"
+  mkdir -p "$MOUNT/dir-$n/a" "$MOUNT/keep-$n"
+  printf 'move one %s\n' "$n" > "$MOUNT/dir-$n/a/one.md"
+  printf 'move two %s\n' "$n" > "$MOUNT/dir-$n/a/two.md"
+  printf 'sibling survives %s\n' "$n" > "$MOUNT/keep-$n/sibling.md"
+  poll "$CONVERGE_S" "directory fixtures synced" \
+    sh -c "$0 __server_has dir-$n/a/one.md && $0 __server_has dir-$n/a/two.md && $0 __server_has keep-$n/sibling.md" || { bad "directory fixtures never synced"; return; }
+
+  mkdir -p "$MOUNT/moved-$n"
+  mv "$MOUNT/dir-$n/a" "$MOUNT/moved-$n/a"
+  check_poll "$CONVERGE_S" "directory rename/move propagates: one" sh -c "$0 __server_has moved-$n/a/one.md"
+  check_poll "$CONVERGE_S" "directory rename/move propagates: two" sh -c "$0 __server_has moved-$n/a/two.md"
+  check "old moved directory paths gone" \
+    sh -c "! $0 __server_has dir-$n/a/one.md && ! $0 __server_has dir-$n/a/two.md"
+
+  rm -rf "$MOUNT/moved-$n"
+  check_poll 15 "recursive directory delete propagates after tombstone" \
+    sh -c "! $0 __server_has moved-$n/a/one.md && ! $0 __server_has moved-$n/a/two.md"
+  check "directory delete did not delete unrelated sibling" sh -c "$0 __server_has keep-$n/sibling.md"
+}
+
+s_rename_create_collision() {
+  local n fid seq ack
+  n="$(nonce)"
+  printf 'source %s\n' "$n" > "$MOUNT/rc-source-$n.md"
+  printf 'target %s\n' "$n" > "$MOUNT/rc-target-$n.md"
+  poll "$CONVERGE_S" "rename collision fixtures synced" \
+    sh -c "$0 __server_has rc-source-$n.md && $0 __server_has rc-target-$n.md" || { bad "rename collision fixtures never synced"; return; }
+  fid="$(file_id "rc-source-$n.md")"
+  seq="$(server_seq)"
+  ack="$(ws_batch "$SB" "[{\"type\":\"file.rename\",\"opId\":\"rc-$n\",\"fileId\":\"$fid\",\"baseSeq\":$seq,\"fromPath\":\"rc-source-$n.md\",\"toPath\":\"rc-target-$n.md\"}]")"
+  check "rename/create collision is deferred, not destructive" \
+    sh -c "echo '$ack' | grep -q 'deferredOps' && echo '$ack' | grep -q 'target-occupied'"
+  check "source path survives collision" sh -c "$0 __server_has rc-source-$n.md"
+  check "target path survives collision" sh -c "$0 __server_has rc-target-$n.md"
+}
+
+s_editor_temp_litter_ignored() {
+  local n; n="$(nonce)"
+  printf 'original editor body %s\n' "$n" > "$MOUNT/edit-save-$n.md"
+  poll "$CONVERGE_S" "editor-save fixture synced" sh -c "$0 __server_has edit-save-$n.md" || { bad "editor-save fixture never synced"; return; }
+
+  printf 'partial temp should not sync %s\n' "$n" > "$MOUNT/edit-save-$n.md.tmp.1234"
+  printf 'backup should not sync %s\n' "$n" > "$MOUNT/edit-save-$n.md~"
+  sleep 2
+  check "tmp save artifact did not become canonical on server" \
+    sh -c "! $0 __server_has edit-save-$n.md.tmp.1234"
+  check "backup save artifact did not become canonical on server" \
+    sh -c "! $0 __server_has edit-save-$n.md~"
+  check "tmp save artifact did not reach mount B" sh -c "test ! -f '$MOUNT_B/edit-save-$n.md.tmp.1234'"
+  check "backup save artifact did not reach mount B" sh -c "test ! -f '$MOUNT_B/edit-save-$n.md~'"
+
+  printf 'saved final body %s\n' "$n" > "$MOUNT/edit-save-$n.md.tmp.1234"
+  mv "$MOUNT/edit-save-$n.md.tmp.1234" "$MOUNT/edit-save-$n.md"
+  rm -f "$MOUNT/edit-save-$n.md~"
+  check_poll "$CONVERGE_S" "atomic tempfile save becomes canonical only after rename" \
+    sh -c "$0 __server_text edit-save-$n.md | grep -q 'saved final body $n'"
+}
+
+s_invalid_workspace_paths() {
+  local n out
+  n="$(nonce)"
+  out="$(opaque_submit_text "$SB" "bad_rel_$n" "../evil-$n.bin" "bad-rel-$n" "" "evil")"
+  check "opaque submit with .. path rejected" \
+    sh -c "echo '$out' | grep -q 'submit.rejected' && echo '$out' | grep -q 'invalid-path'"
+  out="$(opaque_submit_text "$SB" "bad_abs_$n" "/tmp/evil-$n.bin" "bad-abs-$n" "" "evil")"
+  check "opaque submit with absolute path rejected" \
+    sh -c "echo '$out' | grep -q 'submit.rejected' && echo '$out' | grep -q 'invalid-path'"
+  out="$(opaque_submit_text "$SB" "dup_slash_$n" "dup-$n//safe.bin" "dup-slash-$n" "" "safe")"
+  if contains "$out" "submit.rejected"; then
+    check "duplicate slash path rejected safely" sh -c "echo '$out' | grep -q 'invalid-path'"
+  else
+    check_poll "$CONVERGE_S" "duplicate slash path normalized safely" server_has_exact "dup-$n/safe.bin"
+  fi
+  check "invalid path rows did not materialize on disk" \
+    sh -c "test ! -e '$MOUNT/../evil-$n.bin' && test ! -e '$MOUNT/tmp/evil-$n.bin'"
 }
 
 # ISSUE-0045 (was GAP-1 canary): the daemon opaque cycle. Disk binaries
@@ -750,7 +1018,8 @@ s_unmount_guard() {
   out="$(node "$CLI" unmount "$MOUNT" 2>&1)"; rc=$?
   check "unmount refused while daemon holds the lock" sh -c "[ $rc -ne 0 ]"
   daemon_stop || { bad "daemon stop before unmount"; return; }
-  local before after
+  local before after mount_id
+  mount_id="$(node "$CLI" --json status "$MOUNT" | pyj "d['mountId']")"
   before="$(find "$MOUNT" -type f ! -name '.glovebox.json' | sort | shasum | cut -d' ' -f1)"
   node "$CLI" unmount "$MOUNT" >/dev/null 2>&1
   rc=$?
@@ -758,7 +1027,7 @@ s_unmount_guard() {
   check "unmount succeeds once daemon stopped" sh -c "[ $rc -eq 0 ]"
   check "user files untouched by unmount" sh -c "[ '$before' = '$after' ]"
   check "sentinel removed" sh -c "test ! -f '$MOUNT/.glovebox.json'"
-  check "state dir removed" sh -c "! ls '$GLOVEBOX_HOME/state' 2>/dev/null | grep -q ."
+  check "state dir for unmounted binding removed" sh -c "test ! -d '$GLOVEBOX_HOME/state/$mount_id'"
   check "registry entry removed" sh -c "! node '$CLI' --json list 2>/dev/null | grep -q '$MOUNT'"
   # Restore the stack for any scenarios that follow.
   local live_before; live_before="$(live_paths | wc -w | tr -d ' ')"
@@ -841,6 +1110,12 @@ s_text_concurrent_merge
 s_create_disk_to_browser
 s_create_browser_to_disk
 s_create_collision
+s_overwrite_truncate
+s_special_paths
+s_directory_move_delete
+s_rename_create_collision
+s_editor_temp_litter_ignored
+s_invalid_workspace_paths
 s_binary_daemon_sync
 s_binary_lww_recovery
 s_op_kind_rejection
@@ -873,6 +1148,31 @@ run_scenario() {
   CURRENT="$1"
   echo "== $1"
   "$1"
+  assert_convergence "$1"
+}
+
+cmd_run() {
+  : > "$FAILLOG"
+  if [ -z "$(daemon_pid_for "$MOUNT_A")" ] || [ -z "$(daemon_pid_for "$MOUNT_B")" ]; then
+    daemon_start_all || {
+      echo "run: daemon failed to start (see $BASE/daemon-a.log / daemon-b.log)" >&2
+      exit 1
+    }
+  fi
+  if [ "${1:-all}" = "all" ]; then
+    for s in $SCENARIO_ORDER; do run_scenario "$s"; done
+  else
+    for s in "$@"; do run_scenario "$s"; done
+  fi
+  assert_convergence "final sweep"
+  echo
+  echo "== RESULT: $PASS passed, $FAIL failed"
+  if [ "$FAIL" -gt 0 ]; then echo "-- failures:"; cat "$FAILLOG"; exit 1; fi
+}
+
+cmd_full() {
+  cmd_setup "${1:-fresh}"
+  cmd_run all
 }
 
 # ---------------------------------------------------- internal subcommands --
@@ -898,20 +1198,8 @@ case "$cmd" in
   teardown) cmd_teardown ;;
   status)   cmd_status ;;
   list)     echo "$SCENARIO_ORDER" ;;
-  run)
-    : > "$FAILLOG"
-    if [ -z "$(daemon_pid)" ]; then
-      daemon_start || { echo "run: daemon failed to start (see $BASE/daemon.log)" >&2; exit 1; }
-    fi
-    if [ "${1:-all}" = "all" ]; then
-      for s in $SCENARIO_ORDER; do run_scenario "$s"; done
-    else
-      for s in "$@"; do run_scenario "$s"; done
-    fi
-    echo
-    echo "== RESULT: $PASS passed, $FAIL failed"
-    if [ "$FAIL" -gt 0 ]; then echo "-- failures:"; cat "$FAILLOG"; exit 1; fi
-    ;;
+  run)      cmd_run "$@" ;;
+  full)     cmd_full "$@" ;;
   help|*)
     sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
