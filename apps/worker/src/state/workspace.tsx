@@ -27,6 +27,7 @@ import {
 } from '@glovebox/sync/client'
 import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
 import { api, getOrCreateDeviceId } from '../lib/api.ts'
+import { randomUuid } from '../lib/random.ts'
 import {
   WorkspaceSocketTransport,
   type BatchSubmitResult,
@@ -517,7 +518,7 @@ export function WorkspaceProvider({
     async (path: string): Promise<string> => {
       const engine = engineRef.current
       if (!engine) throw new Error('Not connected — enable auto-sync to create files')
-      const fileId = `f_${crypto.randomUUID()}`
+      const fileId = `f_${randomUuid()}`
       await engineReadyRef.current
       if (engineRef.current !== engine) throw new Error('Workspace changed while creating file')
       const room = await engine.openFile(

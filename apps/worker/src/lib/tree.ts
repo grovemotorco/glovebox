@@ -1,5 +1,6 @@
 import type { WorkspaceTreeEntry } from '@glovebox/api'
 import type { BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
+import { randomUuid } from './random.ts'
 
 export interface FileNode {
   kind: 'file'
@@ -147,7 +148,7 @@ export function entriesUnderFolder(
 export function renameFileOp(entry: WorkspaceTreeEntry, toPath: string): WorkspaceBatchWireOp {
   return {
     type: 'file.rename',
-    opId: crypto.randomUUID(),
+    opId: randomUuid(),
     fileId: entry.fileId,
     baseSeq: entry.seq ?? 0,
     fromPath: entry.path,
@@ -159,7 +160,7 @@ export function renameFileOp(entry: WorkspaceTreeEntry, toPath: string): Workspa
 export function deleteFileOp(entry: WorkspaceTreeEntry): WorkspaceBatchWireOp {
   return {
     type: 'file.deleteIntent',
-    opId: crypto.randomUUID(),
+    opId: randomUuid(),
     fileId: entry.fileId,
     baseSeq: entry.seq ?? 0,
     path: entry.path,

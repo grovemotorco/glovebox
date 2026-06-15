@@ -169,6 +169,20 @@ describe('Better Auth flows', () => {
       user: { email: 'margaret@example.com' },
     })
   })
+
+  it('keeps production cookies secure even if a configured trusted origin is http', () => {
+    const options = createAuthOptions({
+      ...testEnv([]),
+      BETTER_AUTH_TRUSTED_ORIGIN: 'https://api.glovebox.test,http://preview.example.test',
+      BETTER_AUTH_COOKIE_DOMAIN: '.glovebox.test',
+    })
+
+    expect(options.advanced?.defaultCookieAttributes?.secure).toBe(true)
+    expect(options.advanced?.crossSubDomainCookies).toEqual({
+      enabled: true,
+      domain: '.glovebox.test',
+    })
+  })
 })
 
 type AuthHarness = {

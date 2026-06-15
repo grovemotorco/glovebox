@@ -17,6 +17,8 @@ export const API_KEY_RATE_LIMIT = {
 } as const
 
 const API_KEY_BEARER_RE = /^bearer\s+(gbx_\S+)\s*$/i
+const IS_LOCAL_DEV = Boolean(import.meta.env.DEV) && !import.meta.env.VITEST
+const LOCAL_DEV_ORIGINS = ['http://api.glovebox.test:4813', 'http://127.0.0.1:4813']
 
 export function createAuth(db: Database, env: Env) {
   return betterAuth({
@@ -29,15 +31,25 @@ export function createAuthOptions(
   env: Env,
   options: { db?: Database; deviceInterval?: `${number}s` } = {},
 ): BetterAuthOptions {
-  const baseURL = env.BETTER_AUTH_URL ?? 'https://api.glovebox.test'
-  const trustedOrigins = (env.BETTER_AUTH_TRUSTED_ORIGIN ?? baseURL)
+  const configuredBaseURL = env.BETTER_AUTH_URL ?? 'https://api.glovebox.test'
+  const baseURL =
+    IS_LOCAL_DEV && configuredBaseURL === 'https://api.glovebox.test'
+      ? 'http://api.glovebox.test:4813'
+      : configuredBaseURL
+  const configuredTrustedOrigins = (env.BETTER_AUTH_TRUSTED_ORIGIN ?? baseURL)
     .split(',')
     .flatMap((origin) => {
       const trimmed = origin.trim()
       return trimmed ? [trimmed] : []
     })
+  const trustedOrigins = [
+    ...new Set([...configuredTrustedOrigins, ...(IS_LOCAL_DEV ? LOCAL_DEV_ORIGINS : [])]),
+  ]
   const webOrigin = trustedOrigins[0]?.replace(/\/$/, '') ?? baseURL.replace(/\/$/, '')
   const devPasswordAuthEnabled = env.BETTER_AUTH_DEV_PASSWORD === 'true'
+  const allowInsecureCookies =
+    IS_LOCAL_DEV && trustedOrigins.some((origin) => origin.startsWith('http://'))
+  const cookieDomain = allowInsecureCookies ? undefined : env.BETTER_AUTH_COOKIE_DOMAIN
 
   return {
     secret: env.BETTER_AUTH_SECRET ?? 'glovebox-dev-auth-secret-change-me',
@@ -81,12 +93,12 @@ export function createAuthOptions(
     },
     advanced: {
       crossSubDomainCookies: {
-        enabled: Boolean(env.BETTER_AUTH_COOKIE_DOMAIN),
-        domain: env.BETTER_AUTH_COOKIE_DOMAIN,
+        enabled: Boolean(cookieDomain),
+        domain: cookieDomain,
       },
       defaultCookieAttributes: {
         sameSite: 'lax',
-        secure: true,
+        secure: !allowInsecureCookies,
         httpOnly: true,
       },
     },
