@@ -40,6 +40,18 @@ EMAIL="${FS_SYNC_EMAIL:-fs-sync-$(date +%s)@glovebox.test}"
 PASS_WORD="${FS_SYNC_PASS:-fs-sync-pass-123}"
 CLI="$ROOT/apps/cli/dist/glovebox.mjs"
 
+# The opaque-submit helper (lib/opaque-submit-node.mjs) runs in Node — not the
+# browser — and opens a raw wss:// socket to the portless-served dev worker,
+# whose TLS cert is signed by the local portless CA. Node only trusts that CA
+# via NODE_EXTRA_CA_CERTS; without it every opaque.submit fails the TLS
+# handshake ("ws error", no opaque.ack) and all opaque scenarios time out. The
+# browser eval helpers are unaffected — the browser already trusts the cert.
+if [ -z "${NODE_EXTRA_CA_CERTS:-}" ] && [ "${URL#https:}" != "$URL" ]; then
+  for _ca in "$HOME/.portless/ca.pem" "$HOME/.portless/ca.crt"; do
+    if [ -f "$_ca" ]; then export NODE_EXTRA_CA_CERTS="$_ca"; break; fi
+  done
+fi
+
 # Shrunk timers: defaults (30 s tombstone, 30 min jittered rescan) are
 # untestable by hand. Constraint: tombstoneDelayMs >= renameCorrectionWindowMs.
 # bulkMinCount lowered so the runtime bulk guard trips on a 6-file rm.
@@ -1044,12 +1056,18 @@ s_unmount_guard() {
 }
 
 s_sigint_clean_stop() {
-  local pid; pid="$(daemon_pid)"
+  local pid mid; pid="$(daemon_pid)"
   [ -n "$pid" ] || { bad "no daemon to stop"; return; }
+  # Locks are keyed by mountId (<mountId>.lock). Only THIS daemon's lock must
+  # be released on stop — the secondary daemon (mount B) legitimately keeps its
+  # own. (Asserting the whole locks dir was empty broke once the harness ran
+  # two daemons.)
+  mid="$(node "$CLI" --json status "$MOUNT" 2>/dev/null | pyj "d['mountId']")"
+  [ -n "$mid" ] || { bad "could not resolve mount A mountId"; return; }
   kill -INT "$pid"
   check_poll 15 "SIGINT stops daemon" sh -c "! kill -0 $pid 2>/dev/null"
-  check "lockfile released on clean stop" \
-    sh -c "! ls '$GLOVEBOX_HOME/locks' 2>/dev/null | grep -q '.lock'"
+  check_poll 5 "lockfile released on clean stop" \
+    sh -c "! test -f '$GLOVEBOX_HOME/locks/$mid.lock'"
   daemon_start
   check_poll 15 "daemon restarts cleanly" sh -c "node '$CLI' --json status '$MOUNT' | grep -q '\"running\": true'"
 }
@@ -1060,10 +1078,13 @@ s_kill9_restart_reconcile() {
   printf '# k9 a [[K9A-%s]]\n' "$n" > "$MOUNT/k9a-$n.md"
   printf '# k9 b [[K9B-%s]]\n' "$n" > "$MOUNT/k9b-$n.md"
   printf '# k9 c [[K9C-%s]]\n' "$n" > "$MOUNT/k9c-$n.md"
+  local mid; mid="$(node "$CLI" --json status "$MOUNT" 2>/dev/null | pyj "d['mountId']")"
   daemon_kill9
   sleep 1
+  # Target mount A's own stale lock (<mountId>.lock); a bare locks-dir glob
+  # would pass trivially on the secondary daemon's live lock.
   check "kill -9 leaves stale lock on disk" \
-    sh -c "ls '$GLOVEBOX_HOME/locks' 2>/dev/null | grep -q '.lock'"
+    sh -c "[ -n '$mid' ] && test -f '$GLOVEBOX_HOME/locks/$mid.lock'"
   daemon_start || { bad "restart after kill -9 (stale lock not broken?)"; return; }
   check "stale lock broken by pid-liveness, restart succeeded" true
   check_poll 20 "all pre-kill files converge after restart" \

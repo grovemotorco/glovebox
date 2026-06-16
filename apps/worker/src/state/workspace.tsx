@@ -33,7 +33,7 @@ import {
   type BatchSubmitResult,
   type ConnectionStatus,
 } from '../lib/transport.ts'
-import { applyTreeWireEvent, type TreeWireEvent } from '../lib/tree-events.ts'
+import { applyTreeWireEvent, isTreeWireEvent, type TreeWireEvent } from '../lib/tree-events.ts'
 import { baseName } from '../lib/tree.ts'
 
 export interface SessionUser {
@@ -44,13 +44,24 @@ export interface SessionUser {
 
 export type WorkspaceConnectionStatus = 'connected' | 'syncing' | 'disconnected'
 
-export interface RoomHandle {
-  fileId: string
-  path: string
-  room: LoroRoomClient
-  status: 'connecting' | 'ready' | 'error'
-  error?: string
-}
+export type RoomHandle =
+  | {
+      fileId: string
+      path: string
+      status: 'connecting' | 'ready'
+      room: LoroRoomClient
+      error?: undefined
+    }
+  // `room` is absent only when an open failed before any room client was
+  // created (e.g. the snapshot fetch rejected). Every reader guards on
+  // `status === 'ready'` before touching `room`, so the union narrows it away.
+  | {
+      fileId: string
+      path: string
+      status: 'error'
+      room?: LoroRoomClient
+      error: string
+    }
 
 interface WorkspaceContextValue {
   user: SessionUser
@@ -260,25 +271,52 @@ export function WorkspaceProvider({
   const resurrectRoomFromPendingDelete = useCallback(
     async (handle: RoomHandle) => {
       const engine = engineRef.current
-      if (!engine) return
+      // Only ready rooms carry pending edits worth resurrecting (the caller
+      // gates on roomHasPendingChanges); the guard also narrows `handle.room`.
+      if (!engine || handle.status !== 'ready') return
 
-      const nextHandle: RoomHandle = { ...handle, status: 'connecting' }
-      roomStore.rooms.set(handle.fileId, nextHandle)
+      const room0 = handle.room
+      roomStore.rooms.set(handle.fileId, {
+        fileId: handle.fileId,
+        path: handle.path,
+        room: room0,
+        status: 'connecting',
+      })
       emitRooms()
 
       try {
         const room = await engine.resurrectDeletedFile(handle.fileId)
-        if (!room) return
         const latest = roomStore.rooms.get(handle.fileId)
-        if (!latest || latest.room !== handle.room) return
-        roomStore.rooms.set(handle.fileId, { ...latest, room, status: 'ready' })
+        if (!latest || latest.room !== room0) return
+        if (!room) {
+          // The engine no longer tracks this file (closed/removed under a
+          // concurrent op), so it cannot be resurrected. Surface an error
+          // instead of leaving the editor stuck on 'connecting' forever.
+          roomStore.rooms.set(handle.fileId, {
+            fileId: handle.fileId,
+            path: latest.path,
+            room: room0,
+            status: 'error',
+            error: 'file was deleted and could not be restored',
+          })
+          emitRooms()
+          return
+        }
+        roomStore.rooms.set(handle.fileId, {
+          fileId: handle.fileId,
+          path: latest.path,
+          room,
+          status: 'ready',
+        })
         emitRooms()
         await refreshTree().catch(() => {})
       } catch (error: unknown) {
         const failed = roomStore.rooms.get(handle.fileId)
-        if (failed?.room !== handle.room) return
+        if (failed?.room !== room0) return
         roomStore.rooms.set(handle.fileId, {
-          ...nextHandle,
+          fileId: handle.fileId,
+          path: handle.path,
+          room: room0,
           status: 'error',
           error: error instanceof Error ? error.message : 'failed to resurrect file',
         })
@@ -441,7 +479,21 @@ export function WorkspaceProvider({
     // tree-resync. (It also forwards gap-free tree-events for future use; the
     // tree map is React-owned in this variant.)
     const unsubscribeEngine = engine.onChange((change) => {
-      if (change.type === 'tree-resync') void refreshTree().catch(() => {})
+      // tree-resync: the replay window was lost — do the one legitimate full
+      // tree refetch.
+      if (change.type === 'tree-resync') {
+        void refreshTree().catch(() => {})
+        return
+      }
+      // tree-event: the engine refilled a structural op via events.since on
+      // reconnect / gap-fill (ISSUE-0048 Phase B). Live ops already arrive
+      // synchronously through subscribeTreeEvents above; this recovers the ones
+      // that never broadcast (missed while the socket was down) — without it
+      // they stay out of the sidebar until the 10s poll. handleTreeEvent dedups
+      // on seq, so the overlap with the live path is a no-op.
+      if (change.type === 'tree-event' && isTreeWireEvent(change.event)) {
+        handleTreeEvent(change.event)
+      }
     })
     let cancelled = false
     void presence
@@ -463,7 +515,7 @@ export function WorkspaceProvider({
       engineRef.current = null
       engineReadyRef.current = null
       for (const handle of roomStore.rooms.values()) {
-        handle.room.disconnect()
+        handle.room?.disconnect()
       }
       roomStore.rooms.clear()
       emitRooms()
@@ -499,12 +551,14 @@ export function WorkspaceProvider({
         roomStore.rooms.set(fileId, { fileId, path, room, status: 'ready' })
         emitRooms()
       })().catch((error: unknown) => {
-        const room = engine.client(fileId)
-        if (!room) return
+        // engine.openFile can reject before any room client is attached (e.g.
+        // the snapshot fetch failed), leaving engine.client(fileId) null. Store
+        // an error handle regardless so the failure surfaces in the editor
+        // instead of the file silently never opening.
         roomStore.rooms.set(fileId, {
           fileId,
           path,
-          room,
+          room: engine.client(fileId) ?? undefined,
           status: 'error',
           error: error instanceof Error ? error.message : 'failed to open file',
         })

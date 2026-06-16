@@ -53,6 +53,7 @@ describe('WorkspaceProvider remote tree delete handling', () => {
     latest = null
     FakeWebSocket.instances = []
     FakeWebSocket.eventsSinceMode = 'empty'
+    FakeWebSocket.eventsSinceEvents = []
     apiMock.treeEntries = [entry('file-1', 'docs/a.md', 1)]
     apiMock.treeSeq = 1
     apiMock.workspaces.create.mockReset()
@@ -113,11 +114,11 @@ describe('WorkspaceProvider remote tree delete handling', () => {
       respondSnapshot(socket, initialSnapshotRequest, 'file-1', 'server text')
       await waitFor(() => latest?.handle?.status === 'ready')
 
-      const originalRoom = latest!.handle!.room
+      const originalRoom = latest!.handle!.room!
       await act(async () => {
         void originalRoom.setTextContent('local edit')
       })
-      await waitFor(() => latest?.handle?.room.hasPendingChanges() === true)
+      await waitFor(() => latest?.handle?.room?.hasPendingChanges() === true)
       await waitForSent(socket, 'content.submit')
 
       await act(async () => {
@@ -138,8 +139,53 @@ describe('WorkspaceProvider remote tree delete handling', () => {
       respondSnapshot(socket, resurrectSnapshotRequest, 'file-1', 'local edit')
 
       await waitFor(() => latest?.handle?.status === 'ready' && latest.handle.room !== originalRoom)
-      expect(latest?.handle?.room.getTextContent()).toBe('local edit')
+      expect(latest?.handle?.room?.getTextContent()).toBe('local edit')
       expect(latest?.workspace.tree.map((item) => item.fileId)).toEqual(['file-1'])
+    } finally {
+      await act(async () => root.unmount())
+    }
+  })
+
+  it('recovers a structural event missed during a disconnect via the engine events.since replay', async () => {
+    const root = await renderWorkspace()
+    try {
+      const first = await connectWorkspace()
+      expect(latest?.workspace.tree.map((item) => item.fileId)).toEqual(['file-1'])
+
+      // file-2 is created at seq 2 while the socket is down, so its broadcast
+      // never reaches this client — it is recoverable ONLY through the engine's
+      // events.since replay on reconnect, never the live tree stream. The tree
+      // API still returns just file-1, so the 10s poll cannot recover it: if
+      // file-2 appears, it can only have arrived as an engine tree-event.
+      FakeWebSocket.eventsSinceEvents = [
+        {
+          type: 'create',
+          fileId: 'file-2',
+          path: 'docs/b.md',
+          seq: 2,
+          entry: entry('file-2', 'docs/b.md', 2),
+        },
+      ]
+      apiMock.treeSeq = 2
+
+      await act(async () => first.close())
+
+      // Transport reconnects (500ms backoff) and the second 'open' triggers
+      // engine.pull() → events.since replays the missed create.
+      await waitFor(() => FakeWebSocket.instances.length === 2, 3_000)
+      const second = FakeWebSocket.instances[1]!
+      await act(async () => {
+        second.open()
+        second.receive({ type: 'ready', sessionPeerId: '1' })
+      })
+
+      await waitFor(
+        () =>
+          latest?.workspace.tree
+            .map((item) => item.fileId)
+            .sort()
+            .join(',') === 'file-1,file-2',
+      )
     } finally {
       await act(async () => root.unmount())
     }
@@ -338,6 +384,10 @@ class FakeWebSocket extends EventTarget {
   // 'empty' keeps the engine quiet; 'snapshot-required' models a lost replay
   // window so the engine emits tree-resync (ISSUE-0048 Phase B).
   static eventsSinceMode: 'empty' | 'snapshot-required' = 'empty'
+  // Events the fake server replays in the events.batch response (modeling ops
+  // missed while the socket was down — recoverable only via events.since, not
+  // the live broadcast stream).
+  static eventsSinceEvents: unknown[] = []
 
   readyState = FakeWebSocket.CONNECTING
   readonly url: string
@@ -368,7 +418,7 @@ class FakeWebSocket extends EventTarget {
           type: 'events.batch',
           requestId,
           currentSeq: apiMock.treeSeq,
-          events: [],
+          events: FakeWebSocket.eventsSinceEvents,
         })
       })
     }
