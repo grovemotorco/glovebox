@@ -146,6 +146,31 @@ describe('WorkspaceProvider remote tree delete handling', () => {
     }
   })
 
+  it('dedupes overlapping openFile calls into a single snapshot attach', async () => {
+    const root = await renderWorkspace()
+    try {
+      const socket = await connectWorkspace()
+
+      // Two openFile calls for the same file before the first resolves (React
+      // StrictMode double-invoke / EditorView open-effect re-run). Only one
+      // snapshot attach may happen, or the engine and UI bind different clients.
+      await act(async () => {
+        latest?.workspace.openFile('file-1', 'docs/a.md')
+        latest?.workspace.openFile('file-1', 'docs/a.md')
+      })
+      // The placeholder is visible immediately (no longer a null handle).
+      expect(latest?.handle?.status).toBe('connecting')
+      const requests = socket.sentJson().filter((message) => message.type === 'snapshot.get')
+      expect(requests.length).toBe(1)
+
+      respondSnapshot(socket, requests[0]!, 'file-1', 'server text')
+      await waitFor(() => latest?.handle?.status === 'ready')
+      expect(latest?.handle?.room).toBeTruthy()
+    } finally {
+      await act(async () => root.unmount())
+    }
+  })
+
   it('recovers a structural event missed during a disconnect via the engine events.since replay', async () => {
     const root = await renderWorkspace()
     try {

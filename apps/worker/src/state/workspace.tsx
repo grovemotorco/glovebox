@@ -48,13 +48,22 @@ export type RoomHandle =
   | {
       fileId: string
       path: string
-      status: 'connecting' | 'ready'
+      status: 'ready'
       room: LoroRoomClient
       error?: undefined
     }
-  // `room` is absent only when an open failed before any room client was
-  // created (e.g. the snapshot fetch rejected). Every reader guards on
-  // `status === 'ready'` before touching `room`, so the union narrows it away.
+  // `room` is absent while an open is still in flight (a synchronous
+  // placeholder that dedupes overlapping openFile calls) or when an open
+  // failed before any client attached (e.g. the snapshot fetch rejected).
+  // Every reader guards on `status === 'ready'` before touching `room`, so the
+  // union narrows it away.
+  | {
+      fileId: string
+      path: string
+      status: 'connecting'
+      room?: LoroRoomClient
+      error?: undefined
+    }
   | {
       fileId: string
       path: string
@@ -542,12 +551,24 @@ export function WorkspaceProvider({
       const engine = engineRef.current
       if (!engine || roomStore.rooms.has(fileId)) return
 
+      // Register a placeholder synchronously so overlapping calls for the same
+      // file (StrictMode double-invoke, EditorView's open effect re-running as
+      // the tree churns) short-circuit on the has() guard above. Without it,
+      // each call would run its own snapshot attach and the engine could end
+      // up tracking a different client than the UI binds. The engine dedupes
+      // concurrent attaches too (belt and suspenders); this also shows the
+      // 'connecting' state immediately.
+      roomStore.rooms.set(fileId, { fileId, path, status: 'connecting' })
+      emitRooms()
+
       void (async () => {
         await engineReadyRef.current
         if (engineRef.current !== engine) return
         const room = await engine.openFile(fileId, path)
         const current = roomStore.rooms.get(fileId)
-        if (current && current.room !== room) return
+        // Bail only if a DIFFERENT real client now owns the slot (the
+        // placeholder has no room, so it must not block the ready transition).
+        if (current && current.room && current.room !== room) return
         roomStore.rooms.set(fileId, { fileId, path, room, status: 'ready' })
         emitRooms()
       })().catch((error: unknown) => {
