@@ -293,6 +293,28 @@ describe('WorkspaceSyncEngine against the real server core', () => {
     expect(a.engine.lastAckedSeq()).toBe(b.engine.lastAckedSeq())
   })
 
+  it('dedupes concurrent opens of the same file to one attached client', async () => {
+    const host = new ServerHost()
+    const a = await makeEngine(host, 'device-a')
+
+    // Two overlapping opens (StrictMode double-invoke / effect re-run) start
+    // before either attaches. Both must resolve to the SAME client, and the
+    // engine must track that one — otherwise the caller and engine diverge.
+    const [c1, c2] = await Promise.all([
+      a.engine.openFile(FILE, PATH, 'base\n'),
+      a.engine.openFile(FILE, PATH),
+    ])
+    expect(c1).toBe(c2)
+    expect(a.engine.client(FILE)).toBe(c1)
+
+    // A later open returns the same tracked client, and an edit on the shared
+    // client is the one the engine pushes.
+    expect(await a.engine.openFile(FILE, PATH)).toBe(c1)
+    await c1.setTextContent('base +A\n')
+    await a.engine.flush()
+    expect(a.engine.getText(FILE)).toBe('base +A\n')
+  })
+
   it('reload mid-session: hydrates from persistence and catches up via events.since', async () => {
     const host = new ServerHost()
     const a = await makeEngine(host, 'device-a')

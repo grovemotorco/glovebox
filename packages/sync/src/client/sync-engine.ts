@@ -89,6 +89,9 @@ export class WorkspaceSyncEngine {
   readonly #options: SyncEngineOptions
   readonly #store: WorkspaceStateStore
   readonly #files = new Map<string, { client: LoroRoomClient; path: string }>()
+  /** In-flight openFile attaches, keyed by fileId, so concurrent opens of the
+   *  same file share one fetch+attach and resolve to the SAME client. */
+  readonly #opening = new Map<string, Promise<LoroRoomClient>>()
   readonly #listeners = new Set<(change: SyncEngineChange) => void>()
   #state: WorkspaceState | null = null
   #unsubscribe: (() => void) | null = null
@@ -153,9 +156,24 @@ export class WorkspaceSyncEngine {
   async openFile(fileId: string, path: string, initialContent?: string): Promise<LoroRoomClient> {
     const existing = this.#files.get(fileId)
     if (existing) return existing.client
-    const client = await this.#fetchAndAttach(fileId, path, initialContent)
-    await this.#persistFile(fileId)
-    return client
+    // Dedupe concurrent opens of the same file: the #files check above only
+    // guards the synchronous entry, so without this two overlapping callers
+    // would each run #fetchAndAttach across the snapshot round-trip, leaving
+    // the engine tracking the last-attached client while a caller holds the
+    // first (edits + lifecycle ops then target different clients).
+    const inFlight = this.#opening.get(fileId)
+    if (inFlight) return inFlight
+    const attach = (async () => {
+      const client = await this.#fetchAndAttach(fileId, path, initialContent)
+      await this.#persistFile(fileId)
+      return client
+    })()
+    this.#opening.set(fileId, attach)
+    try {
+      return await attach
+    } finally {
+      this.#opening.delete(fileId)
+    }
   }
 
   getText(fileId: string): string | null {
