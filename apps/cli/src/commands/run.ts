@@ -8,7 +8,7 @@ import {
   createNodeFS,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printError } from '../cli/output.ts'
+import { printError, printHint, printWarn } from '../cli/output.ts'
 import { getToken } from '../lib/auth-store.ts'
 import { acquireLock } from '../lib/lockfile.ts'
 import { parseSyncOverrides } from '../lib/overrides.ts'
@@ -59,6 +59,17 @@ export async function runRun(
   }
 
   const overrides = parseSyncOverrides(env)
+
+  // Surface the most common run-time failure (no/expired token) up front, as
+  // a clear hint rather than an opaque "WebSocket connection failed" later.
+  const haveCredential = (await getToken(paths, mount.serverUrl)) !== null
+  if (!haveCredential) {
+    printWarn(
+      `No stored credentials for ${mount.serverUrl} — the server may reject this connection. ` +
+        `Sign in: glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}`,
+    )
+  }
+
   const lock = await acquireLock(paths, mount.mountId)
 
   let exiting = false
@@ -128,6 +139,11 @@ export async function runRun(
         printError(`sync cycle failed: ${message}`)
         if (!tlsDiagnosed && message.includes('WebSocket connection failed')) {
           tlsDiagnosed = true
+          if (!haveCredential) {
+            printHint(
+              `Not authenticated — run \`glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`, then restart.`,
+            )
+          }
           void diagnoseTlsTrust(mount.serverUrl).then((problem) => {
             if (problem) {
               printError(
@@ -161,17 +177,18 @@ export async function runRun(
     process.on('SIGINT', () => void shutdown(0))
     process.on('SIGTERM', () => void shutdown(0))
 
+    // Print the banner before starting the loop so it precedes any
+    // first-cycle connection diagnostics on stderr.
+    console.log(
+      `[glovebox] syncing ${mount.dir} ↔ workspace ${mount.workspaceId} (mount ${mount.mountId})`,
+    )
+    console.log('[glovebox] foreground daemon — Ctrl-C to stop')
     await runner.start()
   } catch (error) {
     await teardown()
     await lock.release()
     throw error
   }
-
-  console.log(
-    `[glovebox] syncing ${mount.dir} ↔ workspace ${mount.workspaceId} (mount ${mount.mountId})`,
-  )
-  console.log('[glovebox] foreground daemon — Ctrl-C to stop')
 
   // Block until a signal or terminal close ends the process.
   return new Promise<never>(() => {})

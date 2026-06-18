@@ -62,7 +62,7 @@ export default async function pull(args: string[], globals: GlobalFlags): Promis
     options: {
       workspace: { type: 'string', short: 'w' },
       'file-id': { type: 'string' },
-      server: { type: 'string' },
+      server: { type: 'string', short: 's' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -82,7 +82,7 @@ edits back with \`glovebox push <path>\`.
 Options:
   -w, --workspace <id>   Workspace ID (required)
       --file-id <id>     Pull by file ID instead of path
-      --server <url>     Server URL (default: stored auth's server)
+  -s, --server <url>     Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)
   -h, --help             Show this help message`)
     return
   }

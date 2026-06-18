@@ -1,28 +1,57 @@
-const VERSION = '0.1.0'
+import type { RootCommand } from './index.ts'
+import { DEFAULT_SERVER_URL } from '../lib/url.ts'
+import pkg from '../../package.json' with { type: 'json' }
 
+/** Version inlined from the package manifest at build time, so `--version`
+ * never drifts from what was shipped. */
 export function getVersion(): string {
-  return VERSION
+  return pkg.version
 }
 
-export function printUsage(): void {
-  console.log(`glovebox — sync a local directory with a collaborative workspace
+export function printUsage(commands: RootCommand[]): void {
+  const visible = commands.filter((c) => !c.hidden)
+  const groups = [...new Set(visible.map((c) => c.group))]
+  const pad = Math.max(...visible.map((c) => c.name.length)) + 2
 
-Usage: glovebox [--json] <command> [options]
-
-Commands:
-  auth      Manage server tokens (login / status / logout / mint-dev)
-  mount     Register a directory ↔ workspace binding (no process starts)
-  run       Run the sync daemon for a mount in the foreground
-  list      List registered mounts and their daemon state
-  status    Show sync status for a mount (works without a running daemon)
-  unmount   Remove a mount binding and its daemon state (keeps your files)
-  pull      Fetch a file's working text and record the merge base
-  push      Merge local edits into the live document (exit 0/2/3/1)
-
-Options:
-  --json       Output structured JSON (default when stdout is not a TTY)
-  --help, -h   Show this help message
-  --version    Show version`)
+  const lines: string[] = [
+    'glovebox — sync a local directory with a collaborative workspace',
+    '',
+    'Usage: glovebox [--json|--human] <command> [options]',
+    '',
+    'Getting started:',
+    '  glovebox auth device --workspace <id>   Sign in (opens a browser)',
+    '  glovebox workspaces list                Find your workspace IDs',
+    '  glovebox mount ./notes --workspace <id> Bind a directory',
+    '  glovebox run ./notes                    Start syncing',
+    '',
+    'Commands:',
+  ]
+  for (const group of groups) {
+    lines.push(`  ${group}`)
+    for (const c of visible.filter((x) => x.group === group)) {
+      lines.push(`    ${c.name.padEnd(pad)}${c.summary}`)
+    }
+  }
+  lines.push(
+    '',
+    'Global options:',
+    '  --json          Structured JSON output (default when stdout is not a TTY)',
+    '  --human         Force human output even when piped (alias: --no-json)',
+    '  --help, -h      Show this help message',
+    '  --version, -V   Show version',
+    '',
+    'Configuration (override the dir with GLOVEBOX_HOME):',
+    '  ~/.glovebox/auth.json     Stored tokens (0600)',
+    '  ~/.glovebox/config.json   Default server + preferences',
+    '  ~/.glovebox/mounts.json   Registered mounts',
+    '',
+    'Environment:',
+    '  GLOVEBOX_SERVER_URL   Default server URL (an explicit --server still wins)',
+    '  GLOVEBOX_HOME         Override the ~/.glovebox config directory',
+    '',
+    `Default server: ${DEFAULT_SERVER_URL}   ·   Diagnose: glovebox doctor`,
+  )
+  console.log(lines.join('\n'))
 }
 
 /** Levenshtein distance between two strings. */
@@ -43,15 +72,11 @@ function levenshtein(a: string, b: string): number {
   return dp[m]![n]!
 }
 
-// `pull` and `push` are reserved for the M7 text-push tier (exit-code
-// contract) — do not hand them to another command.
-const COMMAND_NAMES = ['auth', 'mount', 'run', 'list', 'status', 'unmount']
-
-/** Suggest a command name if the input is close to a known command. */
-export function getSuggestion(input: string): string | null {
+/** Suggest the closest known command name (edit distance ≤ 2). */
+export function getSuggestion(input: string, names: string[]): string | null {
   let best: string | null = null
   let bestDist = Infinity
-  for (const name of COMMAND_NAMES) {
+  for (const name of names) {
     const dist = levenshtein(input, name)
     if (dist < bestDist && dist <= 2) {
       bestDist = dist

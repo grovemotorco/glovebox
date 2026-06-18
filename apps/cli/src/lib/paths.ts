@@ -15,6 +15,7 @@ export interface GloveboxPaths {
   home: string
   mountsFile: string
   authFile: string
+  configFile: string
   stateDir(mountId: string): string
   lockFile(mountId: string): string
 }
@@ -25,6 +26,7 @@ export function gloveboxPaths(env: NodeJS.ProcessEnv = process.env): GloveboxPat
     home,
     mountsFile: join(home, 'mounts.json'),
     authFile: join(home, 'auth.json'),
+    configFile: join(home, 'config.json'),
     stateDir: (mountId) => join(home, 'state', encodeURIComponent(mountId)),
     lockFile: (mountId) => join(home, 'locks', `${encodeURIComponent(mountId)}.lock`),
   }

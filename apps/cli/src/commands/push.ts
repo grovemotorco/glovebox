@@ -114,7 +114,7 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
     args,
     options: {
       force: { type: 'boolean', default: false },
-      server: { type: 'string' },
+      server: { type: 'string', short: 's' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -135,7 +135,7 @@ Exit codes: 0 clean · 2 failed hunks (printed verbatim; base unchanged) ·
 
 Options:
       --force        Apply even a degenerate rewrite (>60% deletion)
-      --server <url> Server URL (default: recorded at pull)
+  -s, --server <url> Server URL (default: the server recorded at pull time)
   -h, --help         Show this help message`)
     return
   }
