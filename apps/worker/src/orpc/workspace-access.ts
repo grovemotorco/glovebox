@@ -145,7 +145,10 @@ function requireApiKeyWorkspaceScope(
   const apiKey = principal.apiKey
   if (!apiKey) return
 
-  if (!apiKey.workspaceIds.includes(workspaceId)) {
+  // An empty workspaceIds list means "no per-workspace restriction": the key may reach
+  // any of the principal's own workspaces, with the workspaceMember join in
+  // requireWorkspaceAccess as the real gate. A non-empty list must include this workspace.
+  if (apiKey.workspaceIds.length > 0 && !apiKey.workspaceIds.includes(workspaceId)) {
     throw new ORPCError('FORBIDDEN', {
       status: 403,
       message: 'Forbidden',
@@ -154,10 +157,16 @@ function requireApiKeyWorkspaceScope(
   }
 
   if (!hasWorkspaceScope(apiKey.scopes, requiredScope)) {
+    // Owner operations (workspace update/delete, key management) require an
+    // admin-scoped key even for the workspace owner — surface that explicitly so the
+    // CLI can tell the user to mint one (`auth device --scope workspace:admin`).
+    const adminRequired = requiredScope === 'workspace:admin'
     throw new ORPCError('FORBIDDEN', {
       status: 403,
-      message: 'Forbidden',
-      data: { reason: 'scope_missing' },
+      message: adminRequired
+        ? 'This operation requires a workspace:admin-scoped API key'
+        : 'Forbidden',
+      data: { reason: adminRequired ? 'admin_scope_required' : 'scope_missing' },
     })
   }
 }

@@ -818,6 +818,174 @@ describe('workspace API', () => {
 
     harness.close()
   })
+
+  it('treats an empty-scope API key as unrestricted over its own workspaces', async () => {
+    const harness = createWorkerHarness()
+    const ownerSession = await harness.signUp('owner@example.com', 'Owner User')
+    const owner = harness.client(ownerSession.cookie)
+    const personal = (await owner.workspaces.list()).workspaces[0]
+    if (!personal) throw new Error('sign-up did not create a personal workspace')
+
+    // A device key minted without --workspace carries empty workspaceIds: empty
+    // scope means "no per-workspace restriction", not "zero workspaces".
+    const created = await owner.keys.create({
+      name: 'unscoped device key',
+      purpose: 'cli',
+      scopes: ['workspace:read', 'workspace:write'],
+      workspaceIds: [],
+    })
+    const api = harness.bearerClient(created.plaintext)
+
+    // It can create a workspace and immediately see it in the list.
+    const viaKey = await api.workspaces.create({ name: 'Made By Key' })
+    const listed = await api.workspaces.list()
+    expect(listed.workspaces.map((workspace) => workspace.id)).toEqual(
+      expect.arrayContaining([personal.id, viaKey.id]),
+    )
+
+    // Per-workspace reads/ops resolve for a workspace it owns.
+    await expect(api.workspaces.get({ workspaceId: viaKey.id })).resolves.toMatchObject({
+      id: viaKey.id,
+      currentPrincipalOwner: true,
+    })
+    await expect(api.workspaces.tree({ workspaceId: viaKey.id })).resolves.toMatchObject({
+      entries: expect.any(Array),
+    })
+    await expect(
+      api.auth.mintWorkspaceSocketToken({ workspaceId: viaKey.id }),
+    ).resolves.toMatchObject({ claims: expect.objectContaining({ workspaceId: viaKey.id }) })
+
+    // me.get reflects the same unrestricted view.
+    await expect(api.me.get()).resolves.toMatchObject({
+      principal: expect.objectContaining({ id: humanPrincipalId(ownerSession.userId) }),
+      workspaces: expect.arrayContaining([
+        expect.objectContaining({ id: personal.id }),
+        expect.objectContaining({ id: viaKey.id }),
+      ]),
+    })
+
+    harness.close()
+  })
+
+  it('keeps a workspace-scoped API key restricted to its scoped ids', async () => {
+    const harness = createWorkerHarness()
+    const ownerSession = await harness.signUp('owner@example.com', 'Owner User')
+    const owner = harness.client(ownerSession.cookie)
+    const allowed = await owner.workspaces.create({ name: 'Allowed Docs' })
+    const denied = await owner.workspaces.create({ name: 'Denied Docs' })
+
+    // Scoped to [allowed] only — even though the owner also owns `denied`.
+    const created = await owner.keys.create({
+      name: 'scoped key',
+      purpose: 'api',
+      scopes: ['workspace:read'],
+      workspaceIds: [allowed.id],
+    })
+    const api = harness.bearerClient(created.plaintext)
+
+    await expect(api.workspaces.list()).resolves.toMatchObject({
+      workspaces: [expect.objectContaining({ id: allowed.id })],
+    })
+    await expect(api.workspaces.get({ workspaceId: allowed.id })).resolves.toMatchObject({
+      id: allowed.id,
+    })
+    // idB is owned by the same principal but outside the key's scope → 403.
+    await expect(api.workspaces.get({ workspaceId: denied.id })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    })
+
+    harness.close()
+  })
+
+  it('implements me.get, me.sessions, and me.setActiveWorkspace', async () => {
+    const harness = createWorkerHarness()
+    const ownerSession = await harness.signUp('me@example.com', 'Me User')
+    const owner = harness.client(ownerSession.cookie)
+    const personal = (await owner.workspaces.list()).workspaces[0]
+    if (!personal) throw new Error('sign-up did not create a personal workspace')
+    const second = await owner.workspaces.create({ name: 'Second Workspace' })
+
+    // The personal workspace is pre-selected at sign-up.
+    await expect(owner.me.get()).resolves.toMatchObject({
+      principal: {
+        id: humanPrincipalId(ownerSession.userId),
+        type: 'human',
+        displayName: 'Me User',
+        email: 'me@example.com',
+      },
+      activeWorkspaceId: personal.id,
+      workspaces: expect.arrayContaining([
+        expect.objectContaining({ id: personal.id }),
+        expect.objectContaining({ id: second.id }),
+      ]),
+    })
+
+    await expect(owner.me.setActiveWorkspace({ workspaceId: second.id })).resolves.toEqual({
+      activeWorkspaceId: second.id,
+    })
+    await expect(owner.me.get()).resolves.toMatchObject({ activeWorkspaceId: second.id })
+
+    // Activating a workspace the caller can't see is rejected.
+    await expect(
+      owner.me.setActiveWorkspace({ workspaceId: 'ws_nonexistent' }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+    const sessions = await owner.me.sessions()
+    expect(sessions.sessions.length).toBeGreaterThanOrEqual(1)
+    expect(sessions.sessions[0]).toMatchObject({
+      id: expect.any(String),
+      createdAt: expect.any(Number),
+      expiresAt: expect.any(Number),
+    })
+
+    harness.close()
+  })
+
+  it('requires an admin-scoped API key for owner workspace operations', async () => {
+    const harness = createWorkerHarness()
+    const ownerSession = await harness.signUp('owner@example.com', 'Owner User')
+    const owner = harness.client(ownerSession.cookie)
+    const workspace = await owner.workspaces.create({ name: 'Admin Docs' })
+
+    // The CLI's default device scopes (read+write) cannot run owner ops — and the
+    // refusal is explicit so the CLI can tell the user to mint an admin-scoped key.
+    const writeKey = await owner.keys.create({
+      name: 'write key',
+      purpose: 'cli',
+      scopes: ['workspace:read', 'workspace:write'],
+      workspaceIds: [workspace.id],
+    })
+    const writeClient = harness.bearerClient(writeKey.plaintext)
+    await expect(
+      writeClient.workspaces.update({ workspaceId: workspace.id, name: 'Nope' }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN', data: { reason: 'admin_scope_required' } })
+    await expect(
+      writeClient.workspaces.delete({ workspaceId: workspace.id }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN', data: { reason: 'admin_scope_required' } })
+
+    // An admin-scoped key for the same owner can.
+    const adminKey = await owner.keys.create({
+      name: 'admin key',
+      purpose: 'cli',
+      scopes: ['workspace:read', 'workspace:write', 'workspace:admin'],
+      workspaceIds: [workspace.id],
+    })
+    const adminClient = harness.bearerClient(adminKey.plaintext)
+    await expect(
+      adminClient.workspaces.update({ workspaceId: workspace.id, name: 'Renamed' }),
+    ).resolves.toMatchObject({ id: workspace.id, name: 'Renamed' })
+    await expect(adminClient.workspaces.delete({ workspaceId: workspace.id })).resolves.toEqual({
+      ok: true,
+    })
+
+    // Browser-session owners stay unrestricted (no API key scope in play).
+    const browserWorkspace = await owner.workspaces.create({ name: 'Browser Docs' })
+    await expect(owner.workspaces.delete({ workspaceId: browserWorkspace.id })).resolves.toEqual({
+      ok: true,
+    })
+
+    harness.close()
+  })
 })
 
 type WorkerHarness = {
