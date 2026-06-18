@@ -1,0 +1,40 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: lint + typecheck + build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The recursive build's dts pass can exceed Node's default heap on the
+    # Linux runner; ubuntu-latest has 16 GB, so 4 GB is comfortable headroom.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint + typecheck
+        run: pnpm exec vp check
+
+      - name: Build
+        run: pnpm exec vp run -r build
+
+      - name: Test
+        run: pnpm exec vp test --run

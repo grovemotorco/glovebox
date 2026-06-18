@@ -61,7 +61,10 @@
   // sets; @cloudflare/vite-plugin reads that variable). Wrangler environments
   // do NOT inherit top-level vars/bindings, so this block fully restates them
   // with the portless (*.glovebox.test) dev values. AUTH_EMAIL_MODE "none" +
-  // BETTER_AUTH_DEV_PASSWORD keep auth email out of the loop locally.
+  // BETTER_AUTH_DEV_PASSWORD keep auth email out of the loop locally. This env
+  // is local-only (Miniflare); its D1 binding deliberately does NOT carry the
+  // production database_id, so an accidental `--env dev --remote` cannot touch
+  // prod. Apply local migrations with `db:migrate:local` (it runs `--env dev`).
   "env": {
     "dev": {
       "vars": {
@@ -81,7 +84,11 @@
         {
           "binding": "DB",
           "database_name": "glovebox-db",
-          "database_id": "14e2a7c1-80b9-46ce-ba35-088dc8b648d7",
+          // Placeholder id: this env runs only against the local Miniflare D1,
+          // which is keyed by config, not by a real remote database. Keeping it
+          // distinct from the production id means `--env dev --remote` fails
+          // loudly instead of mutating the live database.
+          "database_id": "local-dev-no-remote",
           "migrations_dir": "./migrations",
         },
       ],
