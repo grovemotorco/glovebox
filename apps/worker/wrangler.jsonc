@@ -4,32 +4,95 @@
   "compatibility_date": "2026-03-17",
   "compatibility_flags": ["nodejs_compat"],
   "main": "src/index.ts",
+
+  // One worker serves the web app, API, auth, and WebSockets. It binds two
+  // custom domains; the client is same-origin (window.location.origin), so each
+  // domain is a complete, self-contained origin. Cloudflare auto-provisions the
+  // DNS records + TLS certs on first deploy. The apex (glovebox.md) is reserved.
+  "routes": [
+    { "pattern": "api.glovebox.md", "custom_domain": true },
+    { "pattern": "app.glovebox.md", "custom_domain": true },
+  ],
+  "placement": { "mode": "smart" },
+
+  // Required secrets (set per environment with `wrangler secret put <NAME>`):
+  //   BETTER_AUTH_SECRET  — better-auth signing secret (src/lib/auth.ts)
+  //   WS_AUTH_SECRET      — WorkspaceDO socket-token HMAC (src/workspace-do.ts)
+  //
+  // Cloudflare Email Service: the sender domain (glovebox.md) must be onboarded
+  // via Dashboard -> Email Sending -> Onboard Domain so the bounce/auth DNS
+  // records (MX/SPF/DKIM/DMARC) are provisioned. See the README.
   "vars": {
-    "AUTH_EMAIL_FROM": "auth@glovebox.test",
+    "AUTH_EMAIL_FROM": "auth@glovebox.md",
     "AUTH_EMAIL_FROM_NAME": "Glovebox",
-    "AUTH_EMAIL_MODE": "none",
-    "BETTER_AUTH_URL": "https://api.glovebox.test",
-    "BETTER_AUTH_TRUSTED_ORIGIN": "https://api.glovebox.test",
-    "BETTER_AUTH_COOKIE_DOMAIN": ".glovebox.test",
-    "BETTER_AUTH_DEV_PASSWORD": "true",
-    "INVITATION_EMAIL_FROM": "invites@glovebox.test",
+    "AUTH_EMAIL_MODE": "send",
+    "BETTER_AUTH_URL": "https://api.glovebox.md",
+    "BETTER_AUTH_TRUSTED_ORIGIN": "https://api.glovebox.md,https://app.glovebox.md",
+    "BETTER_AUTH_COOKIE_DOMAIN": ".glovebox.md",
+    "INVITATION_EMAIL_FROM": "invites@glovebox.md",
     "INVITATION_EMAIL_FROM_NAME": "Glovebox",
-    "INVITATION_ACCEPT_URL": "https://api.glovebox.test/invites/accept",
+    "INVITATION_ACCEPT_URL": "https://app.glovebox.md/invites/accept",
   },
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": ["auth@glovebox.md", "invites@glovebox.md"],
+      "remote": true,
+    },
+  ],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "glovebox-db",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "14e2a7c1-80b9-46ce-ba35-088dc8b648d7",
+      "migrations_dir": "./migrations",
     },
   ],
   "durable_objects": {
     "bindings": [{ "name": "WORKSPACE_DO", "class_name": "WorkspaceDO" }],
   },
-  "send_email": [{ "name": "EMAIL" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceDO"] }],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
+  },
+
+  // Local development (selected by CLOUDFLARE_ENV=dev, which the `dev` script
+  // sets; @cloudflare/vite-plugin reads that variable). Wrangler environments
+  // do NOT inherit top-level vars/bindings, so this block fully restates them
+  // with the portless (*.glovebox.test) dev values. AUTH_EMAIL_MODE "none" +
+  // BETTER_AUTH_DEV_PASSWORD keep auth email out of the loop locally.
+  "env": {
+    "dev": {
+      "vars": {
+        "AUTH_EMAIL_FROM": "auth@glovebox.test",
+        "AUTH_EMAIL_FROM_NAME": "Glovebox",
+        "AUTH_EMAIL_MODE": "none",
+        "BETTER_AUTH_URL": "https://api.glovebox.test",
+        "BETTER_AUTH_TRUSTED_ORIGIN": "https://api.glovebox.test",
+        "BETTER_AUTH_COOKIE_DOMAIN": ".glovebox.test",
+        "BETTER_AUTH_DEV_PASSWORD": "true",
+        "INVITATION_EMAIL_FROM": "invites@glovebox.test",
+        "INVITATION_EMAIL_FROM_NAME": "Glovebox",
+        "INVITATION_ACCEPT_URL": "https://api.glovebox.test/invites/accept",
+      },
+      "send_email": [{ "name": "EMAIL" }],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "glovebox-db",
+          "database_id": "14e2a7c1-80b9-46ce-ba35-088dc8b648d7",
+          "migrations_dir": "./migrations",
+        },
+      ],
+      "durable_objects": {
+        "bindings": [{ "name": "WORKSPACE_DO", "class_name": "WorkspaceDO" }],
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceDO"] }],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+      },
+    },
   },
 }

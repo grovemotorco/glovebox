@@ -1,27 +1,54 @@
 {
   "name": "@glovebox.md/cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Glovebox CLI — mount, sync, and manage local-first Glovebox workspaces from the terminal.",
+  "keywords": [
+    "cli",
+    "crdt",
+    "fuse",
+    "glovebox",
+    "local-first",
+    "loro",
+    "sync"
+  ],
+  "homepage": "https://app.glovebox.md",
+  "bugs": {
+    "url": "https://github.com/grovemotorco/glovebox/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/grovemotorco/glovebox.git",
+    "directory": "apps/cli"
+  },
   "bin": {
     "glovebox": "./dist/glovebox.mjs"
   },
+  "files": [
+    "dist"
+  ],
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "vp pack",
     "test": "vp test",
     "check": "vp check",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
-  "dependencies": {
-    "@glovebox.md/api": "workspace:*",
-    "@glovebox.md/core": "workspace:*",
-    "@glovebox.md/sync": "workspace:*"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "vp pack"
   },
   "devDependencies": {
+    "@glovebox.md/api": "workspace:*",
+    "@glovebox.md/core": "workspace:*",
     "@glovebox.md/harness": "workspace:*",
+    "@glovebox.md/sync": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

@@ -8,7 +8,7 @@ export default defineConfig({
     printWidth: 100,
   },
   lint: {
-    ignorePatterns: ['**/dist/**'],
+    ignorePatterns: ['**/dist/**', 'scripts/**', 'apps/worker/tests/**'],
     options: { typeAware: true, typeCheck: true },
   },
   test: {
