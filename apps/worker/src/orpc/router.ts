@@ -1,4 +1,4 @@
-import { os, notImplemented } from './index.ts'
+import { os } from './index.ts'
 import {
   createWorkspace,
   deleteWorkspace,
@@ -37,6 +37,7 @@ import {
   readVersion,
 } from './document-handlers.ts'
 import { getWorkspaceTree, pushWorkspaceText, readWorkspaceText } from './text-handlers.ts'
+import { getMe, listSessions, setActiveWorkspace } from './me-handlers.ts'
 import {
   acknowledgeWorkspaceRecovery,
   getDocumentRecovery,
@@ -82,10 +83,10 @@ const auth = {
 }
 
 const me = {
-  get: os.me.get.handler(async () => notImplemented('me.get')),
-  sessions: os.me.sessions.handler(async () => notImplemented('me.sessions')),
-  setActiveWorkspace: os.me.setActiveWorkspace.handler(async () =>
-    notImplemented('me.setActiveWorkspace'),
+  get: os.me.get.handler(async ({ context }) => getMe(context)),
+  sessions: os.me.sessions.handler(async ({ context }) => listSessions(context)),
+  setActiveWorkspace: os.me.setActiveWorkspace.handler(async ({ input, context }) =>
+    setActiveWorkspace(input, context),
   ),
 }
 

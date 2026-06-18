@@ -54,7 +54,7 @@ export async function listWorkspaces(context: ORPCContext): Promise<{
   const db = createDb(context.env.DB)
   const principal = await requirePrincipal(context)
   const allowedWorkspaceIds = principal.apiKey
-    ? new Set(assertApiKeyCanListWorkspaces(principal.apiKey))
+    ? assertApiKeyCanListWorkspaces(principal.apiKey)
     : null
   const rows = await db
     .select({ workspace, member: workspaceMember })
@@ -162,7 +162,7 @@ function workspaceSlug(name: string, workspaceId: string): string {
 function assertApiKeyCanListWorkspaces(apiKey: {
   scopes: readonly string[]
   workspaceIds: readonly string[]
-}): readonly string[] {
+}): Set<string> | null {
   if (!hasWorkspaceScope(apiKey.scopes, 'workspace:read')) {
     throw new ORPCError('FORBIDDEN', {
       status: 403,
@@ -170,5 +170,8 @@ function assertApiKeyCanListWorkspaces(apiKey: {
       data: { reason: 'scope_missing' },
     })
   }
-  return apiKey.workspaceIds
+  // An empty workspaceIds list means "no per-workspace restriction": the key sees all
+  // of the principal's own workspaces. A non-empty list restricts to those ids. Either
+  // way the workspaceMember join below remains the real authorization gate.
+  return apiKey.workspaceIds.length > 0 ? new Set(apiKey.workspaceIds) : null
 }
