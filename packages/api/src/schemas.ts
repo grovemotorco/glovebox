@@ -1,4 +1,4 @@
-import { normalizeWorkspaceRelativePath } from '@glovebox/core'
+import { normalizeWorkspaceRelativePath } from '@glovebox.md/core'
 import * as z from 'zod'
 
 export const idSchema = z.string().min(1).max(256)

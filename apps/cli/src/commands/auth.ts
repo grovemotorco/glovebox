@@ -4,8 +4,8 @@ import {
   type DeviceAuthorizationStartOutput,
   type GloveboxClient,
   type KeyPurpose,
-} from '@glovebox/api'
-import { signWorkspaceToken } from '@glovebox/sync/server'
+} from '@glovebox.md/api'
+import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printError, printJson, printSuccess, printWarn, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'

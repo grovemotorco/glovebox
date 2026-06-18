@@ -16,7 +16,7 @@ There are three ways to work with a workspace:
 - **CLI** — sync a local directory to a workspace (`glovebox mount` + `run`).
 - **API** — a typed SDK or REST for programmatic and agent access.
 
-> Inside this repo the CLI runs as `vp run @glovebox/cli -- <args>`; an installed
+> Inside this repo the CLI runs as `vp run @glovebox.md/cli -- <args>`; an installed
 > build exposes it as the `glovebox` binary. Examples below use `glovebox`.
 
 ### Authentication
@@ -64,7 +64,7 @@ target another.
 ### SDK
 
 ```ts
-import { createGloveboxCliClient } from '@glovebox/api'
+import { createGloveboxCliClient } from '@glovebox.md/api'
 
 const client = createGloveboxCliClient({
   baseUrl: 'https://api.glovebox.test',
@@ -151,15 +151,15 @@ vp run dev:worker   # https://api.glovebox.test
 
 | Package                     | Path                       | Purpose                                      |
 | --------------------------- | -------------------------- | -------------------------------------------- |
-| `@glovebox/worker`          | `apps/worker`              | Worker dispatcher, Better Auth, ORPC, DO, UI |
-| `@glovebox/cli`             | `apps/cli`                 | Local file-sync CLI daemon                   |
-| `@glovebox/prototype`       | `apps/prototype`           | Product UI prototype                         |
-| `@glovebox/api`             | `packages/api`             | ORPC contract, typed clients, OpenAPI inputs |
-| `@glovebox/sync`            | `packages/sync`            | Sync protocol, daemon/client/server core     |
-| `@glovebox/core`            | `packages/core`            | Shared types and protocol constants          |
-| `@glovebox/loro-codemirror` | `packages/loro-codemirror` | CodeMirror binding for Loro CRDTs            |
-| `@glovebox/dofs`            | `packages/dofs`            | Durable Object filesystem (vendored)         |
-| `@glovebox/harness`         | `packages/harness`         | Shared test harness                          |
+| `@glovebox.md/worker`          | `apps/worker`              | Worker dispatcher, Better Auth, ORPC, DO, UI |
+| `@glovebox.md/cli`             | `apps/cli`                 | Local file-sync CLI daemon                   |
+| `@glovebox.md/prototype`       | `apps/prototype`           | Product UI prototype                         |
+| `@glovebox.md/api`             | `packages/api`             | ORPC contract, typed clients, OpenAPI inputs |
+| `@glovebox.md/sync`            | `packages/sync`            | Sync protocol, daemon/client/server core     |
+| `@glovebox.md/core`            | `packages/core`            | Shared types and protocol constants          |
+| `@glovebox.md/loro-codemirror` | `packages/loro-codemirror` | CodeMirror binding for Loro CRDTs            |
+| `@glovebox.md/dofs`            | `packages/dofs`            | Durable Object filesystem (vendored)         |
+| `@glovebox.md/harness`         | `packages/harness`         | Shared test harness                          |
 
 ### Database and email
 
@@ -168,9 +168,9 @@ Email Service `EMAIL` binding. Tests use fake/no-email modes and never send real
 email.
 
 ```bash
-vp run @glovebox/worker#db:generate
-vp run @glovebox/worker#db:migrate:local
-vp run @glovebox/worker#db:migrate:remote
+vp run @glovebox.md/worker#db:generate
+vp run @glovebox.md/worker#db:migrate:local
+vp run @glovebox.md/worker#db:migrate:remote
 ```
 
 Secrets such as `BETTER_AUTH_SECRET` and `WS_AUTH_SECRET` are configured as

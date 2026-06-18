@@ -3,8 +3,8 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { WorkspaceTreeEntry } from '@glovebox/api'
-import { bytesToBase64, LoroFileDoc } from '@glovebox/sync/loro'
+import type { WorkspaceTreeEntry } from '@glovebox.md/api'
+import { bytesToBase64, LoroFileDoc } from '@glovebox.md/sync/loro'
 import {
   useRoom,
   useWorkspace,

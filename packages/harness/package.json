@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox/harness",
+  "name": "@glovebox.md/harness",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,8 +11,8 @@
     "check": "vp check"
   },
   "dependencies": {
-    "@glovebox/core": "workspace:*",
-    "@glovebox/sync": "workspace:*",
+    "@glovebox.md/core": "workspace:*",
+    "@glovebox.md/sync": "workspace:*",
     "loro-crdt": "^1.12.1",
     "ws": "catalog:"
   },

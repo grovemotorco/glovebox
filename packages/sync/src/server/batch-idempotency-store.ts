@@ -1,4 +1,4 @@
-import type { WorkspaceChangeEvent } from '@glovebox/core'
+import type { WorkspaceChangeEvent } from '@glovebox.md/core'
 import { bytesToBase64 } from '../loro/base64.ts'
 import type { WorkspaceSqlStorageLike } from './workspace-store.ts'
 

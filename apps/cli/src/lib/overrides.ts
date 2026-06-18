@@ -1,4 +1,4 @@
-import type { DaemonDeletePolicy } from '@glovebox/sync/daemon'
+import type { DaemonDeletePolicy } from '@glovebox.md/sync/daemon'
 
 /**
  * `GLOVEBOX_SYNC_OVERRIDES` — a JSON env lever for tests and local

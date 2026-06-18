@@ -1,5 +1,5 @@
 import { and, eq } from 'drizzle-orm'
-import type { DocumentRole, InviteView } from '@glovebox/api'
+import type { DocumentRole, InviteView } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { workspace, workspaceInvite, workspaceMember } from '../db/schema/index.ts'

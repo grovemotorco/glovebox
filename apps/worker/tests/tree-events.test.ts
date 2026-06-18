@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { WorkspaceTreeEntry } from '@glovebox/api'
+import type { WorkspaceTreeEntry } from '@glovebox.md/api'
 import {
   applyTreeWireEvent,
   type TreeSnapshot,

@@ -1,4 +1,4 @@
-import type { VersionVector, WorkspaceChangeEvent } from '@glovebox/core'
+import type { VersionVector, WorkspaceChangeEvent } from '@glovebox.md/core'
 import { LoroFileDoc } from '../loro/file-doc.ts'
 import { bytesToBase64 } from '../loro/base64.ts'
 import { isMarkdownFile } from '../fs/file-kind.ts'

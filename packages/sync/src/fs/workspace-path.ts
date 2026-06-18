@@ -1,4 +1,4 @@
-import { normalizeWorkspaceMarkdownPath, normalizeWorkspaceRelativePath } from '@glovebox/core'
+import { normalizeWorkspaceMarkdownPath, normalizeWorkspaceRelativePath } from '@glovebox.md/core'
 
 export function requireWorkspaceRelativePath(relativePath: string): string {
   const normalized = normalizeWorkspaceRelativePath(relativePath)

@@ -1,12 +1,12 @@
 import { parseArgs } from 'node:util'
-import { createGloveboxCliClient } from '@glovebox/api'
+import { createGloveboxCliClient } from '@glovebox.md/api'
 import {
   DaemonRunner,
   DaemonSyncEngine,
   NodeDaemonStorage,
   WsDaemonTransport,
   createNodeFS,
-} from '@glovebox/sync/daemon'
+} from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printError } from '../cli/output.ts'
 import { getToken } from '../lib/auth-store.ts'

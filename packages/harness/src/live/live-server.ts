@@ -10,7 +10,7 @@ import {
   type WorkspaceSocket,
   type WorkspaceSqlStorage,
   type WorkspaceSqlValue,
-} from '@glovebox/sync/server'
+} from '@glovebox.md/sync/server'
 
 /**
  * The REAL `WorkspaceServer` core behind a REAL local WebSocket server —

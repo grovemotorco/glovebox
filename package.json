@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox/glovebox",
+  "name": "@glovebox.md/glovebox",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,8 +8,8 @@
     "build": "vp run -r build",
     "test": "vp test",
     "dev": "vp run -r --parallel dev",
-    "dev:worker": "vp run @glovebox/worker#dev",
-    "dev:prototype": "vp run @glovebox/prototype#dev"
+    "dev:worker": "vp run @glovebox.md/worker#dev",
+    "dev:prototype": "vp run @glovebox.md/prototype#dev"
   },
   "devDependencies": {
     "@sentry/dotagents": "catalog:",

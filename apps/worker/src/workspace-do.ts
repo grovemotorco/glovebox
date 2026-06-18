@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { WorkspaceServer, type WorkspaceConnectionClaims } from '@glovebox/sync/server'
+import { WorkspaceServer, type WorkspaceConnectionClaims } from '@glovebox.md/sync/server'
 
 const CLAIMS_HEADER = 'x-glovebox-claims'
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000

@@ -1,5 +1,5 @@
-import type { WorkspaceTreeEntry } from '@glovebox/api'
-import type { WorkspaceServerMessage } from '@glovebox/sync/server'
+import type { WorkspaceTreeEntry } from '@glovebox.md/api'
+import type { WorkspaceServerMessage } from '@glovebox.md/sync/server'
 
 export type TreeWireEvent = Extract<
   WorkspaceServerMessage,

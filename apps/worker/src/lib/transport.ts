@@ -5,16 +5,20 @@ import {
   type LoroUpdateWireEvent,
   type SubmitUpdateInput,
   type SubmitUpdateResult,
-} from '@glovebox/sync/loro'
-import type { OpaqueManifest } from '@glovebox/core'
+} from '@glovebox.md/sync/loro'
+import type { OpaqueManifest } from '@glovebox.md/core'
 import type {
   EventsSinceResult,
   WireWorkspaceEvent,
   WorkspacePresenceTransport,
   WorkspacePresenceWireEvent,
   WorkspaceSyncTransport,
-} from '@glovebox/sync/client'
-import type { BatchAcceptedOp, BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
+} from '@glovebox.md/sync/client'
+import type {
+  BatchAcceptedOp,
+  BatchDeferredOp,
+  WorkspaceBatchWireOp,
+} from '@glovebox.md/sync/server'
 import { randomUuid } from './random.ts'
 import { isTreeWireEvent, type TreeWireEvent } from './tree-events.ts'
 

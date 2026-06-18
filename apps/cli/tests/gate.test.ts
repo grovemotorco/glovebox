@@ -3,11 +3,11 @@ import { mkdir, mkdtemp, readFile, realpath, rm, unlink, writeFile } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { signWorkspaceToken } from '@glovebox/sync/server'
-import { LoroFileDoc } from '@glovebox/sync/loro'
-import { WsDaemonTransport, createNodeFS } from '@glovebox/sync/daemon'
-import { MemoryClientStorage, WorkspaceSyncEngine } from '@glovebox/sync/client'
-import { EDITOR_SAVE_PATTERNS, LiveWorkspaceHost } from '@glovebox/harness'
+import { signWorkspaceToken } from '@glovebox.md/sync/server'
+import { LoroFileDoc } from '@glovebox.md/sync/loro'
+import { WsDaemonTransport, createNodeFS } from '@glovebox.md/sync/daemon'
+import { MemoryClientStorage, WorkspaceSyncEngine } from '@glovebox.md/sync/client'
+import { EDITOR_SAVE_PATTERNS, LiveWorkspaceHost } from '@glovebox.md/harness'
 
 /**
  * M8 milestone gate (scope note "M8 gate"): the REAL WorkspaceServer core

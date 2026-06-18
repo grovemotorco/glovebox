@@ -1,5 +1,5 @@
-import { createGloveboxClient, type GloveboxClient, type RecoveryRecord } from '@glovebox/api'
-import { sha256Hex } from '@glovebox/sync'
+import { createGloveboxClient, type GloveboxClient, type RecoveryRecord } from '@glovebox.md/api'
+import { sha256Hex } from '@glovebox.md/sync'
 import { describe, expect, it } from 'vitest'
 import { worker } from '../src/dispatcher.ts'
 import { humanPrincipalId } from '../src/lib/workspace-bootstrap.ts'

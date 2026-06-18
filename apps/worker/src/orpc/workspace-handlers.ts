@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from 'drizzle-orm'
-import type { WorkspaceCreateInput, WorkspaceSummary, WorkspaceUpdateInput } from '@glovebox/api'
+import type { WorkspaceCreateInput, WorkspaceSummary, WorkspaceUpdateInput } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { workspace, workspaceMember } from '../db/schema/index.ts'

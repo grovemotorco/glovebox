@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { sha256Hex } from '@glovebox/sync'
-import { LocalFSError } from '@glovebox/sync'
+import { sha256Hex } from '@glovebox.md/sync'
+import { LocalFSError } from '@glovebox.md/sync'
 import { MemoryFS } from '../src/fs/memory-fs.ts'
 
 describe('MemoryFS', () => {

@@ -1,5 +1,5 @@
 import { and, eq } from 'drizzle-orm'
-import type { ApiKeyCreateOutput, ApiKeyView, KeyPurpose } from '@glovebox/api'
+import type { ApiKeyCreateOutput, ApiKeyView, KeyPurpose } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { apiKey as authApiKey, apiKeyMetadata } from '../db/schema/index.ts'

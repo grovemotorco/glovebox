@@ -6,7 +6,7 @@ export { base64ToBytes, bytesToBase64 } from './base64.ts'
 
 /**
  * Wire event shape that arrives over the workspace WebSocket. Mirrors the
- * `content.loroUpdate` variant of `WorkspaceChangeEvent` from `@glovebox/core`,
+ * `content.loroUpdate` variant of `WorkspaceChangeEvent` from `@glovebox.md/core`,
  * but kept narrow here so this module has no dependency on the workspace
  * tree event types.
  */

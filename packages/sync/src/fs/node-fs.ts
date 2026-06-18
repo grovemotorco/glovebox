@@ -1,4 +1,4 @@
-import { normalizeWorkspaceRelativePath } from '@glovebox/core'
+import { normalizeWorkspaceRelativePath } from '@glovebox.md/core'
 import { constants as fsConstants } from 'node:fs'
 import {
   lstat,

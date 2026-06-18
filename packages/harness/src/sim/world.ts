@@ -6,7 +6,7 @@ import {
   type WorkspaceSocket,
   type WorkspaceSqlStorage,
   type WorkspaceSqlValue,
-} from '@glovebox/sync/server'
+} from '@glovebox.md/sync/server'
 import {
   MemoryClientStorage,
   WorkspaceSyncEngine,
@@ -15,9 +15,9 @@ import {
   type EventsSinceResult,
   type WireWorkspaceEvent,
   type WorkspaceSyncTransport,
-} from '@glovebox/sync/client'
-import type { SubmitUpdateInput, SubmitUpdateResult } from '@glovebox/sync/loro'
-import { LoroFileDoc, base64ToBytes, bytesToBase64 } from '@glovebox/sync/loro'
+} from '@glovebox.md/sync/client'
+import type { SubmitUpdateInput, SubmitUpdateResult } from '@glovebox.md/sync/loro'
+import { LoroFileDoc, base64ToBytes, bytesToBase64 } from '@glovebox.md/sync/loro'
 import {
   DaemonSyncEngine,
   MemoryDaemonStorage,
@@ -27,13 +27,13 @@ import {
   type OpaqueFetchResult,
   type SubmitOpaqueInput,
   type SubmitOpaqueResult,
-} from '@glovebox/sync/daemon'
+} from '@glovebox.md/sync/daemon'
 import {
   assembleOpaqueWirePayload,
   buildOpaqueWirePayload,
   type OpaqueObjectPayload,
-} from '@glovebox/sync'
-import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
+} from '@glovebox.md/sync'
+import type { WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
 import { MemoryFS } from '../fs/memory-fs.ts'
 import { CrashFuse, SimChannel, SimCrash, SimScheduler, type ChannelPolicy } from './scheduler.ts'
 

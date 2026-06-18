@@ -103,7 +103,7 @@ A real-time file sync and collaborative markdown editing platform.
 Install the CLI to get started:
 
 \`\`\`bash
-npm install -g @glovebox/cli
+npm install -g @glovebox.md/cli
 glovebox init my-workspace
 \`\`\`
 

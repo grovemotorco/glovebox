@@ -1,6 +1,6 @@
 import { and, desc, eq } from 'drizzle-orm'
-import type { DocumentMetadata, TextPushInput, TextPushResult } from '@glovebox/api'
-import type { WorkspaceTreeEntry } from '@glovebox/core'
+import type { DocumentMetadata, TextPushInput, TextPushResult } from '@glovebox.md/api'
+import type { WorkspaceTreeEntry } from '@glovebox.md/core'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { documentVersion, workspaceDocument } from '../db/schema/index.ts'

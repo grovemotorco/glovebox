@@ -129,12 +129,12 @@ storage, so eviction never resets the protocol state.
 
 ## Packages
 
-| Package                     | Role                                                                       |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `@glovebox/worker`          | Worker dispatcher, Better Auth, oRPC API, WorkspaceDO, web app             |
-| `@glovebox/cli`             | Local file-sync daemon (`mount` / `run`)                                   |
-| `@glovebox/api`             | oRPC contract + typed web/CLI clients                                      |
-| `@glovebox/sync`            | Sync protocol: daemon, browser client, DO `WorkspaceServer`, Loro wrappers |
-| `@glovebox/core`            | Shared types, protocol constants, workspace-event shapes                   |
-| `@glovebox/loro-codemirror` | CodeMirror ↔ Loro editor binding                                           |
-| `@glovebox/dofs`            | Durable Object filesystem primitives (vendored)                            |
+| Package                        | Role                                                                       |
+| ------------------------------ | -------------------------------------------------------------------------- |
+| `@glovebox.md/worker`          | Worker dispatcher, Better Auth, oRPC API, WorkspaceDO, web app             |
+| `@glovebox.md/cli`             | Local file-sync daemon (`mount` / `run`)                                   |
+| `@glovebox.md/api`             | oRPC contract + typed web/CLI clients                                      |
+| `@glovebox.md/sync`            | Sync protocol: daemon, browser client, DO `WorkspaceServer`, Loro wrappers |
+| `@glovebox.md/core`            | Shared types, protocol constants, workspace-event shapes                   |
+| `@glovebox.md/loro-codemirror` | CodeMirror ↔ Loro editor binding                                           |
+| `@glovebox.md/dofs`            | Durable Object filesystem primitives (vendored)                            |

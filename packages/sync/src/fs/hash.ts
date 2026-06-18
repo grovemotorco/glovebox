@@ -7,7 +7,7 @@ const encoder = new TextEncoder()
  * Isomorphic synchronous sha256 (pure JS via @noble/hashes): the same
  * watermarks and base hashes are computed in the browser engine, the
  * worker/DO, the daemon, and the CLI. `node:crypto` is off-limits here —
- * this module is reachable from `@glovebox/sync/client`, and a browser
+ * this module is reachable from `@glovebox.md/sync/client`, and a browser
  * bundle externalizes node built-ins; WebCrypto's digest is async and the
  * sync call sites (scan watermarks, opaque conflicts, push bases) cannot
  * await it.

@@ -1,4 +1,4 @@
-import { verifyWorkspaceToken } from '@glovebox/sync/server'
+import { verifyWorkspaceToken } from '@glovebox.md/sync/server'
 import { handleAppFallback } from './app-fallback.ts'
 import { createDb } from './db/index.ts'
 import { createAuth } from './lib/auth.ts'

@@ -1,4 +1,4 @@
-import type { DeviceTag } from '@glovebox/core'
+import type { DeviceTag } from '@glovebox.md/core'
 
 export interface VerifiedSyncConnection {
   workspaceId: string

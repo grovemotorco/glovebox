@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util'
-import type { GloveboxClient } from '@glovebox/api'
+import type { GloveboxClient } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'

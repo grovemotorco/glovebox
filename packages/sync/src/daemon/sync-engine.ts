@@ -1,4 +1,4 @@
-import { SYNC, type OpaqueManifest, type WorkspaceTreeEntry } from '@glovebox/core'
+import { SYNC, type OpaqueManifest, type WorkspaceTreeEntry } from '@glovebox.md/core'
 import { normalizeEol } from '../fs/eol.ts'
 import { isMarkdownFile } from '../fs/file-kind.ts'
 import { sha256Hex } from '../fs/hash.ts'

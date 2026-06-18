@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
-import type { GloveboxClient, TextPushResult } from '@glovebox/api'
+import type { GloveboxClient, TextPushResult } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printError, printJson, printSuccess, printWarn, resolveOutputMode } from '../cli/output.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'

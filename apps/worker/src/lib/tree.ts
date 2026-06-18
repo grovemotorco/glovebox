@@ -1,5 +1,5 @@
-import type { WorkspaceTreeEntry } from '@glovebox/api'
-import type { BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox/sync/server'
+import type { WorkspaceTreeEntry } from '@glovebox.md/api'
+import type { BatchDeferredOp, WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
 import { randomUuid } from './random.ts'
 
 export interface FileNode {

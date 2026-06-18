@@ -1,7 +1,7 @@
 import { rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { DEFAULT_DELETE_POLICY } from '@glovebox/sync/daemon'
+import { DEFAULT_DELETE_POLICY } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
 import { lockHolderPid } from '../lib/lockfile.ts'

@@ -4,7 +4,7 @@ import {
   type OpaqueManifest,
   type WorkspaceChangeEvent,
   type WorkspaceTreeEntry,
-} from '@glovebox/core'
+} from '@glovebox.md/core'
 import { EphemeralStore } from 'loro-crdt'
 import { LoroFileDoc, versionDominates } from '../loro/file-doc.ts'
 import { LoroFileService, LoroFileTooLargeError } from '../loro/file-store.ts'
@@ -40,7 +40,7 @@ import {
   WorkspaceFilesystem,
   writeFileSync,
   type SQLStorageLike,
-} from '@glovebox/dofs'
+} from '@glovebox.md/dofs'
 import {
   assembleOpaqueWirePayload,
   buildOpaqueWirePayload,

@@ -1,5 +1,5 @@
 import { and, eq } from 'drizzle-orm'
-import type { CommentThread, Suggestion } from '@glovebox/api'
+import type { CommentThread, Suggestion } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { commentThread, suggestion } from '../db/schema/index.ts'
@@ -8,7 +8,7 @@ import { requirePrincipal } from './auth-context.ts'
 import { requireCanComment, requireCanEdit, requireWorkspaceAccess } from './workspace-access.ts'
 import { readDocumentOrThrow, readVersionOrThrow } from './document-handlers.ts'
 import { pushTextLive } from './text-handlers.ts'
-import { sha256Hex } from '@glovebox/sync'
+import { sha256Hex } from '@glovebox.md/sync'
 
 type RangeInput = { start: number; end: number; stale?: boolean }
 

@@ -1,4 +1,4 @@
-import { createGloveboxClient, type GloveboxClient } from '@glovebox/api'
+import { createGloveboxClient, type GloveboxClient } from '@glovebox.md/api'
 import { magicLinkClient } from 'better-auth/client/plugins'
 import { createAuthClient } from 'better-auth/react'
 import { randomUuid } from './random.ts'

@@ -1,4 +1,4 @@
-import { SYNC } from '@glovebox/core'
+import { SYNC } from '@glovebox.md/core'
 
 /**
  * Daemon cycle loop (INV-8: rescan is correctness, not optimization). The

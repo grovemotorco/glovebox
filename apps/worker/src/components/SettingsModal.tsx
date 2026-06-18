@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ApiKeyView, DocumentRole, KeyPurpose } from '@glovebox/api'
+import type { ApiKeyView, DocumentRole, KeyPurpose } from '@glovebox.md/api'
 import { api, errorMessage } from '../lib/api.ts'
 import { useUiActions, useUiState } from '../state/ui.ts'
 import { useWorkspace } from '../state/workspace.tsx'

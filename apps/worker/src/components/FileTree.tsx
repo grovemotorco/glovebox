@@ -1,6 +1,6 @@
 import { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import { normalizeWorkspaceRelativePath } from '@glovebox/core'
+import { normalizeWorkspaceRelativePath } from '@glovebox.md/core'
 import { errorMessage } from '../lib/api.ts'
 import {
   ancestorFolderIds,
