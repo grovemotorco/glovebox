@@ -1502,7 +1502,10 @@ describe('WorkspaceServer hibernation safety', () => {
     expect(response.manifest?.chunks).toHaveLength(8)
     expect(response.objects).toHaveLength(8)
     expect(opaqueResponseBytes(response)).toEqual(bytes)
-  })
+    // Heavy real-WASM/CRDT 4 MiB round-trip; the default 5s timed out on the
+    // CI runner under parallel-pool CPU contention. Match the daemon-engine
+    // sibling's 60s headroom.
+  }, 60_000)
 
   it('broadcasts to sockets restored from hibernation without a reconnect', async () => {
     const fileId = 'file-3'

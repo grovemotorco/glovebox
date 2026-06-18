@@ -1078,7 +1078,10 @@ describe('opaque cycle (ISSUE-0045)', () => {
 
     await daemonB.engine.runCycle()
     expect(await fsB.readFileBytes('large.bin')).toEqual(bytes)
-  }, 15_000)
+    // Heavy real-WASM/CRDT 4 MiB round-trip; CPU-bound and starved under the
+    // CI runner's parallel pools, so give it generous headroom over the ~30s
+    // whole-suite wall-clock (15s here still timed out on ubuntu-latest).
+  }, 60_000)
 
   it('behind-window opaque refresh uses metadata-only probes before object fetches', async () => {
     const host = new ServerHost()
