@@ -1,6 +1,6 @@
 {
   "name": "@glovebox.md/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Glovebox CLI — mount, sync, and manage local-first Glovebox workspaces from the terminal.",
   "keywords": [
     "cli",
