@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "portless api.glovebox vp dev",
+    "dev": "CLOUDFLARE_ENV=dev portless api.glovebox vp dev",
     "build": "vp build",
     "deploy": "vp run build && wrangler deploy",
     "db:generate": "drizzle-kit generate",

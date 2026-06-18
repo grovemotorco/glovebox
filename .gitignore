@@ -40,3 +40,4 @@ agents.lock
 
 .pnpm-store
 .pnpm-cache
+*.tgz

@@ -5,6 +5,16 @@
 that watches and reconciles a real directory over a WebSocket to the
 workspace server. No FUSE, no kernel anything.
 
+## Install
+
+```sh
+npm install -g @glovebox.md/cli   # then run `glovebox`
+# or, without installing:
+npx @glovebox.md/cli --help
+```
+
+Requires **Node.js ≥ 22**. Web app: <https://app.glovebox.md>.
+
 ## Commands
 
 | Command                                                       | What it does                                                                                                                 |

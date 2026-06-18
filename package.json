@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox.md/glovebox",
+  "name": "@glovebox.md/root",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,9 +9,14 @@
     "test": "vp test",
     "dev": "vp run -r --parallel dev",
     "dev:worker": "vp run @glovebox.md/worker#dev",
-    "dev:prototype": "vp run @glovebox.md/prototype#dev"
+    "dev:prototype": "vp run @glovebox.md/prototype#dev",
+    "changeset": "changeset",
+    "release:version": "changeset version && pnpm install --lockfile-only",
+    "release:publish": "changeset publish"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "catalog:",
+    "@changesets/cli": "catalog:",
     "@sentry/dotagents": "catalog:",
     "@typescript/native-preview": "catalog:",
     "vite-plus": "catalog:"

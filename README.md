@@ -149,8 +149,8 @@ vp run dev:worker   # https://api.glovebox.test
 
 ### Structure
 
-| Package                     | Path                       | Purpose                                      |
-| --------------------------- | -------------------------- | -------------------------------------------- |
+| Package                        | Path                       | Purpose                                      |
+| ------------------------------ | -------------------------- | -------------------------------------------- |
 | `@glovebox.md/worker`          | `apps/worker`              | Worker dispatcher, Better Auth, ORPC, DO, UI |
 | `@glovebox.md/cli`             | `apps/cli`                 | Local file-sync CLI daemon                   |
 | `@glovebox.md/prototype`       | `apps/prototype`           | Product UI prototype                         |
@@ -175,3 +175,40 @@ vp run @glovebox.md/worker#db:migrate:remote
 
 Secrets such as `BETTER_AUTH_SECRET` and `WS_AUTH_SECRET` are configured as
 Worker secrets outside source control.
+
+## Deployment & Publishing
+
+Glovebox runs as one Worker on two custom domains, with the CLI published to npm.
+
+| Artifact           | Where                                              | How                                                                                            |
+| ------------------ | -------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `glovebox-worker`  | Cloudflare → `api.glovebox.md` + `app.glovebox.md` | `.github/workflows/deploy.yml` (manual) or `pnpm --filter @glovebox.md/worker run deploy`      |
+| `@glovebox.md/cli` | npm (public)                                       | Changesets → `.github/workflows/{release,publish}.yml` (OIDC); seeded once with `pnpm publish` |
+
+Production is the **top-level** `apps/worker/wrangler.jsonc`; local dev uses its `env.dev`
+block (selected by `CLOUDFLARE_ENV=dev` in the worker `dev` script). The browser client is
+same-origin, so each domain is a complete origin.
+
+- **Deploy** — Actions → **deploy** (choose `ref` + whether to apply D1 migrations); it builds, applies remote migrations, then deploys. Locally: `cd apps/worker && pnpm run deploy`. Rollback: `npx wrangler rollback <version-id>` from `apps/worker`.
+- **Publish the CLI** — Changesets-managed and OIDC-published (no `NPM_TOKEN`); only `@glovebox.md/cli` is published, the other workspace packages are private/bundled. In your PR run `pnpm changeset`; merging to `main` opens a **Version Packages** PR (`release.yml`); merging that bumps the version and writes the changelog, then once `verify` passes `publish.yml` builds the self-contained bundle (`vp pack`) and publishes via npm trusted publishing (idempotent — skips versions already on the registry; smoke-tests `glovebox --help`).
+
+First-time setup: add `glovebox.md` as a Cloudflare zone; `wrangler d1 create glovebox-db` →
+real `database_id` in `wrangler.jsonc`, then apply migrations `--remote`; set the
+`BETTER_AUTH_SECRET` / `WS_AUTH_SECRET` Worker secrets; onboard `glovebox.md` in Cloudflare
+**Email Sending → Onboard Domain** (prod uses `AUTH_EMAIL_MODE: "send"`). CI needs the
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repo secrets (and optionally `RELEASE_PAT`, so the
+Version Packages PR triggers `verify`). Custom domains auto-provision DNS + TLS on first deploy.
+
+For npm publishing the `glovebox.md` org already exists. Because OIDC can only be configured on a
+package that already exists, **seed the CLI once** from your machine (you're an org member;
+`auth-and-writes` 2FA prompts for an OTP), then wire up the trusted publisher:
+
+```bash
+cd apps/cli
+pnpm publish --dry-run --no-git-checks         # sanity: tarball = dist/glovebox.mjs + loro wasm, no deps
+pnpm publish --access public --no-git-checks   # real seed publish (enter OTP)
+```
+
+Then on npmjs.com → `@glovebox.md/cli` → **Settings → Publishing access → Trusted Publisher → GitHub
+Actions**, add repository `grovemotorco/glovebox` + workflow `publish.yml`. After that, releases publish
+tokenlessly via OIDC — no `NPM_TOKEN` anywhere.
