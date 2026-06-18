@@ -1,0 +1,79 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref, tag, or SHA to deploy
+        required: true
+        default: main
+        type: string
+      apply_migrations:
+        description: Apply remote D1 migrations before deploy
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy glovebox-worker from ${{ inputs.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build worker
+        run: pnpm exec vp run @glovebox.md/worker#build
+
+      - name: Apply D1 migrations
+        if: ${{ inputs.apply_migrations }}
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/worker
+          command: d1 migrations apply glovebox-db --remote
+
+      - name: Deploy worker
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/worker
+          command: deploy
+
+      - name: Summarize deployed version
+        if: always()
+        env:
+          OUTPUT: ${{ steps.deploy.outputs.command-output }}
+        run: |
+          {
+            echo "## Deployed glovebox-worker"
+            echo ""
+            echo "- Ref: \`${{ inputs.ref }}\`"
+            echo "- D1 migrations: \`${{ inputs.apply_migrations }}\`"
+            echo ""
+            echo '```'
+            printf '%s\n' "$OUTPUT" | grep -E 'Current Version ID|Worker Version ID|Deployment ID|Version ID' || echo '(no version id parsed from output)'
+            echo '```'
+            echo ""
+            echo "Rollback: \`wrangler rollback <version-id>\` from apps/worker."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -13,7 +13,7 @@ npm install -g @glovebox.md/cli   # then run `glovebox`
 npx @glovebox.md/cli --help
 ```
 
-Requires **Node.js ≥ 22**. Web app: <https://app.glovebox.md>.
+Requires **Node.js ≥ 24** (matches the package `engines` field). Web app: <https://app.glovebox.md>.
 
 ## Commands
 

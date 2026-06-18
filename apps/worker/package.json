@@ -8,7 +8,7 @@
     "build": "vp build",
     "deploy": "vp run build && wrangler deploy",
     "db:generate": "drizzle-kit generate",
-    "db:migrate:local": "wrangler d1 migrations apply glovebox-db --local",
+    "db:migrate:local": "wrangler d1 migrations apply glovebox-db --local --env dev",
     "db:migrate:remote": "wrangler d1 migrations apply glovebox-db --remote",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
