@@ -35,11 +35,16 @@ export {
   createGloveboxCliClient,
   createGloveboxClient,
   createGloveboxWebClient,
+  isDefinedError,
+  isGloveboxError,
+  ORPCError,
   rpcUrl,
+  safe,
   type GloveboxApiKeyClientOptions,
   type GloveboxClient,
+  type GloveboxClientError,
   type GloveboxClientOptions,
-  type SafeGloveboxClient,
+  type GloveboxDefinedError,
 } from './client.ts'
 export {
   base64StringSchema,

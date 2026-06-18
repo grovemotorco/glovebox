@@ -5,7 +5,7 @@ import type {
   Suggestion,
   WorkspaceTreeEntry,
 } from '@glovebox.md/api'
-import { api, errorMessage } from '../lib/api.ts'
+import { api, errorMessage, safe } from '../lib/api.ts'
 import { randomUuid } from '../lib/random.ts'
 import { readRoomText, useWorkspace, type RoomHandle } from '../state/workspace.tsx'
 
@@ -90,21 +90,18 @@ export function CollaborationPanel({
   }, [workspaceId, fileId])
 
   useEffect(() => {
-    void refreshReviewData().catch((err: unknown) =>
-      setErrorState({ key: reviewKey, message: errorMessage(err) }),
-    )
+    void (async () => {
+      const { error } = await safe(refreshReviewData())
+      if (error) setErrorState({ key: reviewKey, message: errorMessage(error) })
+    })()
   }, [refreshReviewData, reviewKey])
 
   async function run(action: () => Promise<void>) {
     setBusy(true)
     setErrorState(null)
-    try {
-      await action()
-    } catch (err) {
-      setErrorState({ key: reviewKey, message: errorMessage(err) })
-    } finally {
-      setBusy(false)
-    }
+    const { error } = await safe(action())
+    if (error) setErrorState({ key: reviewKey, message: errorMessage(error) })
+    setBusy(false)
   }
 
   /**

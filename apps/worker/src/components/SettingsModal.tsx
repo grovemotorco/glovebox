@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ApiKeyView, DocumentRole, KeyPurpose } from '@glovebox.md/api'
-import { api, errorMessage } from '../lib/api.ts'
+import { api, errorMessage, safe } from '../lib/api.ts'
 import { useUiActions, useUiState } from '../state/ui.ts'
 import { useWorkspace } from '../state/workspace.tsx'
 import type { EditorMode } from '../state/ui.ts'
@@ -138,19 +138,19 @@ function GeneralTab() {
     setBusy(true)
     setError(null)
     setSaved(false)
-    try {
-      await api.workspaces.update({
-        workspaceId: workspace.id,
-        ...(name.trim() && name.trim() !== workspace.name ? { name: name.trim() } : {}),
-        ...(slug.trim() && slug.trim() !== workspace.slug ? { slug: slug.trim() } : {}),
-      })
-      await refreshWorkspaces()
-      setSaved(true)
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setBusy(false)
-    }
+    const { error } = await safe(
+      (async () => {
+        await api.workspaces.update({
+          workspaceId: workspace.id,
+          ...(name.trim() && name.trim() !== workspace.name ? { name: name.trim() } : {}),
+          ...(slug.trim() && slug.trim() !== workspace.slug ? { slug: slug.trim() } : {}),
+        })
+        await refreshWorkspaces()
+      })(),
+    )
+    if (error) setError(errorMessage(error))
+    else setSaved(true)
+    setBusy(false)
   }
 
   return (
@@ -229,13 +229,9 @@ function MembersTab() {
   async function run(action: () => Promise<void>) {
     setBusy(true)
     setError(null)
-    try {
-      await action()
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setBusy(false)
-    }
+    const { error } = await safe(action())
+    if (error) setError(errorMessage(error))
+    setBusy(false)
   }
 
   const invite = () =>
@@ -442,13 +438,9 @@ function AccessTab() {
   async function run(action: () => Promise<void>) {
     setBusy(true)
     setError(null)
-    try {
-      await action()
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setBusy(false)
-    }
+    const { error } = await safe(action())
+    if (error) setError(errorMessage(error))
+    setBusy(false)
   }
 
   const createKey = () =>
@@ -567,16 +559,16 @@ function DangerTab() {
   async function run(action: () => Promise<void>) {
     setBusy(true)
     setError(null)
-    try {
-      await action()
-      setActiveFile(null)
-      closeSettingsModal()
-      await refreshWorkspaces()
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setBusy(false)
-    }
+    const { error } = await safe(
+      (async () => {
+        await action()
+        setActiveFile(null)
+        closeSettingsModal()
+        await refreshWorkspaces()
+      })(),
+    )
+    if (error) setError(errorMessage(error))
+    setBusy(false)
   }
 
   return (

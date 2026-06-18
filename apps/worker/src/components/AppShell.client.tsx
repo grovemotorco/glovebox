@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import { api, authClient, errorMessage } from '../lib/api.ts'
+import { api, authClient, errorMessage, safe } from '../lib/api.ts'
 import { useUiState } from '../state/ui.ts'
 import { WorkspaceProvider } from '../state/workspace.tsx'
 import { SignIn } from './SignIn.tsx'
@@ -69,13 +69,13 @@ export function DevicePage() {
   async function approve() {
     setState('busy')
     setError(null)
-    try {
-      await api.auth.deviceApprove({ userCode: userCode.trim() })
-      setState('done')
-    } catch (err) {
-      setError(errorMessage(err))
+    const { error } = await safe(api.auth.deviceApprove({ userCode: userCode.trim() }))
+    if (error) {
+      setError(errorMessage(error))
       setState('idle')
+      return
     }
+    setState('done')
   }
 
   return (
@@ -138,17 +138,16 @@ function InviteAcceptInner({ token }: { token: string | null }) {
   useEffect(() => {
     if (!token) return
     let cancelled = false
-    api.invites
-      .accept({ inviteToken: token })
-      .then((invite) => {
-        if (cancelled) return
-        localStorage.setItem('glovebox.activeWorkspace', invite.workspaceId)
-        setResult({ status: 'done', workspaceId: invite.workspaceId })
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        setResult({ status: 'error', message: errorMessage(err) })
-      })
+    void (async () => {
+      const result = await safe(api.invites.accept({ inviteToken: token }))
+      if (cancelled) return
+      if (!result.isSuccess) {
+        setResult({ status: 'error', message: errorMessage(result.error) })
+        return
+      }
+      localStorage.setItem('glovebox.activeWorkspace', result.data.workspaceId)
+      setResult({ status: 'done', workspaceId: result.data.workspaceId })
+    })()
     return () => {
       cancelled = true
     }

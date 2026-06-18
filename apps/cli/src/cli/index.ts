@@ -12,7 +12,7 @@ import unmount from '../commands/unmount.ts'
 import whoami from '../commands/whoami.ts'
 import workspaces from '../commands/workspaces.ts'
 import { getSuggestion, getVersion, printUsage } from './help.ts'
-import { printError } from './output.ts'
+import { printCommandError, printError, resolveOutputMode } from './output.ts'
 
 export interface GlobalFlags {
   json: boolean
@@ -158,6 +158,19 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  printError(err instanceof Error ? err.message : String(err))
+  // `main` already consumed (and spliced) the global flags from its own argv
+  // copy; re-derive them here from the untouched process.argv. Diagnostics stay
+  // human unless JSON is explicitly requested: the non-TTY→JSON default is for a
+  // command's *data*, not its errors. `printCommandError` always writes to
+  // stderr, so a piped/redirected stdout is never polluted with an error.
+  const argv = process.argv.slice(2)
+  const mode = resolveOutputMode(
+    {
+      json: argv.includes('--json'),
+      human: argv.includes('--human') || argv.includes('--no-json'),
+    },
+    { defaultMode: 'human' },
+  )
+  printCommandError(err, mode)
   process.exitCode = 1
 })
