@@ -2,9 +2,13 @@ import { colors, stderrColors } from './colors.ts'
 
 type OutputMode = 'human' | 'json'
 
-export function resolveOutputMode(flags: { json?: boolean; human?: boolean }): OutputMode {
+export function resolveOutputMode(
+  flags: { json?: boolean; human?: boolean },
+  options: { defaultMode?: OutputMode } = {},
+): OutputMode {
   if (flags.human) return 'human'
   if (flags.json) return 'json'
+  if (options.defaultMode) return options.defaultMode
   if (!process.stdout.isTTY) return 'json'
   return 'human'
 }

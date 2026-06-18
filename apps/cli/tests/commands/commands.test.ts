@@ -16,7 +16,7 @@ import { runList } from '../../src/commands/list.ts'
 import { resolveWorkspaceSocketToken } from '../../src/commands/run.ts'
 import { runStatus } from '../../src/commands/status.ts'
 import { runUnmount } from '../../src/commands/unmount.ts'
-import {
+import authCommand, {
   runDeviceLoginWithClient,
   runLogin,
   runAuthStatus,
@@ -357,4 +357,72 @@ describe('auth', () => {
 
     expect(minted).toBe('fresh-ws-token')
   })
+
+  it('prints the stored token raw by default when stdout is piped', async () => {
+    const { paths } = await fixture()
+    await runLogin({ server: 'https://api.glovebox.test', token: 'opaque-token', paths })
+
+    const stdout = await withEnv({ GLOVEBOX_HOME: paths.home }, () =>
+      withStdoutIsTty(false, () =>
+        captureStdout(() => authCommand(['token'], { json: false, human: false })),
+      ),
+    )
+
+    expect(stdout).toEqual(['opaque-token'])
+  })
+
+  it('prints auth token JSON only when JSON output is explicit', async () => {
+    const { paths } = await fixture()
+    await runLogin({ server: 'https://api.glovebox.test', token: 'opaque-token', paths })
+
+    const stdout = await withEnv({ GLOVEBOX_HOME: paths.home }, () =>
+      withStdoutIsTty(false, () =>
+        captureStdout(() => authCommand(['token'], { json: true, human: false })),
+      ),
+    )
+
+    expect(stdout).toEqual([
+      JSON.stringify({ serverUrl: 'https://api.glovebox.test', token: 'opaque-token' }, null, 2),
+    ])
+  })
 })
+
+async function captureStdout(fn: () => Promise<void>): Promise<string[]> {
+  const original = console.log
+  const lines: string[] = []
+  console.log = (...args: unknown[]) => {
+    lines.push(args.join(' '))
+  }
+  try {
+    await fn()
+    return lines
+  } finally {
+    console.log = original
+  }
+}
+
+async function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const previous = new Map(Object.keys(env).map((key) => [key, process.env[key]]))
+  for (const [key, value] of Object.entries(env)) {
+    process.env[key] = value
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+async function withStdoutIsTty<T>(isTTY: boolean, fn: () => Promise<T>): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')
+  Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: isTTY })
+  try {
+    return await fn()
+  } finally {
+    if (descriptor) Object.defineProperty(process.stdout, 'isTTY', descriptor)
+    else Reflect.deleteProperty(process.stdout, 'isTTY')
+  }
+}

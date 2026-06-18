@@ -264,7 +264,7 @@ Dev:
 export default async function auth(args: string[], globals: GlobalFlags): Promise<void> {
   const sub = args[0]
   const rest = args.slice(1)
-  const mode = resolveOutputMode(globals)
+  const mode = resolveOutputMode(globals, { defaultMode: sub === 'token' ? 'human' : undefined })
 
   if (!sub || sub === '--help' || sub === '-h') {
     console.log(HELP)
