@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm'
-import type { KeyPurpose } from '@glovebox/api'
+import type { KeyPurpose } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { apiKeyMetadata, principal } from '../db/schema/index.ts'

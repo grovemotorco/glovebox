@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { WorkspaceTreeEntry } from '@glovebox/api'
+import type { WorkspaceTreeEntry } from '@glovebox.md/api'
 import { WorkspaceSocketTransport } from '../src/lib/transport.ts'
 import type { TreeWireEvent } from '../src/lib/tree-events.ts'
 

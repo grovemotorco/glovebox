@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox/sync",
+  "name": "@glovebox.md/sync",
   "version": "0.0.0",
   "files": [
     "dist"
@@ -30,8 +30,8 @@
     "check": "vp check"
   },
   "dependencies": {
-    "@glovebox/core": "workspace:*",
-    "@glovebox/dofs": "workspace:*",
+    "@glovebox.md/core": "workspace:*",
+    "@glovebox.md/dofs": "workspace:*",
     "@noble/hashes": "catalog:",
     "@sanity/diff-match-patch": "catalog:",
     "loro-crdt": "^1.12.1"

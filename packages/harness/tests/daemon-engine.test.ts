@@ -9,7 +9,7 @@ import {
   type LocalFS,
   type OpaqueObjectPayload,
   type ScanResult,
-} from '@glovebox/sync'
+} from '@glovebox.md/sync'
 import {
   WorkspaceServer,
   type WorkspaceServerMessage,
@@ -17,30 +17,30 @@ import {
   type WorkspaceSocket,
   type WorkspaceSqlStorage,
   type WorkspaceSqlValue,
-} from '@glovebox/sync/server'
+} from '@glovebox.md/sync/server'
 import {
   MemoryClientStorage,
   WorkspaceSyncEngine,
   type EventsSinceResult,
   type WireWorkspaceEvent,
   type WorkspaceSyncTransport,
-} from '@glovebox/sync/client'
+} from '@glovebox.md/sync/client'
 import {
   DaemonSyncEngine,
   MemoryDaemonStorage,
   type BatchSubmitResult,
   type DaemonStorage,
-} from '@glovebox/sync/daemon'
-import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
+} from '@glovebox.md/sync/daemon'
+import type { WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
 import type {
   DaemonTreeState,
   DaemonWorkspaceState,
   OpaqueFetchResult,
   SubmitOpaqueInput,
   SubmitOpaqueResult,
-} from '@glovebox/sync/daemon'
-import type { SubmitUpdateInput, SubmitUpdateResult } from '@glovebox/sync/loro'
-import { LoroFileDoc, base64ToBytes, bytesToBase64 } from '@glovebox/sync/loro'
+} from '@glovebox.md/sync/daemon'
+import type { SubmitUpdateInput, SubmitUpdateResult } from '@glovebox.md/sync/loro'
+import { LoroFileDoc, base64ToBytes, bytesToBase64 } from '@glovebox.md/sync/loro'
 import { EDITOR_SAVE_PATTERNS } from '../src/corpus/editor-saves.ts'
 import { MemoryFS } from '../src/fs/memory-fs.ts'
 

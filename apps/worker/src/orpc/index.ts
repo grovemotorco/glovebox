@@ -1,5 +1,5 @@
 import { implement, ORPCError } from '@orpc/server'
-import { contract } from '@glovebox/api'
+import { contract } from '@glovebox.md/api'
 
 export interface ORPCContext {
   request: Request

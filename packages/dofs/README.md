@@ -1,11 +1,11 @@
-# `@glovebox/dofs`
+# `@glovebox.md/dofs`
 
 > [!NOTE]
 > **Vendored module.** This package is adopted from
 > [`.vendor/workspace`](../../.vendor/workspace) — a local snapshot of
 > Cloudflare's [`@cloudflare/workspace`](https://github.com/cloudflare/workspace)
 > monorepo (`packages/dofs`, upstream commit `3d11231`). It is published locally
-> as `@glovebox/dofs` and wired into the `vp` toolchain, but the source is
+> as `@glovebox.md/dofs` and wired into the `vp` toolchain, but the source is
 > otherwise unchanged. Re-sync from `.vendor/workspace` rather than editing by
 > hand, so upstream changes can be pulled cleanly.
 >

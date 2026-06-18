@@ -1,13 +1,13 @@
-import { normalizeWorkspaceRelativePath } from '@glovebox/core'
+import { normalizeWorkspaceRelativePath } from '@glovebox.md/core'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { sha256Hex } from '@glovebox/sync'
+import { sha256Hex } from '@glovebox.md/sync'
 import {
   LocalFSError,
   type DirEntry,
   type FileStat,
   type LocalFS,
   type ScanResult,
-} from '@glovebox/sync'
+} from '@glovebox.md/sync'
 
 type MemNode = MemFile | MemDir
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { LoroFileDoc } from '@glovebox/sync/loro'
+import { LoroFileDoc } from '@glovebox.md/sync/loro'
 import { DELETION_SCENARIOS } from '../src/corpus/editor-saves.ts'
 import { SimWorld, type SimDaemon } from '../src/sim/world.ts'
 

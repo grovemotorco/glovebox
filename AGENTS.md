@@ -47,7 +47,7 @@ Useful diagnostics:
 
 - **No dynamic imports** — use static `import` at module scope. No `import()`, `React.lazy()`, or dynamic WASM.
 - **Test imports** — use `from 'vitest'`, not `from 'vite-plus/test'`. The catalog aliases vitest correctly; `vite-plus/test` causes duplicate instances with `test.projects`.
-- **Shared packages build first** — `vp run build` handles dependency ordering. `@glovebox/core` must be built before apps can start.
+- **Shared packages build first** — `vp run build` handles dependency ordering. `@glovebox.md/core` must be built before apps can start.
 - **Toolchain** — `vp` wraps Vite, Vitest, oxlint, and oxfmt. Root `pnpm.onlyBuiltDependencies` is required for `esbuild`, `sharp`, `workerd`.
 
 ## Cursor Cloud specific instructions

@@ -1,5 +1,5 @@
 import { and, desc, eq } from 'drizzle-orm'
-import type { DocumentMetadata, DocumentVersion } from '@glovebox/api'
+import type { DocumentMetadata, DocumentVersion } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { documentVersion, workspaceDocument } from '../db/schema/index.ts'

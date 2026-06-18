@@ -2,9 +2,13 @@ import { mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { verifyWorkspaceToken } from '@glovebox/sync/server'
-import { LoroFileDoc, bytesToBase64 } from '@glovebox/sync/loro'
-import { NodeDaemonStorage, envelopeName, type DaemonWorkspaceState } from '@glovebox/sync/daemon'
+import { verifyWorkspaceToken } from '@glovebox.md/sync/server'
+import { LoroFileDoc, bytesToBase64 } from '@glovebox.md/sync/loro'
+import {
+  NodeDaemonStorage,
+  envelopeName,
+  type DaemonWorkspaceState,
+} from '@glovebox.md/sync/daemon'
 import { gloveboxPaths } from '../../src/lib/paths.ts'
 import { acquireLock } from '../../src/lib/lockfile.ts'
 import { runMount } from '../../src/commands/mount.ts'

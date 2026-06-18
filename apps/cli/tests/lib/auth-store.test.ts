@@ -2,7 +2,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { signWorkspaceToken } from '@glovebox/sync/server'
+import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import { gloveboxPaths } from '../../src/lib/paths.ts'
 import {
   decodeTokenClaims,

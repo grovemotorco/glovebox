@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { createGloveboxClient, type GloveboxClient } from '@glovebox/api'
-import { signWorkspaceToken } from '@glovebox/sync/server'
+import { createGloveboxClient, type GloveboxClient } from '@glovebox.md/api'
+import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import { CLAIMS_HEADER, worker } from '../src/dispatcher.ts'
 
 type WorkerEnv = Parameters<NonNullable<typeof worker.fetch>>[1]

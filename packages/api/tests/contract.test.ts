@@ -8,7 +8,7 @@ import {
   rpcUrl,
 } from '../src/index.ts'
 
-describe('@glovebox/api contract', () => {
+describe('@glovebox.md/api contract', () => {
   it('exports the v1 contract groups', () => {
     expect(apiVersion).toBe('v1')
     expect(Object.keys(contract)).toEqual([

@@ -1,4 +1,4 @@
-import { apiVersion } from '@glovebox/api'
+import { apiVersion } from '@glovebox.md/api'
 import { SmartCoercionPlugin } from '@orpc/json-schema'
 import { OpenAPIHandler } from '@orpc/openapi/fetch'
 import { OpenAPIReferencePlugin } from '@orpc/openapi/plugins'

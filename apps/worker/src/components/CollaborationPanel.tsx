@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { CommentThread, DocumentVersion, Suggestion, WorkspaceTreeEntry } from '@glovebox/api'
+import type {
+  CommentThread,
+  DocumentVersion,
+  Suggestion,
+  WorkspaceTreeEntry,
+} from '@glovebox.md/api'
 import { api, errorMessage } from '../lib/api.ts'
 import { randomUuid } from '../lib/random.ts'
 import { readRoomText, useWorkspace, type RoomHandle } from '../state/workspace.tsx'

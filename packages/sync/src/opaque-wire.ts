@@ -1,6 +1,6 @@
 import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
-import type { OpaqueManifest } from '@glovebox/core'
+import type { OpaqueManifest } from '@glovebox.md/core'
 import { sha256Hex } from './fs/hash.ts'
 import { base64ToBytes, bytesToBase64 } from './loro/base64.ts'
 

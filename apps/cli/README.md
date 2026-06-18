@@ -1,4 +1,4 @@
-# @glovebox/cli
+# @glovebox.md/cli
 
 `glovebox` — sync a local directory with a collaborative workspace. The
 "mount" is a **sidecar observer** (architecture D2): a foreground daemon

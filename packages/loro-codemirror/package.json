@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox/loro-codemirror",
+  "name": "@glovebox.md/loro-codemirror",
   "version": "0.3.3",
   "private": true,
   "type": "module",

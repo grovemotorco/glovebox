@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { sha256Hex, type LocalFS } from '@glovebox/sync'
-import { scanMount, type DaemonFileView } from '@glovebox/sync/daemon'
+import { sha256Hex, type LocalFS } from '@glovebox.md/sync'
+import { scanMount, type DaemonFileView } from '@glovebox.md/sync/daemon'
 import { MemoryFS } from '../src/fs/memory-fs.ts'
 import { EDITOR_SAVE_PATTERNS } from '../src/corpus/editor-saves.ts'
 

@@ -1,5 +1,5 @@
 {
-  "name": "@glovebox/api",
+  "name": "@glovebox.md/api",
   "version": "0.0.0",
   "files": [
     "dist"
@@ -23,7 +23,7 @@
     "prepublishOnly": "vp run build"
   },
   "dependencies": {
-    "@glovebox/core": "workspace:*",
+    "@glovebox.md/core": "workspace:*",
     "@orpc/client": "catalog:",
     "@orpc/contract": "catalog:",
     "zod": "catalog:"

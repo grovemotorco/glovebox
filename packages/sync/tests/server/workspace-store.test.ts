@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
-import { LIMITS } from '@glovebox/core'
+import { LIMITS } from '@glovebox.md/core'
 import {
   WorkspaceFileTooLargeError,
   WorkspaceStore,

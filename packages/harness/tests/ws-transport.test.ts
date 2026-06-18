@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { LoroFileDoc } from '@glovebox/sync/loro'
-import { signWorkspaceToken } from '@glovebox/sync/server'
-import { WsDaemonTransport, type WsTransportStopReason } from '@glovebox/sync/daemon'
-import type { SubmitUpdateInput } from '@glovebox/sync/loro'
+import { LoroFileDoc } from '@glovebox.md/sync/loro'
+import { signWorkspaceToken } from '@glovebox.md/sync/server'
+import { WsDaemonTransport, type WsTransportStopReason } from '@glovebox.md/sync/daemon'
+import type { SubmitUpdateInput } from '@glovebox.md/sync/loro'
 import { LiveWorkspaceHost, type LiveWorkspaceHostOptions } from '../src/live/live-server.ts'
 
 /**

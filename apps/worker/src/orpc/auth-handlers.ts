@@ -1,5 +1,8 @@
-import { signWorkspaceToken, verifyWorkspaceToken } from '@glovebox/sync/server'
-import type { DeviceAuthorizationStartInput, DeviceAuthorizationStartOutput } from '@glovebox/api'
+import { signWorkspaceToken, verifyWorkspaceToken } from '@glovebox.md/sync/server'
+import type {
+  DeviceAuthorizationStartInput,
+  DeviceAuthorizationStartOutput,
+} from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import { createDb } from '../db/index.ts'
 import { createAuth } from '../lib/auth.ts'

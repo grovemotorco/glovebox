@@ -4,7 +4,7 @@ export {
   type FileStat,
   type LocalFS,
   type ScanResult,
-} from '@glovebox/sync'
+} from '@glovebox.md/sync'
 export { MemoryFS } from './fs/memory-fs.ts'
 export {
   CrashFuse,

@@ -15,17 +15,17 @@ import type {
   RecoveryRecord,
   WorkspaceSummary,
   WorkspaceTreeEntry,
-} from '@glovebox/api'
-import { createBrowserUser, type AwarenessUser } from '@glovebox/core'
-import type { LoroRoomClient } from '@glovebox/sync/loro'
+} from '@glovebox.md/api'
+import { createBrowserUser, type AwarenessUser } from '@glovebox.md/core'
+import type { LoroRoomClient } from '@glovebox.md/sync/loro'
 import {
   IndexedDbClientStorage,
   MemoryClientStorage,
   WorkspacePresence,
   WorkspaceSyncEngine,
   type WorkspacePresencePeer,
-} from '@glovebox/sync/client'
-import type { WorkspaceBatchWireOp } from '@glovebox/sync/server'
+} from '@glovebox.md/sync/client'
+import type { WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
 import { api, getOrCreateDeviceId } from '../lib/api.ts'
 import { randomUuid } from '../lib/random.ts'
 import {

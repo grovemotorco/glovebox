@@ -1,4 +1,4 @@
-import type { OpaqueManifest, WorkspaceTreeEntry } from '@glovebox/core'
+import type { OpaqueManifest, WorkspaceTreeEntry } from '@glovebox.md/core'
 import { LoroFileDoc } from '../loro/file-doc.ts'
 import { base64ToBytes, bytesToBase64 } from '../loro/base64.ts'
 import {

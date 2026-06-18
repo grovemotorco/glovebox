@@ -4,7 +4,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { EditorState } from '@codemirror/state'
 import { oneDark } from '@codemirror/theme-one-dark'
-import { LoroSyncPlugin } from '@glovebox/loro-codemirror'
+import { LoroSyncPlugin } from '@glovebox.md/loro-codemirror'
 import type { RoomHandle } from '../state/workspace.tsx'
 
 /**

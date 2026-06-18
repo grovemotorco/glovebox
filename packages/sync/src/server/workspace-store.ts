@@ -9,7 +9,7 @@ import {
   type VersionVector,
   type WorkspaceChangeEvent,
   type WorkspaceTreeEntry,
-} from '@glovebox/core'
+} from '@glovebox.md/core'
 import { sha256Hex } from './hash.ts'
 
 const DEFAULT_WORKSPACE_MAX_FILES = 10_000

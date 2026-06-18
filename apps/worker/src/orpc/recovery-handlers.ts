@@ -1,4 +1,4 @@
-import type { RecoveryRecord } from '@glovebox/api'
+import type { RecoveryRecord } from '@glovebox.md/api'
 import { ORPCError } from '@orpc/server'
 import type { ORPCContext } from './index.ts'
 import { fetchWorkspaceDoAdmin, requireWorkspaceAccess } from './workspace-access.ts'

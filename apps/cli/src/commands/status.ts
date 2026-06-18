@@ -1,15 +1,15 @@
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import { SYNC } from '@glovebox/core'
-import { LoroFileDoc, versionDominates } from '@glovebox/sync'
-import { base64ToBytes } from '@glovebox/sync/loro'
+import { SYNC } from '@glovebox.md/core'
+import { LoroFileDoc, versionDominates } from '@glovebox.md/sync'
+import { base64ToBytes } from '@glovebox.md/sync/loro'
 import {
   DEFAULT_DELETE_POLICY,
   NodeDaemonStorage,
   envelopeName,
   type DaemonWorkspaceState,
-} from '@glovebox/sync/daemon'
+} from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'

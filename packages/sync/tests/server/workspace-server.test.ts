@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
-import { Database as DofsDatabase, readRangeSync, stat as dofsStat } from '@glovebox/dofs'
+import { Database as DofsDatabase, readRangeSync, stat as dofsStat } from '@glovebox.md/dofs'
 import { LoroFileDoc } from '../../src/loro/file-doc.ts'
 import { sha256Hex } from '../../src/server/hash.ts'
 import { base64ToBytes, bytesToBase64 } from '../../src/loro/base64.ts'
