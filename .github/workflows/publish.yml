@@ -76,9 +76,40 @@ jobs:
         if: steps.detect.outputs.publish == 'true'
         run: pnpm exec changeset publish
 
-      - name: Push release tag
+      - name: Create GitHub Release
+        # changesets has createGithubReleases:false, and `git push --tags` proved
+        # unreliable (the changeset-created tag did not land — "Everything
+        # up-to-date"). Create the tag + release server-side at the published
+        # commit, mirroring the garage project. The CLI ships only as an npm
+        # bundle (no platform binaries), so this is a notes-only release.
         if: steps.detect.outputs.publish == 'true'
-        run: git push origin --tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version apps/cli/package.json)"
+          tag="@glovebox.md/cli@$version"
+          # Extract this version's section from the changelog (between its
+          # `## x.y.z` header and the next `## `); fall back to a stub.
+          notes_file="$(mktemp)"
+          if [ -f apps/cli/CHANGELOG.md ]; then
+            awk -v ver="$version" '
+              /^## / { if (found) exit; if ($2 == ver) { found = 1; next } }
+              found { print }
+            ' apps/cli/CHANGELOG.md > "$notes_file"
+          fi
+          [ -s "$notes_file" ] || printf 'Release of %s.\n' "$tag" > "$notes_file"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $tag already exists; nothing to do"
+          else
+            gh release create "$tag" \
+              --repo "$REPO" \
+              --title "$tag" \
+              --notes-file "$notes_file" \
+              --target "${{ github.event.workflow_run.head_sha }}"
+          fi
 
       - name: CLI install smoke test
         if: steps.detect.outputs.publish == 'true'
