@@ -1,9 +1,11 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
-import { createGloveboxCliClient, type GloveboxClient } from '@glovebox.md/api'
+import type { GloveboxClient } from '@glovebox.md/api'
 import { normalizeEol, sha256Hex } from '@glovebox.md/sync'
 import { gloveboxPaths, type GloveboxPaths } from './paths.ts'
 import { getToken } from './auth-store.ts'
+import { authedClient, missingCredentialsMessage } from './client.ts'
+import { resolveServerUrl } from './config.ts'
 import { DEFAULT_SERVER_URL, normalizeServerUrl } from './url.ts'
 
 /**
@@ -115,16 +117,20 @@ export async function resolveTextPushClient(options: {
   paths?: GloveboxPaths
   client?: GloveboxClient
 }): Promise<ResolvedTextPushClient> {
-  const serverUrl = normalizeServerUrl(options.serverUrl ?? DEFAULT_SERVER_URL)
-  if (options.client) return { client: options.client, serverUrl }
+  // Injected client (tests): keep the server cosmetic, skip config/disk.
+  if (options.client) {
+    return {
+      client: options.client,
+      serverUrl: normalizeServerUrl(options.serverUrl ?? DEFAULT_SERVER_URL),
+    }
+  }
   const paths = options.paths ?? gloveboxPaths()
+  const serverUrl = await resolveServerUrl(options.serverUrl, paths)
   const apiKey = await getToken(paths, serverUrl)
   if (!apiKey) {
-    throw new Error(
-      `No stored credentials for ${serverUrl}. Run \`glovebox auth device --workspace <id>\` first.`,
-    )
+    throw new Error(await missingCredentialsMessage(paths, serverUrl))
   }
-  return { client: createGloveboxCliClient({ baseUrl: serverUrl, apiKey }), serverUrl }
+  return { client: authedClient(serverUrl, apiKey), serverUrl }
 }
 
 export { normalizeEol, sha256Hex }

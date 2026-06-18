@@ -2,8 +2,13 @@ import { colors, stderrColors } from './colors.ts'
 
 type OutputMode = 'human' | 'json'
 
-export function resolveOutputMode(flags: { json?: boolean }): OutputMode {
+export function resolveOutputMode(
+  flags: { json?: boolean; human?: boolean },
+  options: { defaultMode?: OutputMode } = {},
+): OutputMode {
+  if (flags.human) return 'human'
   if (flags.json) return 'json'
+  if (options.defaultMode) return options.defaultMode
   if (!process.stdout.isTTY) return 'json'
   return 'human'
 }
@@ -22,4 +27,9 @@ export function printWarn(msg: string): void {
 
 export function printSuccess(msg: string): void {
   console.log(`${colors.green}✓${colors.reset} ${msg}`)
+}
+
+/** Dim follow-up guidance on stderr (keeps stdout/JSON clean). */
+export function printHint(msg: string): void {
+  console.error(`${stderrColors.dim}${msg}${stderrColors.reset}`)
 }

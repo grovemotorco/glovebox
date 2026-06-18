@@ -4,9 +4,10 @@ import { parseArgs } from 'node:util'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
+import { resolveServerUrl } from '../lib/config.ts'
 import { canonicalizeDir, gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
 import { addMount, type MountEntry } from '../lib/registry.ts'
-import { DEFAULT_SERVER_URL, normalizeServerUrl } from '../lib/url.ts'
+import { DEFAULT_SERVER_URL } from '../lib/url.ts'
 
 /**
  * Registration ONLY — no process starts, no network, no sentinel write.
@@ -36,7 +37,7 @@ export async function runMount(dirArg: string, options: MountOptions): Promise<M
     mountId: randomUUID(),
     dir,
     workspaceId: options.workspace,
-    serverUrl: normalizeServerUrl(options.server ?? DEFAULT_SERVER_URL),
+    serverUrl: await resolveServerUrl(options.server, paths),
     deviceId: randomUUID(),
     createdAt: Date.now(),
   }
@@ -67,7 +68,7 @@ Arguments:
 
 Options:
   -w, --workspace <id>     Workspace ID to bind to (required)
-  -s, --server <url>       Server URL (default: ${DEFAULT_SERVER_URL})
+  -s, --server <url>       Server URL (default: GLOVEBOX_SERVER_URL, config, or ${DEFAULT_SERVER_URL})
   -h, --help               Show this help message`)
     if (!values.help) {
       process.exitCode = 1

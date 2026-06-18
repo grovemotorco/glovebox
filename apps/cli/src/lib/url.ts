@@ -1,6 +1,11 @@
-/** Dev default — the portless route for the local worker (`vp run dev:worker`).
- * A production default is blocked on the deployment story (scope note §open-4). */
-export const DEFAULT_SERVER_URL = 'https://api.glovebox.test'
+/**
+ * Built-in default server (production). Override precedence (lowest to
+ * highest): this constant → `~/.glovebox/config.json` `defaultServer` →
+ * `GLOVEBOX_SERVER_URL` env → an explicit `--server` flag. See
+ * `resolveServer` in `./config.ts`. The local dev worker (`vp run
+ * dev:worker`) is `https://api.glovebox.test`.
+ */
+export const DEFAULT_SERVER_URL = 'https://api.glovebox.md'
 
 const LOCALHOST_PATTERNS = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/
 
