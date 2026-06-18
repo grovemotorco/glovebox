@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { GloveboxClient, WorkspaceSummary } from '@glovebox.md/api'
+import { ORPCError, type GloveboxClient, type WorkspaceSummary } from '@glovebox.md/api'
 import { gloveboxPaths, type GloveboxPaths } from '../../src/lib/paths.ts'
 import { runAuthStatus, runAuthUse, runLogin } from '../../src/commands/auth.ts'
 import { runWhoami } from '../../src/commands/whoami.ts'
@@ -48,9 +48,13 @@ describe('whoami', () => {
   })
 
   it('falls back to workspaces.list when me.get is not implemented (501)', async () => {
-    const notImplemented = Object.assign(new Error('me.get is not implemented yet'), {
+    // The real client reconstructs a contract-declared error as a defined
+    // ORPCError; `isGloveboxError` narrows on that, not on duck-typed props.
+    const notImplemented = new ORPCError('NOT_IMPLEMENTED', {
+      defined: true,
       status: 501,
-      code: 'NOT_IMPLEMENTED',
+      message: 'me.get is not implemented yet',
+      data: { procedure: 'me.get' },
     })
     const client = {
       me: {

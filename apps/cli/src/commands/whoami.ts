@@ -1,5 +1,10 @@
 import { parseArgs } from 'node:util'
-import type { GloveboxClient, MeView, WorkspaceSummary } from '@glovebox.md/api'
+import {
+  isGloveboxError,
+  type GloveboxClient,
+  type MeView,
+  type WorkspaceSummary,
+} from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
 import { printHint, printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
@@ -27,10 +32,7 @@ export interface WhoamiResult {
 }
 
 function isNotImplemented(error: unknown): boolean {
-  const e = error as { status?: number; code?: string; message?: string } | null
-  return (
-    e?.status === 501 || e?.code === 'NOT_IMPLEMENTED' || /not implemented/i.test(e?.message ?? '')
-  )
+  return isGloveboxError(error) && error.code === 'NOT_IMPLEMENTED'
 }
 
 export async function runWhoami(

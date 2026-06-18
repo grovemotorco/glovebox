@@ -23,7 +23,15 @@ export const commonErrors = {
     data: z
       .object({
         reason: z
-          .enum(['not_a_member', 'insufficient_role', 'owner_required', 'scope_missing'])
+          .enum([
+            'not_a_member',
+            'insufficient_role',
+            'owner_required',
+            'commenter_required',
+            'editor_required',
+            'scope_missing',
+            'admin_scope_required',
+          ])
           .optional(),
       })
       .optional(),

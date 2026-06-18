@@ -26,7 +26,7 @@ import {
   type WorkspacePresencePeer,
 } from '@glovebox.md/sync/client'
 import type { WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
-import { api, getOrCreateDeviceId } from '../lib/api.ts'
+import { api, getOrCreateDeviceId, safe } from '../lib/api.ts'
 import { randomUuid } from '../lib/random.ts'
 import {
   WorkspaceSocketTransport,
@@ -445,14 +445,13 @@ export function WorkspaceProvider({
         }
       },
       getUrl: async () => {
-        try {
-          const minted = await api.auth.mintWorkspaceSocketToken({ workspaceId })
-          // Null token = socket auth not configured (dev) — connect tokenless.
-          return minted.token ? `${baseUrl}?token=${encodeURIComponent(minted.token)}` : baseUrl
-        } catch {
-          // Transient mint failure — try tokenless rather than not at all.
-          return baseUrl
-        }
+        const result = await safe(api.auth.mintWorkspaceSocketToken({ workspaceId }))
+        // Transient mint failure — try tokenless rather than not at all.
+        if (!result.isSuccess) return baseUrl
+        // Null token = socket auth not configured (dev) — connect tokenless.
+        return result.data.token
+          ? `${baseUrl}?token=${encodeURIComponent(result.data.token)}`
+          : baseUrl
       },
     })
     transportRef.current = transport

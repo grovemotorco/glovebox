@@ -28,6 +28,16 @@ const apiMock = vi.hoisted(() => ({
 
 vi.mock('../src/lib/api.ts', () => ({
   getOrCreateDeviceId: () => 'device-test',
+  // Mirror @orpc/client's `safe`: resolve → success result, reject → error
+  // result. The real export is re-exported from lib/api.ts, so the mock must
+  // provide it too (workspace.tsx uses it in the socket-token getUrl).
+  safe: async (promise: Promise<unknown>) => {
+    try {
+      return { error: null, data: await promise, isDefined: false, isSuccess: true }
+    } catch (error) {
+      return { error, data: undefined, isDefined: false, isSuccess: false }
+    }
+  },
   api: {
     workspaces: apiMock.workspaces,
     members: apiMock.members,
