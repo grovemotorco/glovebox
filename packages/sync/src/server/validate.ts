@@ -69,7 +69,9 @@ export function parseClientMessage(raw: string, limits: IngressLimits): Workspac
       allowKeys(message, ['type', 'requestId', 'fileId', 'initialContent', 'observedPath'])
       requireString(message, 'requestId', REQUEST_ID_MAX)
       requireString(message, 'fileId', FILE_ID_MAX)
-      optionalString(message, 'initialContent', limits.maxInitialContentChars)
+      optionalString(message, 'initialContent', limits.maxInitialContentChars, {
+        allowEmpty: true,
+      })
       optionalString(message, 'observedPath', PATH_MAX)
       return message as Extract<WorkspaceClientMessage, { type: 'snapshot.get' }>
     case 'events.since':
@@ -254,9 +256,14 @@ function requireJsonString(message: Record<string, unknown>, key: string): void 
   }
 }
 
-function optionalString(message: Record<string, unknown>, key: string, maxChars: number): void {
+function optionalString(
+  message: Record<string, unknown>,
+  key: string,
+  maxChars: number,
+  options: { allowEmpty?: boolean } = {},
+): void {
   if (message[key] === undefined) return
-  requireString(message, key, maxChars)
+  requireString(message, key, maxChars, options)
 }
 
 function optionalBoolean(message: Record<string, unknown>, key: string): void {

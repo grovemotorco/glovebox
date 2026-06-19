@@ -6,6 +6,7 @@ import {
   NodeDaemonStorage,
   WsDaemonTransport,
   createNodeFS,
+  type DaemonSyncWarning,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
 import type { NextAction } from '../cli/envelope.ts'
@@ -146,6 +147,7 @@ export async function runRun(
       storage: new NodeDaemonStorage(paths.stateDir(mount.mountId)),
       transport,
       deletePolicy: overrides.deletePolicy,
+      onWarning: (warning) => reporter.log('warn', renderDaemonSyncWarning(warning)),
     })
 
     // The WebSocket layer reports connection failures without a cause
@@ -248,6 +250,20 @@ export async function resolveWorkspaceSocketToken(options: {
   }).auth.mintWorkspaceSocketToken({ workspaceId: options.workspaceId })
   // Null token = socket auth not configured on the server — connect tokenless.
   return minted.token ?? undefined
+}
+
+function renderDaemonSyncWarning(warning: DaemonSyncWarning): string {
+  switch (warning.type) {
+    case 'file-operation-failed':
+      return `sync file failed during ${warning.phase}: ${warning.path} (${warning.fileId ?? 'unknown file'}): ${warning.reason}`
+    case 'opaque-submit-failed':
+      return `opaque sync failed: ${warning.path} (${warning.fileId}): ${warning.reason}`
+    case 'opaque-submit-rejected': {
+      const retry =
+        warning.retryAfterSec === undefined ? '' : `; retry after ${warning.retryAfterSec}s`
+      return `opaque sync rejected: ${warning.path} (${warning.fileId}): ${warning.reason}${retry}`
+    }
+  }
 }
 
 type LogLevel = 'info' | 'warn' | 'error'

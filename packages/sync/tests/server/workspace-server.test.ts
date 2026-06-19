@@ -1928,6 +1928,27 @@ describe('WorkspaceServer batch.submit (tree ops)', () => {
 })
 
 describe('WorkspaceServer kind-boundary routing and adoption surfaces (ISSUE-0043/0044/0045)', () => {
+  it('snapshot.get accepts empty initialContent and registers an empty markdown doc', async () => {
+    const host = new FakeHost()
+    const socket = await host.connect('alice')
+    await helloPeerId(host, socket, 'device-a')
+
+    const { snapshotB64 } = await fetchSnapshot(host, socket, 'f-empty', '', 'empty.md')
+
+    expect(LoroFileDoc.fromSnapshot(base64ToBytes(snapshotB64)).getTextContent()).toBe('')
+    await host.send(socket, { type: 'tree.list', requestId: 'rq-empty-tree' })
+    const tree = socket.received('tree.state').at(-1)!
+    expect(tree.entries).toContainEqual(
+      expect.objectContaining({
+        fileId: 'f-empty',
+        path: 'empty.md',
+        contentHash: sha256Hex(''),
+        sizeBytes: 0,
+        tombstone: false,
+      }),
+    )
+  })
+
   it('tree.list returns live entries + currentSeq', async () => {
     const host = new FakeHost()
     const socket = await host.connect('alice')
