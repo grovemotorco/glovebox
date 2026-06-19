@@ -2,6 +2,7 @@ import { rm } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
 import { createGloveboxClient } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
+import { type NextAction, withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printHint, printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
@@ -163,7 +164,20 @@ export default async function doctor(args: string[], globals: GlobalFlags): Prom
 
   const result = await runDoctor({ server: values.server, fix: values.fix })
   if (resolveOutputMode(globals) === 'json') {
-    printJson(result)
+    const nextActions: NextAction[] = []
+    if (result.checks.some((check) => check.status !== 'ok' && check.fix)) {
+      nextActions.push({
+        command: 'glovebox doctor --fix',
+        description: 'Apply the available automatic repairs',
+      })
+    }
+    if (result.checks.find((check) => check.name === 'Credentials')?.status === 'warn') {
+      nextActions.push({
+        command: 'glovebox auth device --workspace <id>',
+        description: 'Sign in to the resolved server',
+      })
+    }
+    printJson(withNextActions(result, nextActions))
   } else {
     for (const check of result.checks) {
       const icon =

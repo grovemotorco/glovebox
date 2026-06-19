@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util'
 import type { GloveboxClient, WorkspaceSummary } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
+import { withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import {
   printError,
@@ -142,8 +143,7 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
     }
     const name = positionals[0]
     if (!name) {
-      usageError('workspaces create requires a <name>', 'glovebox workspaces create')
-      return
+      return usageError('workspaces create requires a <name>', 'glovebox workspaces create')
     }
     const { workspace, serverUrl } = await runWorkspaceCreate({
       name,
@@ -151,7 +151,14 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
       server: values.server,
     })
     if (mode === 'json') {
-      printJson({ serverUrl, workspace })
+      printJson(
+        withNextActions({ serverUrl, workspace }, [
+          {
+            command: `glovebox mount <dir> --workspace ${workspace.id}`,
+            description: 'Bind a local directory to this workspace',
+          },
+        ]),
+      )
       return
     }
     printSuccess(`Created workspace ${colors.bold}${workspace.name}${colors.reset}`)

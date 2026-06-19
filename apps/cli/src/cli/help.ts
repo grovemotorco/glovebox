@@ -1,4 +1,5 @@
 import type { RootCommand } from './index.ts'
+import type { NextAction } from './envelope.ts'
 import { DEFAULT_SERVER_URL } from '../lib/url.ts'
 import pkg from '../../package.json' with { type: 'json' }
 
@@ -29,6 +30,44 @@ export interface CommandHelp {
   options?: [string, string][]
   /** Copy-pasteable example invocations. */
   examples?: string[]
+}
+
+/**
+ * Machine-readable command tree, emitted instead of the prose help screen when
+ * the root command runs in JSON mode (`glovebox --json`, or piped). Lets an
+ * agent discover the whole surface in one call instead of scraping `--help`.
+ */
+export interface CommandTree {
+  name: 'glovebox'
+  version: string
+  defaultServer: string
+  commands: { name: string; group: string; summary: string }[]
+  nextActions: NextAction[]
+}
+
+export function buildCommandTree(commands: RootCommand[]): CommandTree {
+  return {
+    name: 'glovebox',
+    version: getVersion(),
+    defaultServer: DEFAULT_SERVER_URL,
+    commands: commands
+      .filter((command) => !command.hidden)
+      .map((command) => ({
+        name: command.name,
+        group: command.group,
+        summary: command.summary,
+      })),
+    nextActions: [
+      {
+        command: 'glovebox auth device --workspace <id>',
+        description: 'Sign in (browser device flow)',
+      },
+      {
+        command: 'glovebox <command> --help',
+        description: "Show a command's arguments and examples",
+      },
+    ],
+  }
 }
 
 /** Render a {@link CommandHelp} to the shared, aligned help layout. */

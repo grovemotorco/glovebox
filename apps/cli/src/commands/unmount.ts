@@ -77,8 +77,7 @@ export default async function unmount(args: string[], globals: GlobalFlags): Pro
     return
   }
   if (!positionals[0]) {
-    usageError('unmount requires a <dir>', 'glovebox unmount')
-    return
+    return usageError('unmount requires a <dir>', 'glovebox unmount')
   }
 
   const result = await runUnmount(positionals[0])

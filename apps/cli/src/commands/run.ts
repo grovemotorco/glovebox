@@ -8,6 +8,7 @@ import {
   createNodeFS,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
+import type { NextAction } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printError, printHint, printWarn } from '../cli/output.ts'
 import { getToken } from '../lib/auth-store.ts'
@@ -37,6 +38,8 @@ export async function runRun(
   target: string | undefined,
   options: {
     rescanIntervalSec?: number
+    /** Emit newline-delimited JSON events instead of human log lines. */
+    json?: boolean
     paths?: GloveboxPaths
     env?: NodeJS.ProcessEnv
   } = {},
@@ -60,12 +63,19 @@ export async function runRun(
   }
 
   const overrides = parseSyncOverrides(env)
+  const reporter = createRunReporter(options.json ?? false, {
+    dir: mount.dir,
+    workspaceId: mount.workspaceId,
+    mountId: mount.mountId,
+    serverUrl: mount.serverUrl,
+  })
 
   // Surface the most common run-time failure (no/expired token) up front, as
   // a clear hint rather than an opaque "WebSocket connection failed" later.
   const haveCredential = (await getToken(paths, mount.serverUrl)) !== null
   if (!haveCredential) {
-    printWarn(
+    reporter.log(
+      'warn',
       `No stored credentials for ${mount.serverUrl} — the server may reject this connection. ` +
         `Sign in: glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}`,
     )
@@ -75,13 +85,14 @@ export async function runRun(
 
   let exiting = false
   let teardown: () => Promise<void> = async () => {}
-  const shutdown = async (code: number): Promise<void> => {
+  const shutdown = async (code: number, terminal?: TerminalPayload): Promise<void> => {
     if (exiting) {
       return
     }
     exiting = true
     await teardown()
     await lock.release()
+    reporter.terminal(code, terminal)
     process.exit(code)
   }
 
@@ -99,18 +110,30 @@ export async function runRun(
         ),
       backoffInitialMs: overrides.backoffInitialMs,
       onConnect: () => {
-        console.log(`[glovebox] connected to ${mount.serverUrl}`)
+        reporter.connected()
         hints.poke()
       },
       onAuthRequired: (reason) => {
-        printError(
+        reporter.log(
+          'error',
           `server rejected credentials (${reason}) — refresh with ` +
             `\`glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`; retrying with stored token`,
         )
       },
       onStopped: (reason, code) => {
-        printError(`server closed this mount: ${reason} (close code ${code})`)
-        void shutdown(1)
+        const message = `server closed this mount: ${reason} (close code ${code})`
+        reporter.log('error', message)
+        void shutdown(1, {
+          message,
+          code: 'SERVER_CLOSED',
+          fix: 'the workspace may have been revoked or deleted — check `glovebox whoami`',
+          nextActions: [
+            {
+              command: 'glovebox whoami',
+              description: 'Check which workspaces this credential can reach',
+            },
+          ],
+        })
       },
       onHint: () => hints.poke(),
     })
@@ -137,21 +160,23 @@ export async function runRun(
           : overrides.rescanIntervalMs,
       onCycleError: (error) => {
         const message = error instanceof Error ? error.message : String(error)
-        printError(`sync cycle failed: ${message}`)
+        reporter.log('error', `sync cycle failed: ${message}`)
         if (!tlsDiagnosed && message.includes('WebSocket connection failed')) {
           tlsDiagnosed = true
           if (!haveCredential) {
-            printHint(
+            reporter.log(
+              'info',
               `Not authenticated — run \`glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`, then restart.`,
             )
           }
           void diagnoseTlsTrust(mount.serverUrl).then((problem) => {
             if (problem) {
-              printError(
+              reporter.log(
+                'error',
                 `TLS preflight against ${mount.serverUrl}: ${problem.code} — ${problem.message}`,
               )
               if (problem.certTrust) {
-                printError(TLS_TRUST_HINT)
+                reporter.log('error', TLS_TRUST_HINT)
               }
             }
           })
@@ -178,12 +203,9 @@ export async function runRun(
     process.on('SIGINT', () => void shutdown(0))
     process.on('SIGTERM', () => void shutdown(0))
 
-    // Print the banner before starting the loop so it precedes any
-    // first-cycle connection diagnostics on stderr.
-    console.log(
-      `[glovebox] syncing ${mount.dir} ↔ workspace ${mount.workspaceId} (mount ${mount.mountId})`,
-    )
-    console.log('[glovebox] foreground daemon — Ctrl-C to stop')
+    // Emit the start banner before starting the loop so it precedes any
+    // first-cycle connection diagnostics.
+    reporter.start()
     await runner.start()
   } catch (error) {
     await teardown()
@@ -217,6 +239,112 @@ export async function resolveWorkspaceSocketToken(options: {
   return minted.token ?? undefined
 }
 
+type LogLevel = 'info' | 'warn' | 'error'
+
+interface TerminalPayload {
+  message: string
+  code: string
+  fix?: string
+  nextActions?: NextAction[]
+}
+
+interface RunReporter {
+  start(): void
+  connected(): void
+  log(level: LogLevel, message: string): void
+  /** Final output: a `result` envelope on a clean stop (code 0), else `error`. */
+  terminal(code: number, payload?: TerminalPayload): void
+}
+
+interface RunContext {
+  dir: string
+  workspaceId: string
+  mountId: string
+  serverUrl: string
+}
+
+/**
+ * Output adapter for the foreground daemon. Human mode keeps the familiar
+ * `[glovebox] …` log lines (diagnostics on stderr). JSON mode emits typed,
+ * newline-delimited JSON to stdout — one object per line, the LAST line always
+ * the standard `result`/`error` envelope, so a tool reading only the final line
+ * gets exactly what it expects (the NDJSON-with-HATEOAS-terminal shape).
+ */
+export function createRunReporter(json: boolean, ctx: RunContext): RunReporter {
+  if (!json) {
+    return {
+      start() {
+        console.log(
+          `[glovebox] syncing ${ctx.dir} ↔ workspace ${ctx.workspaceId} (mount ${ctx.mountId})`,
+        )
+        console.log('[glovebox] foreground daemon — Ctrl-C to stop')
+      },
+      connected() {
+        console.log(`[glovebox] connected to ${ctx.serverUrl}`)
+      },
+      log(level, message) {
+        if (level === 'warn') printWarn(message)
+        else if (level === 'error') printError(message)
+        else printHint(message)
+      },
+      terminal() {
+        // Human mode: the process simply exits; there is no terminal line.
+      },
+    }
+  }
+
+  const emit = (event: Record<string, unknown>): void => {
+    console.log(JSON.stringify({ ...event, ts: new Date().toISOString() }))
+  }
+  return {
+    start() {
+      emit({
+        type: 'start',
+        command: 'glovebox run',
+        dir: ctx.dir,
+        workspaceId: ctx.workspaceId,
+        mountId: ctx.mountId,
+      })
+    },
+    connected() {
+      emit({ type: 'connected', serverUrl: ctx.serverUrl })
+    },
+    log(level, message) {
+      emit({ type: 'log', level, message })
+    },
+    terminal(code, payload) {
+      if (code === 0) {
+        emit({
+          type: 'result',
+          ok: true,
+          command: 'glovebox run',
+          result: {
+            dir: ctx.dir,
+            workspaceId: ctx.workspaceId,
+            mountId: ctx.mountId,
+            reason: 'stopped',
+          },
+          nextActions: [
+            {
+              command: `glovebox status ${ctx.dir}`,
+              description: 'Inspect sync status for this mount',
+            },
+          ],
+        })
+        return
+      }
+      emit({
+        type: 'error',
+        ok: false,
+        command: 'glovebox run',
+        error: { message: payload?.message ?? 'daemon stopped', code: payload?.code ?? 'STOPPED' },
+        ...(payload?.fix ? { fix: payload.fix } : {}),
+        nextActions: payload?.nextActions ?? [],
+      })
+    },
+  }
+}
+
 /**
  * Parse a human-friendly duration into whole seconds. Accepts a bare number
  * (seconds, the historical form) or a `s`/`m`/`h` suffix. Returns null on a
@@ -230,7 +358,7 @@ export function parseDurationSeconds(value: string): number | null {
   return Number.isFinite(seconds) && seconds > 0 ? seconds : null
 }
 
-export default async function run(args: string[], _globals: GlobalFlags): Promise<void> {
+export default async function run(args: string[], globals: GlobalFlags): Promise<void> {
   const { positionals, values } = parseArgs({
     args,
     allowPositionals: true,
@@ -248,7 +376,7 @@ export default async function run(args: string[], _globals: GlobalFlags): Promis
         summary: 'run the sync daemon for a mount (foreground)',
         usage: 'glovebox run [dir] [options]',
         description:
-          'One process per mount, guarded by a mandatory lockfile. The first cycle\nadopts the directory (sentinel write; existing files bind to workspace\nfiles by path, unknown paths become creates). Watcher events only hint a\nrescan — the jittered rescan loop is the correctness backstop.',
+          'One process per mount, guarded by a mandatory lockfile. The first cycle\nadopts the directory (sentinel write; existing files bind to workspace\nfiles by path, unknown paths become creates). Watcher events only hint a\nrescan — the jittered rescan loop is the correctness backstop.\n\nWith --json, emits newline-delimited JSON events (start/connected/log) and\na terminal result/error envelope as the final line.',
         args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
         options: [
           [
@@ -260,6 +388,7 @@ export default async function run(args: string[], _globals: GlobalFlags): Promis
           'glovebox run ./notes',
           'glovebox run',
           'glovebox run ./notes --rescan-interval 10m',
+          'glovebox --json run ./notes   # newline-delimited JSON events',
         ],
       }),
     )
@@ -277,5 +406,8 @@ export default async function run(args: string[], _globals: GlobalFlags): Promis
     rescanIntervalSec = parsed
   }
 
-  await runRun(positionals[0], { rescanIntervalSec })
+  // The daemon streams NDJSON only on explicit --json (not auto-on-pipe): a
+  // long-running process under a supervisor shouldn't have its log format flip
+  // based on TTY. Humans and log scrapers keep the `[glovebox] …` lines.
+  await runRun(positionals[0], { rescanIntervalSec, json: globals.json })
 }

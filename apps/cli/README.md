@@ -30,24 +30,30 @@ reports the resolved server, whether you're authenticated, and reachability.
 
 ## Commands
 
-| Command                                                   | What it does                                                                 |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `glovebox auth device [--workspace <id>...]`              | Browser device login; stores a `gbx_` API key and sets the default server    |
-| `glovebox whoami`                                         | Show your identity, active workspace, and every workspace you can access     |
-| `glovebox workspaces list` / `create <name>`              | Discover or create workspaces                                                |
-| `glovebox auth status` / `use <url>` / `token` / `logout` | Inspect stored credentials, set the default server, print a token, sign out  |
+| Command                                                   | What it does                                                                                |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `glovebox auth device [--workspace <id>...]`              | Browser device login; stores a `gbx_` API key and sets the default server                   |
+| `glovebox whoami`                                         | Show your identity, active workspace, and every workspace you can access                    |
+| `glovebox workspaces list` / `create <name>`              | Discover or create workspaces                                                               |
+| `glovebox auth status` / `use <url>` / `token` / `logout` | Inspect stored credentials, set the default server, print a token, sign out                 |
 | `glovebox doctor [--fix]`                                 | Check CLI health, the resolved server, auth, and reachability (`--fix` repairs stale locks) |
-| `glovebox mount <dir> --workspace <id>`                   | Register the directory↔workspace binding (no process starts)                 |
-| `glovebox run [<dir>]`                                    | Run the sync daemon in the foreground (one process per mount)                |
-| `glovebox list`                                           | Registered mounts + running/stopped                                          |
-| `glovebox status [<dir>]`                                 | Cursor, tracked files, pending pushes, and the INV-3 deletion stack          |
-| `glovebox unmount <dir>`                                  | Remove the binding + daemon state (never your files); refuses while running  |
-| `glovebox pull <path> --workspace <id>`                   | Fetch a file's working text and record the merge base                        |
-| `glovebox push <path>`                                    | Merge local edits into the live document (exit 0 clean · 2 hunks · 3 refuse) |
+| `glovebox mount <dir> --workspace <id>`                   | Register the directory↔workspace binding (no process starts)                                |
+| `glovebox run [<dir>]`                                    | Run the sync daemon in the foreground (one process per mount)                               |
+| `glovebox list`                                           | Registered mounts + running/stopped                                                         |
+| `glovebox status [<dir>]`                                 | Cursor, tracked files, pending pushes, and the INV-3 deletion stack                         |
+| `glovebox unmount <dir>`                                  | Remove the binding + daemon state (never your files); refuses while running                 |
+| `glovebox pull <path> --workspace <id>`                   | Fetch a file's working text and record the merge base                                       |
+| `glovebox push <path>`                                    | Merge local edits into the live document (exit 0 clean · 2 hunks · 3 refuse)                |
 
 Run `glovebox <command> --help` for per-command options. `--json` gives
 structured output on any command (the default when stdout is not a TTY);
 `--human` forces human output even when piped.
+
+For agents, JSON responses carry machine-readable affordances: a `nextActions`
+array of runnable next steps on success, a `fix` string on errors, and
+`glovebox --json` (no subcommand) returns the full command tree for discovery.
+`glovebox --json run <dir>` streams newline-delimited JSON events whose last
+line is the terminal `result`/`error` envelope.
 
 ## Choosing the server
 

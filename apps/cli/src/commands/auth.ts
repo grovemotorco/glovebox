@@ -7,6 +7,7 @@ import {
 } from '@glovebox.md/api'
 import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import type { GlobalFlags } from '../cli/index.ts'
+import { withNextActions } from '../cli/envelope.ts'
 import { type CommandHelp, renderHelp } from '../cli/help.ts'
 import {
   printError,
@@ -398,7 +399,14 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
       const token = await resolveTokenInput(values.token)
       const result = await runLogin({ server: values.server, token })
       if (mode === 'json') {
-        printJson(result)
+        printJson(
+          withNextActions(result, [
+            {
+              command: 'glovebox whoami',
+              description: 'Verify the stored identity against the server',
+            },
+          ]),
+        )
       } else {
         printSuccess(`Token stored for ${result.serverUrl} (now the default server)`)
         if (result.claims) {
@@ -440,7 +448,14 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
         },
       })
       if (mode === 'json') {
-        printJson(result)
+        printJson(
+          withNextActions(result, [
+            {
+              command: 'glovebox workspaces list',
+              description: 'List the workspaces this key can access',
+            },
+          ]),
+        )
       } else {
         printSuccess(`API key stored for ${result.serverUrl} (now the default server)`)
       }
@@ -485,8 +500,7 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
       const { positionals } = parseArgs({ args: rest, allowPositionals: true, strict: true })
       const target = positionals[0]
       if (!target) {
-        usageError('auth use requires a <url>', 'glovebox auth use')
-        return
+        return usageError('auth use requires a <url>', 'glovebox auth use')
       }
       const result = await runAuthUse({ server: target })
       if (mode === 'json') printJson(result)
@@ -548,8 +562,7 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
         strict: true,
       })
       if (!values.secret || !values.workspace) {
-        usageError('mint-dev requires --secret and --workspace', 'glovebox auth mint-dev')
-        return
+        return usageError('mint-dev requires --secret and --workspace', 'glovebox auth mint-dev')
       }
       const result = await runMintDev({
         secret: values.secret,
