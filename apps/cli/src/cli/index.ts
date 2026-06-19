@@ -8,6 +8,7 @@ import pull from '../commands/pull.ts'
 import push from '../commands/push.ts'
 import run from '../commands/run.ts'
 import status from '../commands/status.ts'
+import sync from '../commands/sync.ts'
 import unmount from '../commands/unmount.ts'
 import whoami from '../commands/whoami.ts'
 import workspaces from '../commands/workspaces.ts'
@@ -84,6 +85,13 @@ export const COMMANDS: RootCommand[] = [
     group: 'Sync',
     summary: "Show a mount's sync status",
     run: status,
+  },
+  {
+    name: 'sync',
+    group: 'Sync',
+    summary: 'Inspect and resolve sync internals',
+    detail: 'deletes',
+    run: sync,
   },
   {
     name: 'unmount',

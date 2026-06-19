@@ -23,9 +23,9 @@ interface Adopted {
   fileIdAt: (path: string) => string
 }
 
-async function adoptedDaemon(): Promise<Adopted> {
+async function adoptedDaemon(options: Parameters<SimWorld['addDaemon']>[2] = {}): Promise<Adopted> {
   const world = new SimWorld({ seed: 7 })
-  const daemon = await world.addDaemon('daemon', { ...FIXTURE })
+  const daemon = await world.addDaemon('daemon', { ...FIXTURE }, options)
   await daemon.engine.runCycle() // registers the fixture files
   await daemon.engine.runCycle() // settles the cursor over the create events
   const byPath = new Map(daemon.engine.files().map((file) => [file.path, file.fileId]))
@@ -105,18 +105,19 @@ describe('deletion-safety corpus against the live daemon', () => {
         }
 
         case 'bulk-delete-guard': {
-          await scenario.run(daemon.fs)
-          await daemon.engine.runCycle()
-          world.advanceClock(120_000)
-          await daemon.engine.runCycle()
-          await daemon.engine.runCycle()
+          const bulk = await adoptedDaemon({
+            deletePolicy: { bulkMinCount: 3, bulkRatioFloor: 3, bulkRatio: 0.5 },
+          })
+          await scenario.run(bulk.daemon.fs)
+          await bulk.daemon.engine.runCycle()
+          bulk.world.advanceClock(120_000)
+          await bulk.daemon.engine.runCycle()
+          await bulk.daemon.engine.runCycle()
 
-          // The wipe must not propagate, no matter how long it sits; the
-          // server retains every file and the daemon keeps tracking them.
-          expect(await propagatedDeletes(daemon)).toBe(0)
-          expect(daemon.engine.files()).toHaveLength(3)
+          expect(await propagatedDeletes(bulk.daemon)).toBe(0)
+          expect(bulk.daemon.engine.files()).toHaveLength(3)
           for (const [path, content] of Object.entries(FIXTURE)) {
-            expect(await serverText(daemon, fileIdAt(path))).toBe(content)
+            expect(await serverText(bulk.daemon, bulk.fileIdAt(path))).toBe(content)
           }
           return
         }

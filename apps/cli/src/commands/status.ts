@@ -7,6 +7,7 @@ import { base64ToBytes } from '@glovebox.md/sync/loro'
 import {
   DEFAULT_DELETE_POLICY,
   NodeDaemonStorage,
+  STATE_ARTIFACT,
   envelopeName,
   type DaemonWorkspaceState,
 } from '@glovebox.md/sync/daemon'
@@ -55,6 +56,8 @@ export interface StatusResult {
   /** Markdown files whose doc version is ahead of the server watermark. */
   pendingPushes: number | null
   pendingRenames: number | null
+  heldDeleteIntents: number
+  freeDeleteIntents: number
   deleteIntents: DeleteIntentView[]
 }
 
@@ -86,7 +89,7 @@ export async function runStatus(
   )
 
   const storage = new NodeDaemonStorage(paths.stateDir(mount.mountId))
-  const stateBytes = await storage.read('workspace-state.json')
+  const stateBytes = await storage.read(STATE_ARTIFACT)
   if (!stateBytes) {
     return {
       dir: mount.dir,
@@ -101,6 +104,8 @@ export async function runStatus(
       trackedFiles: null,
       pendingPushes: null,
       pendingRenames: null,
+      heldDeleteIntents: 0,
+      freeDeleteIntents: 0,
       deleteIntents: [],
     }
   }
@@ -143,6 +148,7 @@ export async function runStatus(
       ? null
       : Math.max(0, intent.observedMissingAtMs + tombstoneDelayMs - now()),
   }))
+  const heldDeleteIntents = deleteIntents.filter((intent) => intent.held !== null).length
 
   return {
     dir: mount.dir,
@@ -157,6 +163,8 @@ export async function runStatus(
     trackedFiles: files.length,
     pendingPushes,
     pendingRenames: (state.pendingRenames ?? []).length,
+    heldDeleteIntents,
+    freeDeleteIntents: deleteIntents.length - heldDeleteIntents,
     deleteIntents,
   }
 }
@@ -193,11 +201,13 @@ function formatStatus(result: StatusResult): void {
     console.log(`  Deletes:   none pending`)
     return
   }
-  console.log(`  Deletes:   ${result.deleteIntents.length} intent(s):`)
+  console.log(
+    `  Deletes:   ${result.deleteIntents.length} intent(s), ${result.heldDeleteIntents} held, ${result.freeDeleteIntents} free:`,
+  )
   for (const intent of result.deleteIntents) {
     if (intent.held) {
       console.log(
-        `    ${intent.path} — ${colors.yellow}HELD (${intent.held})${colors.reset}: will never propagate; restore the files or remount to clear`,
+        `    ${intent.path} — ${colors.yellow}HELD (${intent.held})${colors.reset}: review with \`glovebox sync deletes\`; release with \`glovebox sync deletes --confirm ${intent.path}\` or restore with \`glovebox sync deletes --restore ${intent.path}\``,
       )
     } else {
       const seconds = Math.ceil((intent.msUntilPropagation ?? 0) / 1000)

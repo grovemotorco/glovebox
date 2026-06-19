@@ -146,6 +146,9 @@ const KNOWN_FLAGS = [
   '--save',
   '--file-id',
   '--rescan-interval',
+  '--list',
+  '--confirm',
+  '--restore',
 ] as const
 
 /**

@@ -16,7 +16,9 @@ import type { BatchAcceptedOp, BatchDeferredOp } from '../server/workspace-batch
 import { getSuffixedPath } from '../server/workspace-store.ts'
 import { scanMount, type DaemonFileView } from './scanner.ts'
 import {
+  DELETE_RESOLUTION_ARTIFACT,
   DaemonStateStore,
+  type DeleteResolutionQueue,
   type DaemonStorage,
   type PendingDelete,
   type PendingRename,
@@ -132,6 +134,13 @@ export type DaemonSyncWarning =
       reason: SubmitOpaqueRejectedReason
       retryAfterSec?: number
     }
+  | {
+      type: 'delete-intents-held'
+      held: NonNullable<PendingDelete['held']>
+      count: number
+      paths: string[]
+      totalHeld: number
+    }
 
 export interface DaemonTreeState {
   currentSeq: number
@@ -209,6 +218,7 @@ export class DaemonSyncEngine {
   readonly #clients = new Map<string, LoroRoomClient>()
   readonly #pendingDeletes = new Map<string, PendingDelete>()
   readonly #pendingRenames = new Map<string, PendingRename>()
+  readonly #warnedHeldDeletes = new Set<string>()
   /** Absences adjudicated as remote-edit-wins — checkout re-materializes. */
   readonly #resurrect = new Set<string>()
   /** Files whose submit was deferred with history-pruned — repaired in push. */
@@ -269,6 +279,84 @@ export class DaemonSyncEngine {
     this.#options.onWarning?.(warning)
   }
 
+  #warnHeldDeletes(intents: PendingDelete[]): void {
+    const fresh = intents.filter((intent) => {
+      if (!intent.held) return false
+      const key = `${intent.held}:${intent.fileId}`
+      if (this.#warnedHeldDeletes.has(key)) return false
+      this.#warnedHeldDeletes.add(key)
+      return true
+    })
+    if (fresh.length === 0) return
+
+    const byHold = new Map<NonNullable<PendingDelete['held']>, PendingDelete[]>()
+    for (const intent of fresh) {
+      if (!intent.held) continue
+      const group = byHold.get(intent.held) ?? []
+      group.push(intent)
+      byHold.set(intent.held, group)
+    }
+    const totalHeld = [...this.#pendingDeletes.values()].filter((intent) => intent.held).length
+    for (const [held, group] of byHold) {
+      this.#warn({
+        type: 'delete-intents-held',
+        held,
+        count: group.length,
+        paths: group.map((intent) => intent.path),
+        totalHeld,
+      })
+    }
+  }
+
+  async #applyDeleteResolutionCommands(): Promise<void> {
+    const bytes = await this.#options.storage.read(DELETE_RESOLUTION_ARTIFACT)
+    if (bytes === null) return
+    let queue: DeleteResolutionQueue | null = null
+    try {
+      queue = JSON.parse(new TextDecoder().decode(bytes)) as DeleteResolutionQueue
+    } catch {
+      // A corrupt local command queue must not brick the daemon.
+    }
+    await this.#options.storage.delete(DELETE_RESOLUTION_ARTIFACT)
+    if (!queue || !Array.isArray(queue.commands)) return
+
+    let pendingChanged = false
+    for (const command of queue.commands) {
+      if (!Array.isArray(command.fileIds)) continue
+      for (const fileId of command.fileIds) {
+        if (command.action === 'confirm') {
+          const intent = this.#pendingDeletes.get(fileId)
+          if (intent?.held !== undefined) {
+            delete intent.held
+            intent.confirmedAtMs = command.createdAt
+            pendingChanged = true
+          }
+          continue
+        }
+        if (command.action === 'restore') {
+          if (this.#pendingDeletes.delete(fileId)) {
+            pendingChanged = true
+          }
+          await this.#markForRestore(fileId)
+        }
+      }
+    }
+    if (pendingChanged) {
+      await this.#store.setPendingDeletes([...this.#pendingDeletes.values()])
+    }
+  }
+
+  async #markForRestore(fileId: string): Promise<void> {
+    const view = this.#views.get(fileId)
+    if (!view) return
+    view.lastWrittenHash = ''
+    this.#resurrect.add(fileId)
+    await this.#store.updateFileMeta(fileId, {
+      lastWrittenHash: '',
+      ...(view.contentKind === 'opaque' ? { opaqueHash: '' } : {}),
+    })
+  }
+
   /** Reconcile persisted artifacts and hydrate docs. Does not touch disk. */
   async start(): Promise<void> {
     if (this.#started) return
@@ -283,6 +371,7 @@ export class DaemonSyncEngine {
     for (const intent of reconciled.state.pendingDeletes) {
       this.#pendingDeletes.set(intent.fileId, intent)
     }
+    this.#warnHeldDeletes([...this.#pendingDeletes.values()].filter((intent) => intent.held))
     for (const rename of reconciled.state.pendingRenames) {
       this.#pendingRenames.set(rename.fileId, rename)
     }
@@ -361,6 +450,7 @@ export class DaemonSyncEngine {
    * within the same cycle.
    */
   async runCycle(): Promise<void> {
+    await this.#applyDeleteResolutionCommands()
     await this.#checkSentinel()
     if (this.#needsAdoption) {
       // Must complete before the first scan classifies disk files as
@@ -521,6 +611,17 @@ export class DaemonSyncEngine {
 
   pendingDeletes(): PendingDelete[] {
     return [...this.#pendingDeletes.values()]
+  }
+
+  nextWakeMs(_now?: number): number | null {
+    if (this.#mountSuspect) return null
+    let earliest: number | null = null
+    for (const intent of this.#pendingDeletes.values()) {
+      if (intent.held !== undefined) continue
+      const wake = intent.observedMissingAtMs + this.#policy.tombstoneDelayMs
+      if (earliest === null || wake < earliest) earliest = wake
+    }
+    return earliest
   }
 
   pendingRenames(): PendingRename[] {
@@ -1359,13 +1460,18 @@ export class DaemonSyncEngine {
       let changed = false
       for (const del of diff.deletes) {
         const intent = this.#pendingDeletes.get(del.fileId)
-        if (intent && intent.held === undefined) {
+        if (intent && intent.held === undefined && intent.confirmedAtMs === undefined) {
           intent.held = 'bulk-startup'
           changed = true
         }
       }
       if (changed) {
         await this.#store.setPendingDeletes([...this.#pendingDeletes.values()])
+        this.#warnHeldDeletes(
+          diff.deletes
+            .map((del) => this.#pendingDeletes.get(del.fileId))
+            .filter((intent): intent is PendingDelete => intent?.held === 'bulk-startup'),
+        )
       }
     }
   }
@@ -1405,7 +1511,9 @@ export class DaemonSyncEngine {
   #applyBulkWindowGuard(): void {
     const now = this.#now()
     const recent = [...this.#pendingDeletes.values()].filter(
-      (intent) => now - intent.observedMissingAtMs <= this.#policy.bulkWindowMs,
+      (intent) =>
+        intent.confirmedAtMs === undefined &&
+        now - intent.observedMissingAtMs <= this.#policy.bulkWindowMs,
     )
     const tracked = Math.max(this.#views.size, 1)
     const hot =
@@ -1413,9 +1521,14 @@ export class DaemonSyncEngine {
       (recent.length >= this.#policy.bulkRatioFloor &&
         recent.length / tracked >= this.#policy.bulkRatio)
     if (!hot) return
+    const newlyHeld: PendingDelete[] = []
     for (const intent of recent) {
-      intent.held ??= 'bulk-window'
+      if (intent.held === undefined && intent.confirmedAtMs === undefined) {
+        intent.held = 'bulk-window'
+        newlyHeld.push(intent)
+      }
     }
+    this.#warnHeldDeletes(newlyHeld)
   }
 
   async #recordPendingRename(fileId: string, fromPath: string, toPath: string): Promise<void> {

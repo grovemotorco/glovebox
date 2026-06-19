@@ -52,6 +52,20 @@ export interface PendingDelete {
    * it). Persisted so a restart cannot launder a held wipe into deletes.
    */
   held?: 'bulk-startup' | 'bulk-window'
+  /** Set only by explicit local user confirmation; prevents later bulk guards
+   *  from re-freezing the same reviewed absence after a restart. */
+  confirmedAtMs?: number
+}
+
+export interface DeleteResolutionCommand {
+  id: string
+  action: 'confirm' | 'restore'
+  fileIds: string[]
+  createdAt: number
+}
+
+export interface DeleteResolutionQueue {
+  commands: DeleteResolutionCommand[]
 }
 
 export interface DaemonFileState {
@@ -118,7 +132,8 @@ export interface DaemonReconcileResult {
   fresh: boolean
 }
 
-const STATE_ARTIFACT = 'workspace-state.json'
+export const STATE_ARTIFACT = 'workspace-state.json'
+export const DELETE_RESOLUTION_ARTIFACT = 'delete-resolutions.json'
 const ENVELOPE_PREFIX = 'loro/'
 const ENVELOPE_SUFFIX = '.snapshot.json'
 

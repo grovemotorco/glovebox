@@ -914,15 +914,15 @@ s_fresh_tab_midstream_repair() {
 
 s_bulk_delete_window_guard() {
   local n i; n="$(nonce)"
-  for i in 1 2 3 4 5 6; do printf 'bulk %s\n' "$i" > "$MOUNT/bulk-$n-$i.md"; done
-  poll "$CONVERGE_S" "6 files synced" sh -c "[ \$($0 __count_prefix bulk-$n) -eq 6 ]" || { bad "bulk seeds never synced"; return; }
+  for i in $(seq 1 100); do printf 'bulk %s\n' "$i" > "$MOUNT/bulk-$n-$i.md"; done
+  poll "$CONVERGE_S" "100 files synced" sh -c "[ \$($0 __count_prefix bulk-$n) -eq 100 ]" || { bad "bulk seeds never synced"; return; }
   rm "$MOUNT"/bulk-$n-*.md
   sleep $(( TOMBSTONE_S + 2 ))   # well past tombstone: only the guard can be holding them
-  check "all 6 intents HELD by bulk-window guard" \
-    sh -c "[ \"\$(node '$CLI' --json status '$MOUNT' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for i in d[\"deleteIntents\"] if i[\"held\"]==\"bulk-window\"))')\" = '6' ]"
-  check "no bulk file tombstoned on server" sh -c "[ \$($0 __count_prefix bulk-$n) -eq 6 ]"
+  check "all 100 intents HELD by bulk-window guard" \
+    sh -c "[ \"\$(node '$CLI' --json status '$MOUNT' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for i in d[\"deleteIntents\"] if i[\"held\"]==\"bulk-window\"))')\" = '100' ]"
+  check "no bulk file tombstoned on server" sh -c "[ \$($0 __count_prefix bulk-$n) -eq 100 ]"
   # Restoring the files cancels the held intents.
-  for i in 1 2 3 4 5 6; do printf 'bulk %s\n' "$i" > "$MOUNT/bulk-$n-$i.md"; done
+  for i in $(seq 1 100); do printf 'bulk %s\n' "$i" > "$MOUNT/bulk-$n-$i.md"; done
   check_poll "$CONVERGE_S" "restored files cancel held intents" \
     sh -c "! node '$CLI' --json status '$MOUNT' | grep -q 'bulk-$n'"
 }
