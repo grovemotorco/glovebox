@@ -107,6 +107,32 @@ export interface OpaqueFetchResult {
   manifest?: OpaqueManifest
 }
 
+export type DaemonFileOperationPhase = 'scan.create'
+
+type SubmitOpaqueRejectedReason = Extract<SubmitOpaqueResult, { type: 'rejected' }>['reason']
+
+export type DaemonSyncWarning =
+  | {
+      type: 'file-operation-failed'
+      phase: DaemonFileOperationPhase
+      fileId?: string
+      path: string
+      reason: string
+    }
+  | {
+      type: 'opaque-submit-failed'
+      fileId: string
+      path: string
+      reason: string
+    }
+  | {
+      type: 'opaque-submit-rejected'
+      fileId: string
+      path: string
+      reason: SubmitOpaqueRejectedReason
+      retryAfterSec?: number
+    }
+
 export interface DaemonTreeState {
   currentSeq: number
   entries: WorkspaceTreeEntry[]
@@ -165,6 +191,7 @@ export interface DaemonSyncEngineOptions {
   now?: () => number
   newOpId?: () => string
   newFileId?: () => string
+  onWarning?: (warning: DaemonSyncWarning) => void
 }
 
 /** Scanner view plus the absorb anchor that travels with the watermark. */
@@ -236,6 +263,10 @@ export class DaemonSyncEngine {
     this.#now = options.now ?? (() => Date.now())
     this.#newOpId = options.newOpId ?? (() => crypto.randomUUID())
     this.#newFileId = options.newFileId ?? (() => crypto.randomUUID())
+  }
+
+  #warn(warning: DaemonSyncWarning): void {
+    this.#options.onWarning?.(warning)
   }
 
   /** Reconcile persisted artifacts and hydrate docs. Does not touch disk. */
@@ -1250,8 +1281,21 @@ export class DaemonSyncEngine {
       }
       const fileId = this.#newFileId()
       const text = normalizeEol(create.text ?? '')
-      const snapshot = await this.#options.transport.fetchSnapshot(fileId, text, create.path)
-      const doc = LoroFileDoc.fromSnapshot(snapshot)
+      let snapshot: Uint8Array
+      let doc: LoroFileDoc
+      try {
+        snapshot = await this.#options.transport.fetchSnapshot(fileId, text, create.path)
+        doc = LoroFileDoc.fromSnapshot(snapshot)
+      } catch (error) {
+        this.#warn({
+          type: 'file-operation-failed',
+          phase: 'scan.create',
+          fileId,
+          path: create.path,
+          reason: errorReason(error),
+        })
+        continue
+      }
       this.#views.set(fileId, {
         fileId,
         path: create.path,
@@ -1446,10 +1490,23 @@ export class DaemonSyncEngine {
           baseHashHex: view.lastWrittenHash,
           bytes,
         })
-      } catch {
+      } catch (error) {
+        this.#warn({
+          type: 'opaque-submit-failed',
+          fileId,
+          path: view.path,
+          reason: errorReason(error),
+        })
         continue // Outcome unknown — the same opId retries next cycle.
       }
       if (result.type === 'rejected') {
+        this.#warn({
+          type: 'opaque-submit-rejected',
+          fileId,
+          path: view.path,
+          reason: result.reason,
+          retryAfterSec: result.retryAfterSec,
+        })
         this.#opaqueInFlight.delete(fileId)
         if (result.reason !== 'rate-limited') {
           // Permanent for this payload (too-large, or the server row is
@@ -1759,4 +1816,10 @@ export class DaemonSyncEngine {
 /** The server refused snapshot.get because the row is opaque (kind crossing). */
 function isOpaqueFileRefusal(error: unknown): boolean {
   return error instanceof Error && error.message.includes('opaque-file')
+}
+
+function errorReason(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) return error.message
+  const reason = String(error)
+  return reason.length > 0 ? reason : 'unknown error'
 }
