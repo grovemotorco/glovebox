@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 
-const [serverUrl, workspaceId, fileId, observedPath, opId, baseHashHex, bytesArg] =
+const [serverUrl, workspaceId, fileId, observedPath, opId, baseHashHex, bytesArg, socketToken] =
   process.argv.slice(2)
 
 if (!serverUrl || !workspaceId || !fileId || !observedPath || !opId || baseHashHex === undefined) {
   console.error(
-    'usage: opaque-submit-node.mjs <server-url> <workspace-id> <file-id> <path> <op-id> <base-hash-hex> <bytes-b64|--oversize>',
+    'usage: opaque-submit-node.mjs <server-url> <workspace-id> <file-id> <path> <op-id> <base-hash-hex> <bytes-b64|--oversize> [socket-token]',
   )
   process.exit(2)
 }
@@ -55,13 +55,21 @@ function socketUrl() {
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   url.pathname = `/ws/${encodeURIComponent(workspaceId)}`
   url.search = ''
+  if (socketToken) url.searchParams.set('token', socketToken)
   url.hash = ''
   return url.toString()
 }
 
 const result = await new Promise((resolve) => {
   const sock = new WebSocket(socketUrl())
-  const timer = setTimeout(() => resolve({ err: 'timeout waiting for opaque ack' }), 20_000)
+  const timer = setTimeout(() => {
+    try {
+      sock.close()
+    } catch {
+      // Already closed.
+    }
+    resolve({ err: 'timeout waiting for opaque ack' })
+  }, 20_000)
   sock.addEventListener('message', (event) => {
     let message
     try {
@@ -86,3 +94,4 @@ const result = await new Promise((resolve) => {
 })
 
 console.log(JSON.stringify(result))
+process.exit(0)

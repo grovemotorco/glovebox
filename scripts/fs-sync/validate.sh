@@ -122,14 +122,22 @@ recovery_list() { api "$SA" documents/recoveryList "{\"workspaceId\":\"$(wsid)\"
 
 ws_batch() { page "$1" ws-batch.js "__WSID__=$(wsid)" "__OPS__=$2"; }
 ws_raw() { page "$1" ws-raw.js "__WSID__=$(wsid)" "__MSG__=$2"; }
+socket_token() {
+  api "$1" auth/mintWorkspaceSocketToken "{\"workspaceId\":\"$(wsid)\"}" |
+    pyj "d['body']['json'].get('token') or ''"
+}
 opaque_submit_b64() {
-  node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "$5" "$6"
+  local token; token="$(socket_token "$1")"
+  node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "$5" "$6" "$token"
 }
 opaque_submit_text() {
   local b64; b64="$(printf '%s' "$6" | base64 | tr -d '\n')"
   opaque_submit_b64 "$1" "$2" "$3" "$4" "$5" "$b64"
 }
-opaque_oversize() { node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "" --oversize; }
+opaque_oversize() {
+  local token; token="$(socket_token "$1")"
+  node "$LIB/opaque-submit-node.mjs" "$URL" "$(wsid)" "$2" "$3" "$4" "" --oversize "$token"
+}
 
 type_text() { page "$1" type-text.js "__TEXT__=$2" "__WHERE__=${3:-start}"; }
 editor_text() { page "$1" editor-text.js | pyj "d['text']"; }
