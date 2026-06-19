@@ -47,10 +47,9 @@ export default async function list(args: string[], globals: GlobalFlags): Promis
     console.log(
       renderHelp({
         name: 'glovebox list',
-        summary: 'list registered mounts and their daemon state',
+        summary: "list your mounts and whether they're running",
         usage: 'glovebox list [options]',
-        description:
-          'Shows every registered mount with a ● running / ○ stopped daemon indicator\nand the holder pid. Works offline — daemon state is read from the lockfile.',
+        description: 'Lists your mounts with a ● running / ○ stopped indicator. Works offline.',
         examples: ['glovebox list', 'glovebox --json list'],
       }),
     )

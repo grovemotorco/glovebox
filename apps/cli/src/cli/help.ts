@@ -1,5 +1,5 @@
 import type { RootCommand } from './index.ts'
-import type { NextAction } from './envelope.ts'
+import { CliError, type NextAction } from './envelope.ts'
 import { DEFAULT_SERVER_URL } from '../lib/url.ts'
 import pkg from '../../package.json' with { type: 'json' }
 
@@ -16,7 +16,7 @@ export function getVersion(): string {
  * whole surface (the inconsistency the pre-overhaul per-command strings had).
  */
 export interface CommandHelp {
-  /** Fully-qualified invocation, e.g. `glovebox auth device`. */
+  /** Fully-qualified invocation, e.g. `glovebox auth login`. */
   name: string
   /** One-line tagline shown after the em-dash on the title row. */
   summary: string
@@ -59,8 +59,8 @@ export function buildCommandTree(commands: RootCommand[]): CommandTree {
       })),
     nextActions: [
       {
-        command: 'glovebox auth device --workspace <id>',
-        description: 'Sign in (browser device flow)',
+        command: 'glovebox auth login --workspace <id>',
+        description: 'Sign in (opens a browser)',
       },
       {
         command: 'glovebox <command> --help',
@@ -114,6 +114,72 @@ export function renderHelp(help: CommandHelp): string {
   return lines.join('\n')
 }
 
+/** One row in a group command's subcommand index (`auth --help`). */
+export interface GroupSubcommand {
+  /** Bare subcommand name, e.g. `login`. */
+  name: string
+  summary: string
+  /** Short parenthesized tag after the summary, e.g. `dev`. */
+  tag?: string
+}
+
+/**
+ * Declarative spec for a group command's `--help` screen. Group help is a thin
+ * index — name + one-line summary per subcommand — and defers every option,
+ * usage shape, and example to the leaf `<sub> --help`. This keeps the flag set
+ * in exactly one place (the leaf {@link CommandHelp}), so the two can't drift,
+ * and the index stays aligned no matter how many flags a subcommand grows.
+ */
+export interface GroupHelp {
+  /** Fully-qualified group name, e.g. `glovebox auth`. */
+  name: string
+  summary: string
+  subcommands: GroupSubcommand[]
+  /** Optional group-level prose shown after the index (newlines preserved). */
+  note?: string
+}
+
+/** Render a {@link GroupHelp} to the shared, aligned subcommand-index layout. */
+export function renderGroupHelp(group: GroupHelp): string {
+  const lines: string[] = [`${group.name} — ${group.summary}`, '', 'Subcommands:']
+  const pad = Math.max(...group.subcommands.map((s) => s.name.length)) + 2
+  for (const sub of group.subcommands) {
+    lines.push(`  ${sub.name.padEnd(pad)}${sub.summary}${sub.tag ? ` (${sub.tag})` : ''}`)
+  }
+  if (group.note) lines.push('', group.note.trim())
+  lines.push('', `Run \`${group.name} <subcommand> --help\` for a subcommand's options.`)
+  return lines.join('\n')
+}
+
+/**
+ * Build the {@link CliError} for an unrecognized subcommand of a group command.
+ * Throwing this (rather than printing inline) routes it through the one
+ * top-level renderer, so it honors `--json`, carries a `--help` `fix`, and — when
+ * one is close enough — a `Did you mean` suggestion plus a runnable next action.
+ * Mirrors the unknown top-level command handling in `cli/index.ts`.
+ */
+export function unknownSubcommand(group: string, sub: string, names: string[]): CliError {
+  const suggestion = getSuggestion(sub, names)
+  return new CliError(
+    suggestion
+      ? `Unknown ${group} subcommand: ${sub}. Did you mean "${suggestion}"?`
+      : `Unknown ${group} subcommand: ${sub}`,
+    {
+      fix: `Run \`glovebox ${group} --help\` for usage.`,
+      ...(suggestion
+        ? {
+            nextActions: [
+              {
+                command: `glovebox ${group} ${suggestion}`,
+                description: 'Run the closest matching subcommand',
+              },
+            ],
+          }
+        : {}),
+    },
+  )
+}
+
 export function printUsage(commands: RootCommand[]): void {
   const visible = commands.filter((c) => !c.hidden)
   const groups = [...new Set(visible.map((c) => c.group))]
@@ -125,7 +191,7 @@ export function printUsage(commands: RootCommand[]): void {
     'Usage: glovebox [--json|--human] <command> [options]',
     '',
     'Getting started:',
-    '  glovebox auth device --workspace <id>   Sign in (opens a browser)',
+    '  glovebox auth login --workspace <id>    Sign in (opens a browser)',
     '  glovebox workspaces list                Find your workspace IDs',
     '  glovebox mount ./notes --workspace <id> Bind a directory',
     '  glovebox run ./notes                    Start syncing',
@@ -148,14 +214,9 @@ export function printUsage(commands: RootCommand[]): void {
     '  --help, -h      Show this help message',
     '  --version, -V   Show version',
     '',
-    'Configuration (override the dir with GLOVEBOX_HOME):',
-    '  ~/.glovebox/auth.json     Stored tokens (0600)',
-    '  ~/.glovebox/config.json   Default server + preferences',
-    '  ~/.glovebox/mounts.json   Registered mounts',
-    '',
     'Environment:',
-    '  GLOVEBOX_SERVER_URL   Default server URL (an explicit --server still wins)',
-    '  GLOVEBOX_HOME         Override the ~/.glovebox config directory',
+    '  GLOVEBOX_SERVER_URL   Default server URL',
+    '  GLOVEBOX_HOME         Config directory (default: ~/.glovebox)',
     '',
     `Default server: ${DEFAULT_SERVER_URL}   ·   Diagnose: glovebox doctor`,
   )

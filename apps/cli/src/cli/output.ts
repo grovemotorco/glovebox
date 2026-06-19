@@ -62,14 +62,22 @@ export function printError(msg: string): void {
  */
 export function printCommandError(error: unknown, mode: OutputMode): void {
   const envelope = toErrorEnvelope(error)
-  const fix = error instanceof CliError ? error.fix : undefined
-  const nextActions = error instanceof CliError ? error.nextActions : undefined
+  const isCli = error instanceof CliError
+  const fix = isCli ? error.fix : undefined
+  const nextActions = isCli ? error.nextActions : undefined
+  // Our own CliErrors already carry a fix/suggestion; for foreign errors (node
+  // arg-parse failures, network errors) derive the equivalent from the message
+  // so they're just as actionable — and in both output modes, since a piped
+  // agent now reads the JSON envelope on failure too.
+  const guidance = isCli ? {} : deriveErrorGuidance(error)
+  const effectiveFix = fix ?? guidance.fix
   if (mode === 'json') {
     console.error(
       JSON.stringify(
         {
           error: envelope,
-          ...(fix ? { fix } : {}),
+          ...(guidance.suggestion ? { suggestion: guidance.suggestion } : {}),
+          ...(effectiveFix ? { fix: effectiveFix } : {}),
           ...(nextActions && nextActions.length > 0 ? { nextActions } : {}),
         },
         null,
@@ -79,7 +87,8 @@ export function printCommandError(error: unknown, mode: OutputMode): void {
     return
   }
   printError(envelope.code ? `${envelope.message} (${envelope.code})` : envelope.message)
-  if (fix) printHint(fix)
+  if (guidance.suggestion) printHint(`Did you mean "${guidance.suggestion}"?`)
+  if (effectiveFix) printHint(effectiveFix)
 }
 
 export function printWarn(msg: string): void {
@@ -104,4 +113,89 @@ export function printSuccess(msg: string): void {
 /** Dim follow-up guidance on stderr (keeps stdout/JSON clean). */
 export function printHint(msg: string): void {
   console.error(`${stderrColors.dim}${msg}${stderrColors.reset}`)
+}
+
+/**
+ * Known flags across the whole CLI surface, for "did you mean" on an unknown
+ * option. The failing subcommand's strict parser only reports the bad flag, not
+ * its own option set, so we match against this global list — a small accepted
+ * trade-off: a flag valid on a *different* command can still be suggested.
+ */
+const KNOWN_FLAGS = [
+  '--json',
+  '--human',
+  '--no-json',
+  '--help',
+  '--version',
+  '--server',
+  '--workspace',
+  '--scope',
+  '--purpose',
+  '--timeout-ms',
+  '--token',
+  '--slug',
+  '--fix',
+  '--force',
+  '--secret',
+  '--principal',
+  '--principal-type',
+  '--role',
+  '--owner',
+  '--epoch',
+  '--ttl-hours',
+  '--save',
+  '--file-id',
+  '--rescan-interval',
+] as const
+
+/**
+ * Turn a foreign error message into the same suggestion/fix our own CliErrors
+ * carry: an unknown `--flag` gets the closest known flag plus a `--help` pointer;
+ * a failed fetch gets a reachability hint. Returns {} when nothing matches.
+ */
+function deriveErrorGuidance(error: unknown): { suggestion?: string; fix?: string } {
+  const message = error instanceof Error ? error.message : String(error)
+  const unknownOption = /Unknown option '(--[^']+)'/.exec(message)?.[1]
+  if (unknownOption) {
+    const suggestion = suggestFlag(unknownOption)
+    return {
+      ...(suggestion ? { suggestion } : {}),
+      fix: 'Run the command with --help for its options.',
+    }
+  }
+  if (message === 'fetch failed') {
+    return {
+      fix: "Couldn't reach the server. Check the URL is right and online — run `glovebox doctor`.",
+    }
+  }
+  return {}
+}
+
+/** Closest known flag within edit distance 3, else null. */
+function suggestFlag(input: string): string | null {
+  let best: { flag: string; distance: number } | null = null
+  for (const flag of KNOWN_FLAGS) {
+    const distance = levenshtein(input, flag)
+    if (distance > 3) continue
+    if (!best || distance < best.distance) best = { flag, distance }
+  }
+  return best?.flag ?? null
+}
+
+/** Levenshtein edit distance between two strings. */
+function levenshtein(a: string, b: string): number {
+  const m = a.length
+  const n = b.length
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array<number>(n + 1).fill(0))
+  for (let i = 0; i <= m; i++) dp[i]![0] = i
+  for (let j = 0; j <= n; j++) dp[0]![j] = j
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i]![j] =
+        a[i - 1] === b[j - 1]
+          ? dp[i - 1]![j - 1]!
+          : 1 + Math.min(dp[i - 1]![j]!, dp[i]![j - 1]!, dp[i - 1]![j - 1]!)
+    }
+  }
+  return dp[m]![n]!
 }

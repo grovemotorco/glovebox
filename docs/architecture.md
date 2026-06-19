@@ -78,7 +78,7 @@ sequenceDiagram
   participant Browser
   participant DO as WorkspaceDO
 
-  CLI->>Worker: auth device (start)
+  CLI->>Worker: auth login → deviceStart
   Worker-->>CLI: verification URL + user code
   Browser->>Worker: approve device
   CLI->>Worker: poll until approved

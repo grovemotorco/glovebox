@@ -137,13 +137,12 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
         summary: 'merge local edits into the live document',
         usage: 'glovebox push <path> [options]',
         description:
-          'Merges your edits (diffed against the recorded base from `glovebox pull`)\n' +
-          'into the live document server-side; concurrent edits are preserved. On a\n' +
-          'clean merge the local file and base advance to the merged result.\n\n' +
-          'Exit codes: 0 clean · 2 failed hunks (printed verbatim; base unchanged) ·\n' +
-          '3 degenerate-rewrite refused (use --force only intentionally) · 1 other.',
+          'Merges your local edits back into the live document, preserving other\n' +
+          "people's concurrent changes. Pull the file first if you haven't.\n\n" +
+          'Exit codes: 0 clean · 2 some changes could not be applied (re-pull and\n' +
+          'retry) · 3 looks like a destructive rewrite, refused (use --force) · 1 other.',
         options: [
-          ['--force', 'Apply even a degenerate rewrite (>60% deletion)'],
+          ['--force', 'Apply even when it looks like a destructive rewrite (>60% deleted)'],
           ['-s, --server <url>', 'Server URL (default: the server recorded at pull time)'],
         ],
         examples: ['glovebox push docs/note.md', 'glovebox push docs/note.md --force'],
@@ -218,7 +217,7 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
       // A real failure (auth, missing base, unreadable file): route through the
       // top-level renderer so it honors --json and carries a fix.
       throw new CliError(outcome.error, {
-        fix: 'usually `glovebox pull` the file first, or refresh credentials with `glovebox auth device`',
+        fix: 'usually `glovebox pull` the file first, or refresh credentials with `glovebox auth login`',
       })
   }
 }

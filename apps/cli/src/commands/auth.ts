@@ -7,8 +7,8 @@ import {
 } from '@glovebox.md/api'
 import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import type { GlobalFlags } from '../cli/index.ts'
-import { withNextActions } from '../cli/envelope.ts'
-import { type CommandHelp, renderHelp } from '../cli/help.ts'
+import { CliError, withNextActions } from '../cli/envelope.ts'
+import { type CommandHelp, renderGroupHelp, renderHelp, unknownSubcommand } from '../cli/help.ts'
 import {
   printError,
   printJson,
@@ -17,27 +17,27 @@ import {
   resolveOutputMode,
   usageError,
 } from '../cli/output.ts'
-import { colors, stderrColors } from '../cli/colors.ts'
+import { stderrColors } from '../cli/colors.ts'
 import {
   decodeTokenClaims,
   getToken,
-  loadAuth,
   removeToken,
   saveToken,
   type DecodedTokenClaims,
 } from '../lib/auth-store.ts'
-import { loadConfig, resolveServerUrl, setDefaultServer } from '../lib/config.ts'
+import { resolveServerUrl, setDefaultServer } from '../lib/config.ts'
 import { gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
 import { normalizeServerUrl } from '../lib/url.ts'
 import whoamiCommand from './whoami.ts'
 
 /**
  * Token STORAGE + the default-server preference. Minting belongs to the
- * product server (overlook, the auth/sessions boundary); `auth device` runs
- * the browser device flow and stores the returned `gbx_` key, while the
- * labeled `mint-dev` helper signs locally with a supplied `WS_AUTH_SECRET`
- * for dev workers and tests. A successful login also records the server as
- * the default so later commands need no `--server` (see `lib/config.ts`).
+ * product server (overlook, the auth/sessions boundary); `auth login` runs the
+ * browser device flow and stores the returned `gbx_` key (or, with
+ * `--with-token`, stores a token piped on stdin), while the labeled `mint-dev`
+ * helper signs locally with a supplied `WS_AUTH_SECRET` for dev workers and
+ * tests. A successful login also records the server as the default so later
+ * commands need no `--server` (see `lib/config.ts`).
  */
 
 interface CommandOptions {
@@ -67,51 +67,12 @@ export async function runLogin(
   return { serverUrl, claims: decodeTokenClaims(token) }
 }
 
-export interface AuthStatusEntry {
-  serverUrl: string
-  savedAt: number
-  isApiKey: boolean
-  isDefault: boolean
-  claims: DecodedTokenClaims | null
-  expired: boolean | null
-}
-
-export async function runAuthStatus(options: CommandOptions = {}): Promise<{
-  defaultServer: string | null
-  servers: AuthStatusEntry[]
-}> {
-  const paths = options.paths ?? gloveboxPaths()
-  const auth = await loadAuth(paths)
-  const defaultServer = (await loadConfig(paths)).defaultServer ?? null
-  const servers = Object.entries(auth.servers).map(([serverUrl, record]) => {
-    const claims = decodeTokenClaims(record.token)
-    return {
-      serverUrl,
-      savedAt: record.savedAt,
-      isApiKey: record.token.startsWith('gbx_'),
-      isDefault: serverUrl === defaultServer,
-      claims,
-      expired: claims ? claims.exp <= Date.now() : null,
-    }
-  })
-  return { defaultServer, servers }
-}
-
 export async function runLogout(
   options: { server?: string } & CommandOptions,
 ): Promise<{ serverUrl: string; removed: boolean }> {
   const paths = options.paths ?? gloveboxPaths()
   const serverUrl = await resolveServerUrl(options.server, paths)
   return { serverUrl, removed: await removeToken(paths, serverUrl) }
-}
-
-export async function runAuthUse(
-  options: { server: string } & CommandOptions,
-): Promise<{ serverUrl: string }> {
-  const paths = options.paths ?? gloveboxPaths()
-  const serverUrl = normalizeServerUrl(options.server)
-  await setDefaultServer(paths, serverUrl)
-  return { serverUrl }
 }
 
 export async function runAuthToken(
@@ -230,13 +191,16 @@ export async function runMintDev(
   return { serverUrl, token, saved: options.save ?? false }
 }
 
-/** Token to store: --token flag, else piped stdin (never echoed prompts). */
-async function resolveTokenInput(flagValue: string | undefined): Promise<string> {
-  if (flagValue) {
-    return flagValue
-  }
+/**
+ * Read a pre-minted token for `auth login --with-token`. Stdin ONLY — never an
+ * argv flag — so the secret can't leak into `ps` output or shell history (the
+ * `gh auth login --with-token` convention). It is never echoed.
+ */
+async function readTokenFromStdin(): Promise<string> {
   if (process.stdin.isTTY) {
-    throw new Error('pass --token <t> or pipe the token on stdin')
+    throw new CliError('No token on stdin.', {
+      fix: 'Pipe a token: `echo "$GLOVEBOX_TOKEN" | glovebox auth login --with-token`.',
+    })
   }
   let data = ''
   for await (const chunk of process.stdin) {
@@ -244,33 +208,45 @@ async function resolveTokenInput(flagValue: string | undefined): Promise<string>
   }
   const token = data.trim()
   if (!token) {
-    throw new Error('no token on stdin')
+    throw new CliError('No token on stdin.', {
+      fix: 'Pipe a non-empty token: `echo "$GLOVEBOX_TOKEN" | glovebox auth login --with-token`.',
+    })
   }
   return token
 }
 
-const HELP = `glovebox auth — manage credentials and the default server
+/**
+ * Group help is a thin index — name + summary per subcommand — and defers each
+ * subcommand's flags/usage/examples to `auth <sub> --help` (the AUTH_SUBHELP
+ * leaf specs), so the option set lives in exactly one place. `whoami` is not
+ * listed: it's the top-level `glovebox whoami`, not an auth subcommand (the
+ * `whoami` case below stays only as a back-compat passthrough).
+ */
+const HELP = renderGroupHelp({
+  name: 'glovebox auth',
+  summary: 'manage credentials and the default server',
+  subcommands: [
+    { name: 'login', summary: 'sign in (browser device flow, or --with-token from stdin)' },
+    { name: 'logout', summary: 'forget a stored token' },
+    { name: 'token', summary: 'print the stored token (for scripting)' },
+    { name: 'mint-dev', summary: 'sign a workspace token locally', tag: 'dev' },
+  ],
+})
 
-Usage:
-  glovebox auth device [--workspace <id>...] [--server <url>] [--scope <s>...]
-                                          browser device login; stores a gbx_ key
-  glovebox whoami [--server <url>]        show your identity and workspaces
-  glovebox auth status                    list stored credentials (decoded, not verified)
-  glovebox auth use <url>                 set the default server for later commands
-  glovebox auth token [--server <url>]    print the stored token (for scripting)
-  glovebox auth login [--server <url>] [--token <t>]
-                                          store a pre-minted token (or pipe on stdin)
-  glovebox auth logout [--server <url>]   forget a token
+/** Dispatchable auth subcommands, for "did you mean" on a typo. Includes the
+ * `whoami` passthrough even though it's omitted from the displayed index. */
+const AUTH_SUBCOMMANDS = ['login', 'logout', 'token', 'mint-dev', 'whoami']
 
-The server is chosen by: --server flag → GLOVEBOX_SERVER_URL → the default
-set at login (config) → the built-in default. A successful login records the
-default, so most commands afterward need no --server.
-
-Run \`glovebox auth <command> --help\` for a subcommand's options.
-
-Dev:
-  glovebox auth mint-dev --secret <s> --workspace <id> [--save] [...]
-                                          sign a token locally (dev workers/tests only)`
+/**
+ * Subcommands removed in the auth-flow consolidation, mapped to a migration
+ * hint. Routed before the generic "did you mean" so users running the old names
+ * get a precise pointer instead of a fuzzy guess.
+ */
+const REMOVED_SUBCOMMANDS: Record<string, string> = {
+  device: 'Use `glovebox auth login` — the browser device flow is now the default.',
+  status: 'Removed. Use `glovebox whoami` (verified identity) or `glovebox doctor` (local state).',
+  use: 'Removed. Login sets the default server; override per-command with --server or GLOVEBOX_SERVER_URL.',
+}
 
 /**
  * Per-subcommand help screens. The dispatcher routes `auth <sub> --help` here
@@ -279,36 +255,26 @@ Dev:
  * absent: it forwards to the `whoami` command, which renders its own help.
  */
 const AUTH_SUBHELP: Record<string, CommandHelp> = {
-  device: {
-    name: 'glovebox auth device',
-    summary: 'browser device login; stores a gbx_ API key',
-    usage: 'glovebox auth device [--workspace <id>]... [options]',
+  login: {
+    name: 'glovebox auth login',
+    summary: 'sign in to a Glovebox server',
+    usage: [
+      'glovebox auth login [--workspace <id>]... [options]',
+      'echo "$GLOVEBOX_TOKEN" | glovebox auth login --with-token',
+    ],
     description:
-      'Runs the browser device-authorization flow: prints a verification URL and\ncode, polls until you approve, then stores the returned gbx_ key and records\nthe server as your default.',
+      'Signs in and records the server as your default. By default runs the browser\ndevice flow — prints a verification URL and code, polls until you approve, then\nstores the returned gbx_ key. With --with-token, stores a token piped on stdin\ninstead (never echoed, never passed on argv).',
     options: [
-      ['-w, --workspace <id>', 'Scope the key to a workspace (repeatable; empty = account-scoped)'],
+      ['-w, --workspace <id>', 'Scope the key to a workspace (repeatable; omit = account-scoped)'],
       ['-s, --server <url>', 'Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
       ['--scope <s>', 'Capability scope (repeatable; default workspace:read + workspace:write)'],
       ['--purpose <p>', 'Key purpose: cli, agent, or api (default cli)'],
+      ['--with-token', 'Store a pre-minted token read from stdin instead of the browser flow'],
     ],
     examples: [
-      'glovebox auth device --workspace ws_abc123',
-      'glovebox auth device -w ws_abc123 --server https://api.glovebox.test',
-    ],
-  },
-  login: {
-    name: 'glovebox auth login',
-    summary: 'store a pre-minted token',
-    usage: 'glovebox auth login [--token <t>] [options]',
-    description:
-      'Stores a token you already hold (and records the server as your default).\nPass it with --token, or pipe it on stdin — it is never echoed.',
-    options: [
-      ['-t, --token <t>', 'The token to store (or pipe it on stdin)'],
-      ['-s, --server <url>', 'Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
-    ],
-    examples: [
-      'glovebox auth login --token gbx_… --server https://api.glovebox.test',
-      'pbpaste | glovebox auth login',
+      'glovebox auth login --workspace ws_abc123',
+      'glovebox auth login -w ws_abc123 --server https://api.glovebox.test',
+      'echo "$GLOVEBOX_TOKEN" | glovebox auth login --with-token',
     ],
   },
   logout: {
@@ -319,22 +285,6 @@ const AUTH_SUBHELP: Record<string, CommandHelp> = {
       ['-s, --server <url>', 'Server whose token to forget (default: the resolved server)'],
     ],
     examples: ['glovebox auth logout', 'glovebox auth logout --server https://api.glovebox.test'],
-  },
-  status: {
-    name: 'glovebox auth status',
-    summary: 'list stored credentials (decoded, not verified)',
-    usage: 'glovebox auth status',
-    description:
-      'Lists every server you have a stored token for, with the decoded claims when\navailable. Offline — it never contacts a server (use `glovebox whoami` for the\nverified, online identity).',
-    examples: ['glovebox auth status', 'glovebox --json auth status'],
-  },
-  use: {
-    name: 'glovebox auth use',
-    summary: 'set the default server for later commands',
-    usage: 'glovebox auth use <url>',
-    description: 'Records <url> as the default server, so later commands need no --server.',
-    args: [['url', 'The server URL to make default']],
-    examples: ['glovebox auth use https://api.glovebox.test'],
   },
   token: {
     name: 'glovebox auth token',
@@ -392,48 +342,46 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
         args: rest,
         options: {
           server: { type: 'string', short: 's' },
-          token: { type: 'string', short: 't' },
-        },
-        strict: true,
-      })
-      const token = await resolveTokenInput(values.token)
-      const result = await runLogin({ server: values.server, token })
-      if (mode === 'json') {
-        printJson(
-          withNextActions(result, [
-            {
-              command: 'glovebox whoami',
-              description: 'Verify the stored identity against the server',
-            },
-          ]),
-        )
-      } else {
-        printSuccess(`Token stored for ${result.serverUrl} (now the default server)`)
-        if (result.claims) {
-          console.log(`  Principal: ${result.claims.principalId}`)
-          console.log(`  Workspace: ${result.claims.workspaceId}`)
-          console.log(`  Expires:   ${new Date(result.claims.exp).toISOString()}`)
-        }
-      }
-      return
-    }
-    case 'device': {
-      const { values } = parseArgs({
-        args: rest,
-        options: {
-          server: { type: 'string', short: 's' },
           workspace: { type: 'string', short: 'w', multiple: true },
           scope: { type: 'string', multiple: true },
           purpose: { type: 'string' },
+          'with-token': { type: 'boolean', default: false },
           'timeout-ms': { type: 'string' },
         },
         strict: true,
       })
+
+      // --with-token: store a token piped on stdin (the secret never touches
+      // argv). Otherwise run the browser device flow — the default sign-in.
+      if (values['with-token']) {
+        const token = await readTokenFromStdin()
+        const result = await runLogin({ server: values.server, token })
+        if (mode === 'json') {
+          printJson(
+            withNextActions(result, [
+              {
+                command: 'glovebox whoami',
+                description: 'Verify the stored identity against the server',
+              },
+            ]),
+          )
+        } else {
+          printSuccess(`Token stored for ${result.serverUrl} (now the default server)`)
+          if (result.claims) {
+            console.log(`  Principal: ${result.claims.principalId}`)
+            console.log(`  Workspace: ${result.claims.workspaceId}`)
+            console.log(`  Expires:   ${new Date(result.claims.exp).toISOString()}`)
+          }
+        }
+        return
+      }
+
+      // Empty = an account-scoped key; --workspace narrows it. The server (not
+      // the CLI) decides what an empty scope grants.
+      const workspaceIds = values.workspace ?? []
       const result = await runDeviceLogin({
         server: values.server,
-        // Empty = an account-scoped key; --workspace narrows it. The server
-        // (not the CLI) decides what an empty scope grants.
-        workspaceIds: values.workspace ?? [],
+        workspaceIds,
         scopes: values.scope,
         purpose: parseKeyPurpose(values.purpose),
         timeoutMs: values['timeout-ms'] ? Number(values['timeout-ms']) : undefined,
@@ -459,52 +407,15 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
       } else {
         printSuccess(`API key stored for ${result.serverUrl} (now the default server)`)
       }
-      return
-    }
-    case 'status': {
-      const result = await runAuthStatus()
-      if (mode === 'json') {
-        printJson(result)
-        return
-      }
-      if (result.servers.length === 0) {
-        console.log(
-          `${colors.dim}No stored credentials. Sign in: \`glovebox auth device --workspace <id>\`.${colors.reset}`,
+      // An account-scoped key can't list or open workspaces — warn (to stderr,
+      // so JSON stdout stays clean) and point at the fix.
+      if (workspaceIds.length === 0) {
+        printWarn(
+          'Signed in account-scoped (no --workspace). Per-workspace commands ' +
+            '(pull/push/run) need a workspace-scoped key — re-run ' +
+            '`glovebox auth login --workspace <id>`.',
         )
-        return
       }
-      for (const entry of result.servers) {
-        const kind = entry.isApiKey
-          ? 'api key'
-          : entry.expired === null
-            ? 'token'
-            : entry.expired
-              ? `${colors.red}EXPIRED${colors.reset}`
-              : 'valid'
-        const star = entry.isDefault ? ` ${colors.green}(default)${colors.reset}` : ''
-        console.log(`${colors.bold}${entry.serverUrl}${colors.reset} [${kind}]${star}`)
-        if (entry.claims) {
-          console.log(`  Principal: ${entry.claims.principalId}`)
-          console.log(`  Workspace: ${entry.claims.workspaceId}`)
-          console.log(`  Epoch:     ${entry.claims.epoch}`)
-          console.log(`  Expires:   ${new Date(entry.claims.exp).toISOString()}`)
-        } else if (entry.isApiKey) {
-          console.log(
-            `  ${colors.dim}Run \`glovebox whoami\` to resolve this key's identity.${colors.reset}`,
-          )
-        }
-      }
-      return
-    }
-    case 'use': {
-      const { positionals } = parseArgs({ args: rest, allowPositionals: true, strict: true })
-      const target = positionals[0]
-      if (!target) {
-        return usageError('auth use requires a <url>', 'glovebox auth use')
-      }
-      const result = await runAuthUse({ server: target })
-      if (mode === 'json') printJson(result)
-      else printSuccess(`Default server set to ${result.serverUrl}`)
       return
     }
     case 'token': {
@@ -587,10 +498,13 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
       }
       return
     }
-    default:
-      printError(`Unknown auth subcommand: ${sub}`)
-      console.log(HELP)
-      process.exitCode = 1
+    default: {
+      const migration = REMOVED_SUBCOMMANDS[sub]
+      if (migration) {
+        throw new CliError(`\`glovebox auth ${sub}\` has been removed.`, { fix: migration })
+      }
+      throw unknownSubcommand('auth', sub, AUTH_SUBCOMMANDS)
+    }
   }
 }
 

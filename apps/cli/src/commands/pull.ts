@@ -75,13 +75,13 @@ export default async function pull(args: string[], globals: GlobalFlags): Promis
     console.log(
       renderHelp({
         name: 'glovebox pull',
-        summary: "fetch a file's working text and record the merge base",
+        summary: "download a file's latest text for local editing",
         usage: [
           'glovebox pull <path> --workspace <id> [options]',
           'glovebox pull --file-id <fileId> --workspace <id> [options]',
         ],
         description:
-          'Writes the file at its workspace-relative path under the current directory\nand records the merge base in .glovebox/<fileId>/ (never edit that). Push\nedits back with `glovebox push <path>`.',
+          'Downloads the file to its path under the current directory so you can edit it\nlocally. Push your edits back with `glovebox push <path>`.',
         options: [
           ['-w, --workspace <id>', 'Workspace ID (required)'],
           ['--file-id <id>', 'Pull by file ID instead of path'],

@@ -6,8 +6,8 @@ import { DEFAULT_SERVER_URL, normalizeServerUrl } from './url.ts'
  * `~/.glovebox/config.json` — non-secret CLI preferences. Today it holds one
  * thing: `defaultServer`, the server a bare command targets when neither
  * `--server` nor `GLOVEBOX_SERVER_URL` is set. It is written by the first
- * successful login (`auth device`/`auth login`) and by `auth use`, so the
- * common single-server workflow needs no flags after sign-in. Tokens live in
+ * successful `auth login`, so the common single-server workflow needs no flags
+ * after sign-in. Tokens live in
  * `auth.json`; this file never holds secrets. A corrupt file degrades to "no
  * preferences", never a crash (loro-2 discipline, same as the registry).
  */

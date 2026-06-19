@@ -38,7 +38,7 @@ export const COMMANDS: RootCommand[] = [
     name: 'auth',
     group: 'Setup',
     summary: 'Manage credentials and the default server',
-    detail: 'device · login · whoami · status · use · token · logout',
+    detail: 'login · logout · token',
     run: auth,
   },
   {
@@ -64,43 +64,43 @@ export const COMMANDS: RootCommand[] = [
   {
     name: 'mount',
     group: 'Sync',
-    summary: 'Register a directory ↔ workspace binding (no process starts)',
+    summary: 'Bind a local directory to a workspace',
     run: mount,
   },
   {
     name: 'run',
     group: 'Sync',
-    summary: 'Run the sync daemon for a mount in the foreground',
+    summary: 'Start syncing a mount (runs in the foreground)',
     run: run,
   },
   {
     name: 'list',
     group: 'Sync',
-    summary: 'List registered mounts and their daemon state',
+    summary: "List your mounts and whether they're running",
     run: list,
   },
   {
     name: 'status',
     group: 'Sync',
-    summary: 'Show sync status for a mount (works without a running daemon)',
+    summary: "Show a mount's sync status",
     run: status,
   },
   {
     name: 'unmount',
     group: 'Sync',
-    summary: 'Remove a mount binding and its daemon state (keeps your files)',
+    summary: 'Remove a mount binding (keeps your files)',
     run: unmount,
   },
   {
     name: 'pull',
     group: 'Files',
-    summary: "Fetch a file's working text and record the merge base",
+    summary: "Download a file's latest text for local editing",
     run: pull,
   },
   {
     name: 'push',
     group: 'Files',
-    summary: 'Merge local edits into the live document (exit 0/2/3/1)',
+    summary: 'Merge your local edits back into the live document',
     run: push,
   },
 ]
@@ -167,18 +167,18 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   // `main` already consumed (and spliced) the global flags from its own argv
-  // copy; re-derive them here from the untouched process.argv. Diagnostics stay
-  // human unless JSON is explicitly requested: the non-TTY→JSON default is for a
-  // command's *data*, not its errors. `printCommandError` always writes to
-  // stderr, so a piped/redirected stdout is never polluted with an error.
+  // copy; re-derive them here from the untouched process.argv. Errors follow the
+  // SAME resolution as data — interactive TTYs get the human "error: …" line,
+  // while piped/`--json` callers get the JSON `{ error, fix, nextActions }`
+  // envelope. Otherwise an agent piping us reads JSON on success but unparseable
+  // prose on failure, exactly when `fix`/`nextActions` matter most.
+  // `printCommandError` always writes to stderr, so a piped/redirected stdout is
+  // never polluted with an error.
   const argv = process.argv.slice(2)
-  const mode = resolveOutputMode(
-    {
-      json: argv.includes('--json'),
-      human: argv.includes('--human') || argv.includes('--no-json'),
-    },
-    { defaultMode: 'human' },
-  )
+  const mode = resolveOutputMode({
+    json: argv.includes('--json'),
+    human: argv.includes('--human') || argv.includes('--no-json'),
+  })
   printCommandError(err, mode)
   process.exitCode = 1
 })

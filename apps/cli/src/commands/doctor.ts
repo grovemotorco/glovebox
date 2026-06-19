@@ -71,9 +71,9 @@ export async function runDoctor(
   checks.push({
     name: 'Credentials',
     // Missing credentials is a warning, not a failure: `doctor` is often the
-    // first thing run, before `auth device`.
+    // first thing run, before `auth login`.
     status: hasToken ? 'ok' : 'warn',
-    detail: hasToken ? 'token stored' : 'none — run `glovebox auth device --workspace <id>`',
+    detail: hasToken ? 'token stored' : 'none — run `glovebox auth login --workspace <id>`',
   })
 
   let reachable = false
@@ -173,7 +173,7 @@ export default async function doctor(args: string[], globals: GlobalFlags): Prom
     }
     if (result.checks.find((check) => check.name === 'Credentials')?.status === 'warn') {
       nextActions.push({
-        command: 'glovebox auth device --workspace <id>',
+        command: 'glovebox auth login --workspace <id>',
         description: 'Sign in to the resolved server',
       })
     }
