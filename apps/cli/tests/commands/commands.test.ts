@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { verifyWorkspaceToken } from '@glovebox.md/sync/server'
 import { LoroFileDoc, bytesToBase64 } from '@glovebox.md/sync/loro'
 import {
+  DELETE_RESOLUTION_ARTIFACT,
   NodeDaemonStorage,
+  STATE_ARTIFACT,
   envelopeName,
   type DaemonWorkspaceState,
 } from '@glovebox.md/sync/daemon'
@@ -15,6 +17,7 @@ import { runMount } from '../../src/commands/mount.ts'
 import { runList } from '../../src/commands/list.ts'
 import { resolveWorkspaceSocketToken } from '../../src/commands/run.ts'
 import { runStatus } from '../../src/commands/status.ts'
+import { runSyncDeletes } from '../../src/commands/sync.ts'
 import { runUnmount } from '../../src/commands/unmount.ts'
 import authCommand, {
   runDeviceLoginWithClient,
@@ -61,7 +64,7 @@ describe('mount / list / unmount', () => {
 
     // Simulate daemon leftovers that unmount must clean up.
     const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
-    await storage.writeAtomic('workspace-state.json', new TextEncoder().encode('{}'))
+    await storage.writeAtomic(STATE_ARTIFACT, new TextEncoder().encode('{}'))
     await writeFile(join(mountDir, '.glovebox.json'), '{"workspaceId":"ws-1"}\n')
 
     const removed = await runUnmount(mountDir, { paths })
@@ -191,7 +194,7 @@ describe('status', () => {
       ],
     }
     const encoder = new TextEncoder()
-    await storage.writeAtomic('workspace-state.json', encoder.encode(JSON.stringify(state)))
+    await storage.writeAtomic(STATE_ARTIFACT, encoder.encode(JSON.stringify(state)))
     await storage.writeAtomic(
       envelopeName('f-synced'),
       encoder.encode(
@@ -224,6 +227,8 @@ describe('status', () => {
     expect(result.trackedFiles).toBe(3)
     expect(result.pendingPushes).toBe(1)
     expect(result.pendingRenames).toBe(1)
+    expect(result.heldDeleteIntents).toBe(1)
+    expect(result.freeDeleteIntents).toBe(1)
 
     const byPath = new Map(result.deleteIntents.map((intent) => [intent.path, intent]))
     expect(byPath.get('doomed.md')).toMatchObject({
@@ -250,8 +255,162 @@ describe('status', () => {
   })
 })
 
+describe('sync deletes', () => {
+  it('lists held and free pending deletes', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    const result = await runSyncDeletes(mountDir, { paths, env: {} })
+
+    expect(result.heldDeleteIntents).toBe(1)
+    expect(result.freeDeleteIntents).toBe(1)
+    expect(result.deleteIntents.map((intent) => [intent.path, intent.held])).toEqual([
+      ['held.md', 'bulk-window'],
+      ['free.md', null],
+    ])
+    expect(result.action).toBeNull()
+  })
+
+  it('confirms held deletes by clearing the hold and queuing a daemon wake command', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    const result = await runSyncDeletes(mountDir, {
+      action: 'confirm',
+      resolutionTarget: 'all',
+      paths,
+      env: {},
+      signalDaemon: false,
+      now: () => 123,
+    })
+
+    expect(result.action).toMatchObject({
+      type: 'confirm',
+      target: 'all',
+      matched: 1,
+      paths: ['held.md'],
+      queued: true,
+    })
+    expect(result.heldDeleteIntents).toBe(0)
+    expect(result.freeDeleteIntents).toBe(2)
+
+    const state = JSON.parse(
+      new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+    ) as DaemonWorkspaceState
+    const confirmed = state.pendingDeletes.find((intent) => intent.path === 'held.md')
+    expect(confirmed?.held).toBeUndefined()
+    expect(confirmed?.confirmedAtMs).toBe(123)
+
+    const queue = JSON.parse(
+      new TextDecoder().decode((await storage.read(DELETE_RESOLUTION_ARTIFACT))!),
+    ) as { commands: { action: string; fileIds: string[]; createdAt: number }[] }
+    expect(queue.commands).toEqual([
+      { id: expect.any(String), action: 'confirm', fileIds: ['f-held'], createdAt: 123 },
+    ])
+  })
+
+  it('restores held deletes by canceling the intent and authorizing checkout', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    const result = await runSyncDeletes(mountDir, {
+      action: 'restore',
+      resolutionTarget: 'all',
+      paths,
+      env: {},
+      signalDaemon: false,
+      now: () => 456,
+    })
+
+    expect(result.action).toMatchObject({
+      type: 'restore',
+      target: 'all',
+      matched: 1,
+      paths: ['held.md'],
+      queued: true,
+    })
+    expect(result.deleteIntents.map((intent) => intent.path)).toEqual(['free.md'])
+
+    const state = JSON.parse(
+      new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+    ) as DaemonWorkspaceState
+    expect(state.pendingDeletes.map((intent) => intent.path)).toEqual(['free.md'])
+    expect(state.files['f-held']!.lastWrittenHash).toBe('')
+
+    const queue = JSON.parse(
+      new TextDecoder().decode((await storage.read(DELETE_RESOLUTION_ARTIFACT))!),
+    ) as { commands: { action: string; fileIds: string[]; createdAt: number }[] }
+    expect(queue.commands).toEqual([
+      { id: expect.any(String), action: 'restore', fileIds: ['f-held'], createdAt: 456 },
+    ])
+  })
+})
+
 function byPathOf(result: Awaited<ReturnType<typeof runStatus>>) {
   return new Map(result.deleteIntents.map((intent) => [intent.path, intent]))
+}
+
+function deleteState(mountId: string, deviceId: string): DaemonWorkspaceState {
+  const T0 = 1_000_000
+  return {
+    workspaceId: 'ws-1',
+    mountId,
+    deviceId,
+    lastAckedSeq: 7,
+    files: {
+      'f-held': {
+        path: 'held.md',
+        contentKind: 'markdown',
+        nodeId: '0:1',
+        syncedVVB64: '',
+        lastWrittenHash: 'held-hash',
+        sizeBytes: 10,
+        savedAt: T0,
+      },
+      'f-free': {
+        path: 'free.md',
+        contentKind: 'markdown',
+        nodeId: '0:2',
+        syncedVVB64: '',
+        lastWrittenHash: 'free-hash',
+        sizeBytes: 10,
+        savedAt: T0,
+      },
+    },
+    pendingRenames: [],
+    pendingDeletes: [
+      {
+        opId: 'd-held',
+        fileId: 'f-held',
+        path: 'held.md',
+        baseSeq: 7,
+        observedMissingAtMs: T0,
+        held: 'bulk-window',
+      },
+      {
+        opId: 'd-free',
+        fileId: 'f-free',
+        path: 'free.md',
+        baseSeq: 7,
+        observedMissingAtMs: T0,
+      },
+    ],
+  }
 }
 
 describe('auth', () => {

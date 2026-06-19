@@ -204,6 +204,10 @@ export async function runRun(
 
     process.on('SIGINT', () => void shutdown(0))
     process.on('SIGTERM', () => void shutdown(0))
+    process.on('SIGUSR2', () => {
+      reporter.log('info', 'delete resolution requested; running a sync cycle')
+      void runner.kick()
+    })
 
     // Emit the start banner before starting the loop so it precedes any
     // first-cycle connection diagnostics.
@@ -262,6 +266,11 @@ function renderDaemonSyncWarning(warning: DaemonSyncWarning): string {
       const retry =
         warning.retryAfterSec === undefined ? '' : `; retry after ${warning.retryAfterSec}s`
       return `opaque sync rejected: ${warning.path} (${warning.fileId}): ${warning.reason}${retry}`
+    }
+    case 'delete-intents-held': {
+      const shown = warning.paths.slice(0, 5).join(', ')
+      const more = warning.paths.length > 5 ? `, +${warning.paths.length - 5} more` : ''
+      return `${warning.count} deletion(s) held (${warning.held}): ${shown}${more}. Review with \`glovebox sync deletes\`; release with \`glovebox sync deletes --confirm all\` or restore with \`glovebox sync deletes --restore all\`.`
     }
   }
 }

@@ -15,6 +15,7 @@ export interface DaemonCycleHost {
   start(): Promise<void>
   runCycle(): Promise<void>
   stop(): void
+  nextWakeMs?(now?: number): number | null
 }
 
 export interface DaemonRunnerOptions {
@@ -26,6 +27,8 @@ export interface DaemonRunnerOptions {
   jitterMax?: number
   /** Uniform [0,1) source for the jitter draw (seeded in tests). */
   random?: () => number
+  now?: () => number
+  wakeFloorMs?: number
   /** Timer injection for tests. */
   setTimer?: (callback: () => void, delayMs: number) => unknown
   clearTimer?: (handle: unknown) => void
@@ -40,6 +43,8 @@ export class DaemonRunner {
   readonly #jitterMin: number
   readonly #jitterMax: number
   readonly #random: () => number
+  readonly #now: () => number
+  readonly #wakeFloorMs: number
   readonly #setTimer: (callback: () => void, delayMs: number) => unknown
   readonly #clearTimer: (handle: unknown) => void
   readonly #onCycleError: (error: unknown) => void
@@ -54,6 +59,8 @@ export class DaemonRunner {
     this.#jitterMin = options.jitterMin ?? SYNC.periodicRescanJitterMin
     this.#jitterMax = options.jitterMax ?? SYNC.periodicRescanJitterMax
     this.#random = options.random ?? Math.random
+    this.#now = options.now ?? (() => Date.now())
+    this.#wakeFloorMs = options.wakeFloorMs ?? 1_000
     this.#setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs))
     this.#clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as number))
     this.#onCycleError = options.onCycleError ?? (() => {})
@@ -99,13 +106,17 @@ export class DaemonRunner {
   #schedule(): void {
     if (this.#stopped) return
     const jitter = this.#jitterMin + this.#random() * (this.#jitterMax - this.#jitterMin)
-    this.#timer = this.#setTimer(
-      () => {
-        this.#timer = null
-        void this.#enqueueCycle().then(() => this.#schedule())
-      },
-      Math.round(this.#intervalMs * jitter),
-    )
+    const periodicDelayMs = Math.round(this.#intervalMs * jitter)
+    const now = this.#now()
+    const nextWakeMs = this.#engine.nextWakeMs?.(now) ?? null
+    const delayMs =
+      nextWakeMs === null
+        ? periodicDelayMs
+        : Math.min(periodicDelayMs, Math.max(this.#wakeFloorMs, nextWakeMs - now))
+    this.#timer = this.#setTimer(() => {
+      this.#timer = null
+      void this.#enqueueCycle().then(() => this.#schedule())
+    }, delayMs)
   }
 
   #enqueueCycle(): Promise<void> {

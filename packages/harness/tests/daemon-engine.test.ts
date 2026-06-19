@@ -26,9 +26,11 @@ import {
   type WorkspaceSyncTransport,
 } from '@glovebox.md/sync/client'
 import {
+  DELETE_RESOLUTION_ARTIFACT,
   DaemonSyncEngine,
   MemoryDaemonStorage,
   type BatchSubmitResult,
+  type DaemonDeletePolicy,
   type DaemonStorage,
 } from '@glovebox.md/sync/daemon'
 import type { WorkspaceBatchWireOp } from '@glovebox.md/sync/server'
@@ -487,6 +489,7 @@ interface BootDaemonOptions {
   storage?: DaemonStorage
   deviceId?: string
   now?: () => number
+  deletePolicy?: Partial<DaemonDeletePolicy>
 }
 
 async function bootDaemon(
@@ -509,6 +512,7 @@ async function bootDaemon(
       storage,
       transport,
       now: options.now,
+      deletePolicy: options.deletePolicy,
       newFileId: () => `file-${++fileIdCounter}`,
     })
     await engine.start()
@@ -813,7 +817,10 @@ describe('DaemonSyncEngine INV-3 deletion stack', () => {
       'n/4.md': 'four\n',
     }
     const fs = MemoryFS.from(files)
-    const daemon = await bootDaemon(host, fs, { now: () => clock.nowMs })
+    const daemon = await bootDaemon(host, fs, {
+      now: () => clock.nowMs,
+      deletePolicy: { bulkMinCount: 4, bulkRatioFloor: 4, bulkRatio: 0.5 },
+    })
     await daemon.engine.runCycle()
     await daemon.engine.runCycle()
     const fileIds = daemon.engine.files().map((file) => file.fileId)
@@ -843,6 +850,88 @@ describe('DaemonSyncEngine INV-3 deletion stack', () => {
     await daemon.engine.runCycle()
     expect(daemon.engine.pendingDeletes()).toEqual([])
     expect(daemon.engine.files()).toHaveLength(4)
+  })
+
+  it('confirms a held bulk disappearance and propagates the server deletes', async () => {
+    const host = new ServerHost()
+    const clock = { nowMs: 1_750_000_000_000 }
+    const files = {
+      'n/1.md': 'one\n',
+      'n/2.md': 'two\n',
+      'n/3.md': 'three\n',
+      'n/4.md': 'four\n',
+    }
+    const fs = MemoryFS.from(files)
+    const daemon = await bootDaemon(host, fs, {
+      now: () => clock.nowMs,
+      deletePolicy: { bulkMinCount: 4, bulkRatioFloor: 4, bulkRatio: 0.5 },
+    })
+    await daemon.engine.runCycle()
+    await daemon.engine.runCycle()
+    const fileIds = daemon.engine.files().map((file) => file.fileId)
+
+    for (const path of Object.keys(files)) {
+      await fs.deletePath(path)
+    }
+    await daemon.engine.runCycle()
+    expect(daemon.engine.pendingDeletes()).toHaveLength(4)
+    expect(daemon.engine.pendingDeletes().every((intent) => intent.held === 'bulk-window')).toBe(
+      true,
+    )
+
+    await daemon.storage.writeAtomic(
+      DELETE_RESOLUTION_ARTIFACT,
+      new TextEncoder().encode(
+        JSON.stringify({
+          commands: [{ id: 'confirm-all', action: 'confirm', fileIds, createdAt: clock.nowMs }],
+        }),
+      ),
+    )
+    clock.nowMs += 31_000
+    await daemon.engine.runCycle()
+
+    expect(daemon.engine.pendingDeletes()).toEqual([])
+    expect(daemon.engine.files()).toEqual([])
+    expect((await daemon.transport.listTree()).entries).toEqual([])
+  })
+
+  it('does not launder held bulk deletes across restart', async () => {
+    const host = new ServerHost()
+    const clock = { nowMs: 1_750_000_000_000 }
+    const storage = new MemoryDaemonStorage()
+    const files = {
+      'n/1.md': 'one\n',
+      'n/2.md': 'two\n',
+      'n/3.md': 'three\n',
+      'n/4.md': 'four\n',
+    }
+    const fs = MemoryFS.from(files)
+    const daemon = await bootDaemon(host, fs, {
+      now: () => clock.nowMs,
+      storage,
+      deletePolicy: { bulkMinCount: 4, bulkRatioFloor: 4, bulkRatio: 0.5 },
+    })
+    await daemon.engine.runCycle()
+    await daemon.engine.runCycle()
+
+    for (const path of Object.keys(files)) {
+      await fs.deletePath(path)
+    }
+    await daemon.engine.runCycle()
+    expect(daemon.engine.pendingDeletes().every((intent) => intent.held === 'bulk-window')).toBe(
+      true,
+    )
+
+    await daemon.restart()
+    clock.nowMs += 120_000
+    await daemon.engine.runCycle()
+
+    const intents = daemon.engine.pendingDeletes()
+    expect(intents).toHaveLength(4)
+    expect(intents.every((intent) => intent.held === 'bulk-window')).toBe(true)
+    expect((await daemon.transport.listTree()).entries.map((entry) => entry.path).sort()).toEqual(
+      Object.keys(files).sort(),
+    )
   })
 
   it('holds a 100% wipe seen by the first scan after a restart (startup guard)', async () => {

@@ -37,6 +37,7 @@ class FakeEngine implements DaemonCycleHost {
   inFlight = 0
   maxInFlight = 0
   failNext = false
+  wakeAt: number | null = null
   /** Resolved by the test to release a blocked cycle. */
   gate: Promise<void> | null = null
 
@@ -61,6 +62,10 @@ class FakeEngine implements DaemonCycleHost {
 
   stop(): void {
     this.stopped += 1
+  }
+
+  nextWakeMs(): number | null {
+    return this.wakeAt
   }
 }
 
@@ -149,6 +154,54 @@ describe('DaemonRunner (INV-8: jittered rescan + restart scan)', () => {
     expect(timers.pending()).toBe(1) // still armed after the failure
     await timers.fireLast()
     expect(engine.cycles).toBe(2)
+    runner.stop()
+  })
+
+  it('clamps the scheduled cycle to the engine next-wake hint', async () => {
+    const timers = new FakeTimers()
+    const engine = new FakeEngine()
+    let now = 100_000
+    engine.wakeAt = 102_500
+    const runner = new DaemonRunner({
+      engine,
+      intervalMs: 10_000,
+      jitterMin: 1,
+      jitterMax: 1,
+      random: () => 0,
+      now: () => now,
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+    })
+
+    await runner.start()
+    expect(timers.scheduled[0]!.delayMs).toBe(2_500)
+
+    now = 102_500
+    engine.wakeAt = null
+    await timers.fireLast()
+    expect(engine.cycles).toBe(2)
+    expect(timers.scheduled[1]!.delayMs).toBe(10_000)
+    runner.stop()
+  })
+
+  it('floors a past-due next-wake hint instead of busy-looping', async () => {
+    const timers = new FakeTimers()
+    const engine = new FakeEngine()
+    engine.wakeAt = 99_000
+    const runner = new DaemonRunner({
+      engine,
+      intervalMs: 10_000,
+      jitterMin: 1,
+      jitterMax: 1,
+      random: () => 0,
+      now: () => 100_000,
+      wakeFloorMs: 1_000,
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+    })
+
+    await runner.start()
+    expect(timers.scheduled[0]!.delayMs).toBe(1_000)
     runner.stop()
   })
 

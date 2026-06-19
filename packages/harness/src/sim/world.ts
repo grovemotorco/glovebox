@@ -22,6 +22,7 @@ import {
   DaemonSyncEngine,
   MemoryDaemonStorage,
   type BatchSubmitResult,
+  type DaemonDeletePolicy,
   type DaemonStorage,
   type DaemonTreeState,
   type OpaqueFetchResult,
@@ -597,7 +598,11 @@ export class SimWorld {
    * (no broadcast subscription): quiesce() runs their cycles, and a tripped
    * crash fuse inside a cycle kills the process until reboot().
    */
-  async addDaemon(deviceId: string, files: Record<string, string> = {}): Promise<SimDaemon> {
+  async addDaemon(
+    deviceId: string,
+    files: Record<string, string> = {},
+    options: { deletePolicy?: Partial<DaemonDeletePolicy> } = {},
+  ): Promise<SimDaemon> {
     const fs = MemoryFS.from(files)
     const storage = new FusedDaemonStorage(new MemoryDaemonStorage(), new CrashFuse(deviceId))
     let currentSocket: SimSocket | null = null
@@ -620,6 +625,7 @@ export class SimWorld {
         fs,
         storage,
         transport,
+        deletePolicy: options.deletePolicy,
         now: () => this.clockMs,
         newFileId: () => `${deviceId}-file-${++this.#fileIdCounter}`,
       })
