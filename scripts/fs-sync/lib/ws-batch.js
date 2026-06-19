@@ -7,8 +7,21 @@
 ;(async () => {
   const WSID = '__WSID__'
   const ops = __OPS__
-  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://'
-  const sock = new WebSocket(proto + location.host + '/ws/' + WSID)
+  async function socketUrl() {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://'
+    const base = proto + location.host + '/ws/' + encodeURIComponent(WSID)
+    const res = await fetch('/api/rpc/auth/mintWorkspaceSocketToken', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ json: { workspaceId: WSID } }),
+    })
+    if (!res.ok) return base
+    const body = await res.json().catch(() => null)
+    const token = body?.json?.token
+    return token ? base + '?token=' + encodeURIComponent(token) : base
+  }
+  const sock = new WebSocket(await socketUrl())
   const reqId = 'fsx-' + Math.random().toString(36).slice(2)
   const result = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve({ err: 'timeout waiting for batch ack' }), 10000)
