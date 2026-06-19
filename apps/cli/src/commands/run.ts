@@ -210,6 +210,17 @@ export async function runRun(
   } catch (error) {
     await teardown()
     await lock.release()
+    // Ensure the --json NDJSON stream always ends on a terminal line, even when
+    // setup/start throws after the `start` event (else stdout ends on start/log
+    // while the failure goes only to stderr). Human mode's terminal() is a
+    // no-op, so the rethrow still surfaces the error via the top-level handler.
+    reporter.terminal(1, {
+      message: error instanceof Error ? error.message : String(error),
+      code:
+        typeof (error as { code?: unknown }).code === 'string'
+          ? (error as { code: string }).code
+          : 'RUN_FAILED',
+    })
     throw error
   }
 

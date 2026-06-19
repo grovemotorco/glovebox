@@ -132,7 +132,7 @@ const KNOWN_FLAGS = [
   '--scope',
   '--purpose',
   '--timeout-ms',
-  '--token',
+  '--with-token',
   '--slug',
   '--fix',
   '--force',
@@ -157,6 +157,11 @@ function deriveErrorGuidance(error: unknown): { suggestion?: string; fix?: strin
   const message = error instanceof Error ? error.message : String(error)
   const unknownOption = /Unknown option '(--[^']+)'/.exec(message)?.[1]
   if (unknownOption) {
+    // `--token` was removed with the auth consolidation; it's too far from any
+    // current flag for a useful fuzzy match, so point migrators at its successor.
+    if (unknownOption === '--token') {
+      return { fix: 'Use `glovebox auth login --with-token` and pipe the token on stdin.' }
+    }
     const suggestion = suggestFlag(unknownOption)
     return {
       ...(suggestion ? { suggestion } : {}),

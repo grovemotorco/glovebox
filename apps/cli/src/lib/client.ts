@@ -63,7 +63,7 @@ export async function missingCredentialsMessage(
   if (others.length > 0) {
     message +=
       `\n  You do have credentials for: ${others.join(', ')}.` +
-      `\n  Target one with --server <url>, set GLOVEBOX_SERVER_URL, or run \`glovebox auth use <url>\`.`
+      `\n  Target one with --server <url> or set GLOVEBOX_SERVER_URL.`
   }
   return message
 }
