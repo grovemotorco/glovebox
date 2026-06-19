@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
 import type { GloveboxClient, TextPushResult } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
+import { CliError, type NextAction, withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import {
   printError,
@@ -153,9 +154,17 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
 
   const path = positionals[0]
   if (!path) {
-    usageError('push requires a <path>', 'glovebox push')
-    return
+    return usageError('push requires a <path>', 'glovebox push')
   }
+
+  // Recovery for both partial (exit 2) and refused (exit 3) pushes is the same
+  // shape: re-pull, reconcile, retry.
+  const repull: NextAction[] = [
+    {
+      command: `glovebox pull ${path} --workspace <id>`,
+      description: 'Re-pull, then reconcile and push again',
+    },
+  ]
 
   const outcome = await runPush({ path, force: values.force, serverUrl: values.server })
   const json = resolveOutputMode(globals) === 'json'
@@ -168,7 +177,17 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
       else printSuccess(`${path} already up to date`)
       return
     case 2:
-      if (json) printJson({ ...outcome.result, resent: outcome.resent })
+      if (json)
+        printJson(
+          withNextActions(
+            {
+              ...outcome.result,
+              resent: outcome.resent,
+              fix: 're-pull the file, reconcile the failed hunks, and push again',
+            },
+            repull,
+          ),
+        )
       else {
         printWarn(
           `${outcome.result.failedHunks.length} hunk(s) could not be placed — base unchanged`,
@@ -178,7 +197,16 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
       process.exitCode = 2
       return
     case 3:
-      if (json) printJson(outcome.result)
+      if (json)
+        printJson(
+          withNextActions(
+            {
+              ...outcome.result,
+              fix: 're-pull and re-derive your edit; pass --force only if flattening is intended',
+            },
+            repull,
+          ),
+        )
       else {
         printError(
           `refused: drifted base and the push deletes ${Math.round(outcome.result.deletedRatio * 100)}% of it — re-pull, or use --force only if the rewrite is intended`,
@@ -187,8 +215,10 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
       process.exitCode = 3
       return
     case 1:
-      printError(outcome.error)
-      process.exitCode = 1
-      return
+      // A real failure (auth, missing base, unreadable file): route through the
+      // top-level renderer so it honors --json and carries a fix.
+      throw new CliError(outcome.error, {
+        fix: 'usually `glovebox pull` the file first, or refresh credentials with `glovebox auth device`',
+      })
   }
 }

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
 import type { GlobalFlags } from '../cli/index.ts'
+import { withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
@@ -83,8 +84,7 @@ export default async function mount(args: string[], globals: GlobalFlags): Promi
     return
   }
   if (!positionals[0] || !values.workspace) {
-    usageError('mount requires a <dir> and --workspace <id>', 'glovebox mount')
-    return
+    return usageError('mount requires a <dir> and --workspace <id>', 'glovebox mount')
   }
 
   const entry = await runMount(positionals[0], {
@@ -94,7 +94,14 @@ export default async function mount(args: string[], globals: GlobalFlags): Promi
 
   const mode = resolveOutputMode(globals)
   if (mode === 'json') {
-    printJson(entry)
+    printJson(
+      withNextActions(entry, [
+        {
+          command: `glovebox run ${entry.dir}`,
+          description: 'Start the sync daemon for this mount',
+        },
+      ]),
+    )
   } else {
     printSuccess(`Mounted ${colors.bold}${entry.dir}${colors.reset}`)
     console.log(`  Workspace: ${entry.workspaceId}`)

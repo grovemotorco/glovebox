@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util'
 import type { GloveboxClient } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
+import { withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'
@@ -97,13 +98,11 @@ export default async function pull(args: string[], globals: GlobalFlags): Promis
 
   const workspaceId = values.workspace
   if (!workspaceId) {
-    usageError('pull requires --workspace <id>', 'glovebox pull')
-    return
+    return usageError('pull requires --workspace <id>', 'glovebox pull')
   }
   const path = positionals[0]
   if (!path && !values['file-id']) {
-    usageError('pull requires a <path> or --file-id', 'glovebox pull')
-    return
+    return usageError('pull requires a <path> or --file-id', 'glovebox pull')
   }
 
   const view = await runPull({
@@ -114,7 +113,14 @@ export default async function pull(args: string[], globals: GlobalFlags): Promis
   })
 
   if (resolveOutputMode(globals) === 'json') {
-    printJson(view)
+    printJson(
+      withNextActions(view, [
+        {
+          command: `glovebox push ${view.path}`,
+          description: 'Push your edits back after editing the file',
+        },
+      ]),
+    )
     return
   }
   printSuccess(`pulled ${view.path} (${view.bytes} bytes) → ${view.localFile}`)

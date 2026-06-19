@@ -30,6 +30,26 @@ workspace event log.
 | `glovebox push <path> [--force]`                    | merge your local edits into the live document                                      |
 | `glovebox --json pull/push …`                       | structured output (default when stdout is not a TTY)                               |
 
+## Machine-readable output (`--json`)
+
+`--json` (the default when stdout is not a TTY) carries agent affordances:
+
+- **`nextActions`** — a sibling array on success responses, each a runnable
+  command with the context filled in. After `pull docs/note.md`:
+  `"nextActions": [{ "command": "glovebox push docs/note.md", "description": … }]`.
+- **`fix`** — on the error envelope
+  (`{ "error": { code, status, message }, "fix"?: …, "nextActions"?: … }`), a
+  plain-language remediation. Errors go to **stderr**, success data to **stdout**,
+  so `$(glovebox --json auth token)` never captures a diagnostic.
+- **Command tree** — `glovebox --json` (no subcommand) returns
+  `{ name, version, defaultServer, commands[], nextActions[] }`, so you can
+  discover the whole surface without scraping `--help`.
+
+`glovebox --json run <dir>` streams newline-delimited JSON — typed `start` /
+`connected` / `log` lines, then a terminal `result` (clean stop) or `error`
+(server closed) envelope as the **last line**. Read only the final line if you
+just want the outcome.
+
 ## Workspace anatomy
 
 ```

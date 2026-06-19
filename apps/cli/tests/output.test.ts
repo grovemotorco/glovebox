@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ORPCError } from '@glovebox.md/api'
+import { CliError } from '../src/cli/envelope.ts'
 import { printCommandError, toErrorEnvelope } from '../src/cli/output.ts'
 
 /**
@@ -34,6 +35,43 @@ describe('toErrorEnvelope', () => {
 
   it('stringifies a non-Error throwable', () => {
     expect(toErrorEnvelope('nope')).toEqual({ code: null, status: null, message: 'nope' })
+  })
+
+  it('keeps a CliError code (or null) and message', () => {
+    expect(toErrorEnvelope(new CliError('m', { code: 'USAGE' }))).toEqual({
+      code: 'USAGE',
+      status: null,
+      message: 'm',
+    })
+    expect(toErrorEnvelope(new CliError('m'))).toEqual({ code: null, status: null, message: 'm' })
+  })
+})
+
+describe('printCommandError with a CliError', () => {
+  it('surfaces fix and nextActions in the json envelope', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    printCommandError(
+      new CliError('bad usage', {
+        fix: 'Run `glovebox mount --help` for usage.',
+        nextActions: [{ command: 'glovebox mount', description: 'retry' }],
+      }),
+      'json',
+    )
+    expect(JSON.parse(err.mock.calls[0]![0] as string)).toEqual({
+      error: { code: null, status: null, message: 'bad usage' },
+      fix: 'Run `glovebox mount --help` for usage.',
+      nextActions: [{ command: 'glovebox mount', description: 'retry' }],
+    })
+    err.mockRestore()
+  })
+
+  it('prints the fix as a dim hint in human mode', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    printCommandError(new CliError('bad usage', { fix: 'Run `glovebox mount --help`' }), 'human')
+    const lines = err.mock.calls.map((call) => call[0] as string)
+    expect(lines.some((line) => line.includes('bad usage'))).toBe(true)
+    expect(lines.some((line) => line.includes('Run `glovebox mount --help`'))).toBe(true)
+    err.mockRestore()
   })
 })
 

@@ -11,8 +11,9 @@ import status from '../commands/status.ts'
 import unmount from '../commands/unmount.ts'
 import whoami from '../commands/whoami.ts'
 import workspaces from '../commands/workspaces.ts'
-import { getSuggestion, getVersion, printUsage } from './help.ts'
-import { printCommandError, printError, resolveOutputMode } from './output.ts'
+import { CliError } from './envelope.ts'
+import { buildCommandTree, getSuggestion, getVersion, printUsage } from './help.ts'
+import { printCommandError, printJson, resolveOutputMode } from './output.ts'
 
 export interface GlobalFlags {
   json: boolean
@@ -132,7 +133,10 @@ async function main(): Promise<void> {
   const first = args[0]
 
   if (!first || first === '--help' || first === '-h') {
-    printUsage(COMMANDS)
+    // Agents (or any piped/`--json` caller) get the command tree as JSON so they
+    // can discover the surface without scraping `--help`; humans get the prose.
+    if (resolveOutputMode(globals) === 'json') printJson(buildCommandTree(COMMANDS))
+    else printUsage(COMMANDS)
     return
   }
   if (first === '--version' || first === '-V') {
@@ -144,14 +148,18 @@ async function main(): Promise<void> {
   if (!command) {
     const names = COMMANDS.filter((c) => !c.hidden).map((c) => c.name)
     const suggestion = getSuggestion(first, names)
-    printError(
+    // Route through the top-level renderer so it honors --json and carries a fix.
+    throw new CliError(
       suggestion
         ? `Unknown command: ${first}. Did you mean "${suggestion}"?`
         : `Unknown command: ${first}`,
+      {
+        fix: "Run 'glovebox --help' to list commands.",
+        nextActions: suggestion
+          ? [{ command: `glovebox ${suggestion}`, description: 'Run the closest matching command' }]
+          : undefined,
+      },
     )
-    printUsage(COMMANDS)
-    process.exitCode = 1
-    return
   }
 
   await command.run(args.slice(1), globals)

@@ -11,6 +11,7 @@ import {
   type DaemonWorkspaceState,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
+import { withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
@@ -233,7 +234,19 @@ export default async function status(args: string[], globals: GlobalFlags): Prom
   const result = await runStatus(positionals[0])
   const mode = resolveOutputMode(globals)
   if (mode === 'json') {
-    printJson(result)
+    printJson(
+      withNextActions(
+        result,
+        result.daemon.running
+          ? []
+          : [
+              {
+                command: `glovebox run ${result.dir}`,
+                description: 'Start the sync daemon for this mount',
+              },
+            ],
+      ),
+    )
   } else {
     formatStatus(result)
   }
