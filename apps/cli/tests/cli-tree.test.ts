@@ -25,6 +25,6 @@ describe('buildCommandTree', () => {
   it('includes getting-started next actions', () => {
     const tree = buildCommandTree(commands)
     expect(tree.nextActions.length).toBeGreaterThan(0)
-    expect(tree.nextActions.some((action) => action.command.includes('auth device'))).toBe(true)
+    expect(tree.nextActions.some((action) => action.command.includes('auth login'))).toBe(true)
   })
 })

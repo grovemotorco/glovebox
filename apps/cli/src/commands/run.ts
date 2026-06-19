@@ -77,7 +77,7 @@ export async function runRun(
     reporter.log(
       'warn',
       `No stored credentials for ${mount.serverUrl} — the server may reject this connection. ` +
-        `Sign in: glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}`,
+        `Sign in: glovebox auth login --server ${mount.serverUrl} --workspace ${mount.workspaceId}`,
     )
   }
 
@@ -117,7 +117,7 @@ export async function runRun(
         reporter.log(
           'error',
           `server rejected credentials (${reason}) — refresh with ` +
-            `\`glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`; retrying with stored token`,
+            `\`glovebox auth login --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`; retrying with stored token`,
         )
       },
       onStopped: (reason, code) => {
@@ -166,7 +166,7 @@ export async function runRun(
           if (!haveCredential) {
             reporter.log(
               'info',
-              `Not authenticated — run \`glovebox auth device --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`, then restart.`,
+              `Not authenticated — run \`glovebox auth login --server ${mount.serverUrl} --workspace ${mount.workspaceId}\`, then restart.`,
             )
           }
           void diagnoseTlsTrust(mount.serverUrl).then((problem) => {
@@ -373,15 +373,15 @@ export default async function run(args: string[], globals: GlobalFlags): Promise
     console.log(
       renderHelp({
         name: 'glovebox run',
-        summary: 'run the sync daemon for a mount (foreground)',
+        summary: 'start syncing a mount (runs in the foreground)',
         usage: 'glovebox run [dir] [options]',
         description:
-          'One process per mount, guarded by a mandatory lockfile. The first cycle\nadopts the directory (sentinel write; existing files bind to workspace\nfiles by path, unknown paths become creates). Watcher events only hint a\nrescan — the jittered rescan loop is the correctness backstop.\n\nWith --json, emits newline-delimited JSON events (start/connected/log) and\na terminal result/error envelope as the final line.',
+          'Watches the directory and syncs changes both ways over a live connection\nuntil you stop it (Ctrl-C). Only one `run` per mount at a time.\n\nWith --json, emits newline-delimited JSON events (start/connected/log) and a\nterminal result/error line.',
         args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
         options: [
           [
             '--rescan-interval <dur>',
-            'Periodic full-rescan interval, e.g. 30m, 1h, or bare seconds (default 30m, jittered)',
+            'How often to do a full rescan, e.g. 30m, 1h, or bare seconds (default 30m)',
           ],
         ],
         examples: [

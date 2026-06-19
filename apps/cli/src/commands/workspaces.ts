@@ -2,14 +2,8 @@ import { parseArgs } from 'node:util'
 import type { GloveboxClient, WorkspaceSummary } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
 import { withNextActions } from '../cli/envelope.ts'
-import { renderHelp } from '../cli/help.ts'
-import {
-  printError,
-  printJson,
-  printSuccess,
-  resolveOutputMode,
-  usageError,
-} from '../cli/output.ts'
+import { type CommandHelp, renderGroupHelp, renderHelp, unknownSubcommand } from '../cli/help.ts'
+import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { resolveAuthedClient } from '../lib/client.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'
@@ -51,16 +45,42 @@ export async function runWorkspaceCreate(
   return { serverUrl, workspace }
 }
 
-const HELP = renderHelp({
+/** Group help is a thin index; each subcommand's flags live in its leaf spec. */
+const HELP = renderGroupHelp({
   name: 'glovebox workspaces',
   summary: 'list and create workspaces',
-  usage: [
-    'glovebox workspaces [list] [--server <url>]',
-    'glovebox workspaces create <name> [--slug <slug>] [--server <url>]',
+  subcommands: [
+    { name: 'list', summary: 'list your workspaces on a server (the default)' },
+    { name: 'create', summary: 'create a workspace' },
   ],
-  options: [['-s, --server <url>', 'Server (default: GLOVEBOX_SERVER_URL, config, or built-in)']],
-  examples: ['glovebox workspaces list', 'glovebox workspaces create "My Notes" --slug my-notes'],
 })
+
+const SERVER_OPTION: [string, string] = [
+  '-s, --server <url>',
+  'Server (default: GLOVEBOX_SERVER_URL, config, or built-in)',
+]
+
+/** Per-subcommand leaf help, routed before the strict parser sees `--help`. */
+const WS_SUBHELP: Record<string, CommandHelp> = {
+  list: {
+    name: 'glovebox workspaces list',
+    summary: 'list your workspaces on a server',
+    usage: 'glovebox workspaces list [options]',
+    options: [SERVER_OPTION],
+    examples: ['glovebox workspaces list', 'glovebox --json workspaces list'],
+  },
+  create: {
+    name: 'glovebox workspaces create',
+    summary: 'create a workspace',
+    usage: 'glovebox workspaces create <name> [options]',
+    args: [['name', 'Display name for the workspace']],
+    options: [['--slug <slug>', 'URL-friendly identifier (optional)'], SERVER_OPTION],
+    examples: [
+      'glovebox workspaces create "My Notes"',
+      'glovebox workspaces create "My Notes" --slug my-notes',
+    ],
+  },
+}
 
 const SUBCOMMAND_SCAN_OPTIONS = {
   server: { type: 'string', short: 's' },
@@ -102,7 +122,7 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
       strict: true,
     })
     if (values.help) {
-      console.log(HELP)
+      console.log(renderHelp(WS_SUBHELP.list!))
       return
     }
     const { workspaces: list, serverUrl } = await runWorkspacesList({ server: values.server })
@@ -138,7 +158,7 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
       strict: true,
     })
     if (values.help) {
-      console.log(HELP)
+      console.log(renderHelp(WS_SUBHELP.create!))
       return
     }
     const name = positionals[0]
@@ -170,7 +190,5 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
     return
   }
 
-  printError(`Unknown workspaces subcommand: ${sub}`)
-  console.log(HELP)
-  process.exitCode = 1
+  throw unknownSubcommand('workspaces', sub, ['list', 'create'])
 }

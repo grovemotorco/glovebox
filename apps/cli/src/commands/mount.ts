@@ -66,7 +66,7 @@ export default async function mount(args: string[], globals: GlobalFlags): Promi
         summary: 'register a directory ↔ workspace binding',
         usage: 'glovebox mount <dir> --workspace <id> [options]',
         description:
-          'Registers only — no process starts. Start syncing with `glovebox run <dir>`.\nRefuses nested or overlapping mounts and directories already claimed by\nanother entry.',
+          'Creates the binding only — no syncing starts. Start syncing with\n`glovebox run <dir>`. Refuses nested or overlapping mounts.',
         args: [['dir', 'Directory to bind (created if missing)']],
         options: [
           ['-w, --workspace <id>', 'Workspace ID to bind to (required)'],

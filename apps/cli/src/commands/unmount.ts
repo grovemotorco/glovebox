@@ -69,7 +69,7 @@ export default async function unmount(args: string[], globals: GlobalFlags): Pro
         summary: 'remove a mount binding (keeps your files)',
         usage: 'glovebox unmount <dir> [options]',
         description:
-          "Removes the registry entry, the daemon's state directory, and the in-mount\n.glovebox.json sentinel. Refuses while a daemon is running on the mount.\nUser files are never touched.",
+          'Removes the binding and its local sync data for this directory. Refuses\nwhile the mount is running. Your files are never touched.',
         args: [['dir', 'The mounted directory (exact mount root)']],
         examples: ['glovebox unmount ./notes'],
       }),

@@ -19,7 +19,7 @@ import { runUnmount } from '../../src/commands/unmount.ts'
 import authCommand, {
   runDeviceLoginWithClient,
   runLogin,
-  runAuthStatus,
+  runAuthToken,
   runLogout,
   runMintDev,
 } from '../../src/commands/auth.ts'
@@ -255,7 +255,7 @@ function byPathOf(result: Awaited<ReturnType<typeof runStatus>>) {
 }
 
 describe('auth', () => {
-  it('stores, lists, and forgets tokens; mint-dev signs verifiable claims', async () => {
+  it('stores and forgets tokens per server; mint-dev signs verifiable claims', async () => {
     const { paths } = await fixture()
 
     const minted = await runMintDev({
@@ -270,19 +270,18 @@ describe('auth', () => {
     const verified = await verifyWorkspaceToken(minted.token, 'dev-secret', Date.now())
     expect(verified).toMatchObject({ workspaceId: 'ws-1', principalId: 'tester', epoch: 2 })
 
-    const status = await runAuthStatus({ paths })
-    expect(status.servers).toHaveLength(1)
-    expect(status.servers[0]).toMatchObject({
-      serverUrl: 'https://api.glovebox.test',
-      expired: false,
-    })
-    expect(status.servers[0]!.claims).toMatchObject({ principalId: 'tester' })
+    // mint-dev --save stored the token for its target server.
+    expect((await runAuthToken({ server: 'https://api.glovebox.test', paths })).token).toBe(
+      minted.token,
+    )
 
     await runLogin({ server: 'https://other.example', token: 'opaque-token', paths })
-    expect((await runAuthStatus({ paths })).servers).toHaveLength(2)
+    expect((await runAuthToken({ server: 'https://other.example', paths })).token).toBe(
+      'opaque-token',
+    )
 
     expect((await runLogout({ server: 'https://other.example', paths })).removed).toBe(true)
-    expect((await runAuthStatus({ paths })).servers).toHaveLength(1)
+    expect((await runAuthToken({ server: 'https://other.example', paths })).token).toBeNull()
   })
 
   it('runs device auth and stores the approved gbx_ API key', async () => {
@@ -328,9 +327,9 @@ describe('auth', () => {
       apiKey: 'gbx_device_key',
       saved: true,
     })
-    expect(await runAuthStatus({ paths })).toMatchObject({
-      servers: [expect.objectContaining({ serverUrl: 'https://api.glovebox.test' })],
-    })
+    expect((await runAuthToken({ server: 'https://api.glovebox.test', paths })).token).toBe(
+      'gbx_device_key',
+    )
   })
 
   it('refreshes stored API keys into workspace socket tokens for the daemon', async () => {
@@ -361,7 +360,7 @@ describe('auth', () => {
   it('shows subcommand help for `auth <sub> --help` instead of erroring', async () => {
     // Regression: the subcommand parsers are strict and don't declare --help,
     // so the dispatcher must intercept it before parseArgs throws.
-    for (const sub of ['device', 'login', 'logout', 'status', 'use', 'token', 'mint-dev']) {
+    for (const sub of ['login', 'logout', 'token', 'mint-dev']) {
       const lines = await captureStdout(() =>
         authCommand([sub, '--help'], { json: false, human: false }),
       )

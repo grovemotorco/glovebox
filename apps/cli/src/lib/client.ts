@@ -59,7 +59,7 @@ export async function missingCredentialsMessage(
   const others = Object.keys((await loadAuth(paths)).servers).filter((url) => url !== serverUrl)
   let message =
     `Not logged in to ${serverUrl}.\n` +
-    `  Sign in with: glovebox auth device --server ${serverUrl} --workspace <id>`
+    `  Sign in with: glovebox auth login --server ${serverUrl} --workspace <id>`
   if (others.length > 0) {
     message +=
       `\n  You do have credentials for: ${others.join(', ')}.` +

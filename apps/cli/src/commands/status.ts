@@ -223,7 +223,7 @@ export default async function status(args: string[], globals: GlobalFlags): Prom
         summary: 'show sync status for a mount',
         usage: 'glovebox status [dir] [options]',
         description:
-          "Reads the daemon's persisted state directly, so it works whether or not a\ndaemon is running. Shows the INV-3 deletion stack: open delete intents with\ntheir countdowns, held reasons, and mount-suspect state.",
+          'Shows the sync cursor, tracked files, edits waiting to be pushed, and any\npending deletions. Works whether or not the mount is currently running.',
         args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
         examples: ['glovebox status', 'glovebox status ./notes', 'glovebox --json status ./notes'],
       }),

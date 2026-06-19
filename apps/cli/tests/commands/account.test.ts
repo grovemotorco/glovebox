@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ORPCError, type GloveboxClient, type WorkspaceSummary } from '@glovebox.md/api'
 import { gloveboxPaths, type GloveboxPaths } from '../../src/lib/paths.ts'
-import { runAuthStatus, runAuthUse, runLogin } from '../../src/commands/auth.ts'
+import { loadConfig } from '../../src/lib/config.ts'
+import { runLogin } from '../../src/commands/auth.ts'
 import { runWhoami } from '../../src/commands/whoami.ts'
 import { runWorkspaceCreate, runWorkspacesList } from '../../src/commands/workspaces.ts'
 
@@ -82,20 +83,13 @@ describe('workspaces', () => {
 })
 
 describe('login records the default server', () => {
-  it('sets the config default and flags it in auth status; auth use overrides it', async () => {
+  it('sets the config default to the server signed in to, and a later login moves it', async () => {
     const paths = await tempHome()
     await runLogin({ server: 'https://api.glovebox.md', token: 'gbx_fake', paths })
+    expect((await loadConfig(paths)).defaultServer).toBe('https://api.glovebox.md')
 
-    const status = await runAuthStatus({ paths })
-    expect(status.defaultServer).toBe('https://api.glovebox.md')
-    expect(status.servers).toHaveLength(1)
-    expect(status.servers[0]).toMatchObject({
-      serverUrl: 'https://api.glovebox.md',
-      isApiKey: true,
-      isDefault: true,
-    })
-
-    await runAuthUse({ server: 'https://api.glovebox.test', paths })
-    expect((await runAuthStatus({ paths })).defaultServer).toBe('https://api.glovebox.test')
+    // Switching servers is now done by signing in again (there is no `auth use`).
+    await runLogin({ server: 'https://api.glovebox.test', token: 'gbx_fake2', paths })
+    expect((await loadConfig(paths)).defaultServer).toBe('https://api.glovebox.test')
   })
 })

@@ -18,7 +18,7 @@ Requires **Node.js ≥ 24**. Web app: <https://app.glovebox.md>.
 ## Quick start
 
 ```sh
-glovebox auth device --workspace <id>   # sign in (opens a browser, stores an API key)
+glovebox auth login --workspace <id>    # sign in (opens a browser, stores an API key)
 glovebox whoami                         # confirm who you are + list your workspaces
 glovebox mount ./notes --workspace <id> # bind a local directory to a workspace
 glovebox run ./notes                    # start the foreground sync daemon (Ctrl-C to stop)
@@ -30,20 +30,20 @@ reports the resolved server, whether you're authenticated, and reachability.
 
 ## Commands
 
-| Command                                                   | What it does                                                                                |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `glovebox auth device [--workspace <id>...]`              | Browser device login; stores a `gbx_` API key and sets the default server                   |
-| `glovebox whoami`                                         | Show your identity, active workspace, and every workspace you can access                    |
-| `glovebox workspaces list` / `create <name>`              | Discover or create workspaces                                                               |
-| `glovebox auth status` / `use <url>` / `token` / `logout` | Inspect stored credentials, set the default server, print a token, sign out                 |
-| `glovebox doctor [--fix]`                                 | Check CLI health, the resolved server, auth, and reachability (`--fix` repairs stale locks) |
-| `glovebox mount <dir> --workspace <id>`                   | Register the directory↔workspace binding (no process starts)                                |
-| `glovebox run [<dir>]`                                    | Run the sync daemon in the foreground (one process per mount)                               |
-| `glovebox list`                                           | Registered mounts + running/stopped                                                         |
-| `glovebox status [<dir>]`                                 | Cursor, tracked files, pending pushes, and the INV-3 deletion stack                         |
-| `glovebox unmount <dir>`                                  | Remove the binding + daemon state (never your files); refuses while running                 |
-| `glovebox pull <path> --workspace <id>`                   | Fetch a file's working text and record the merge base                                       |
-| `glovebox push <path>`                                    | Merge local edits into the live document (exit 0 clean · 2 hunks · 3 refuse)                |
+| Command                                      | What it does                                                                                          |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `glovebox auth login [--workspace <id>...]`  | Sign in: browser device flow (or `--with-token` to store a token from stdin). Sets the default server |
+| `glovebox whoami`                            | Show your identity, active workspace, and every workspace you can access                              |
+| `glovebox workspaces list` / `create <name>` | Discover or create workspaces                                                                         |
+| `glovebox auth token` / `logout`             | Print the stored token (for scripting), or sign out                                                   |
+| `glovebox doctor [--fix]`                    | Check CLI health, the resolved server, auth, and reachability (`--fix` repairs stale locks)           |
+| `glovebox mount <dir> --workspace <id>`      | Register the directory↔workspace binding (no process starts)                                          |
+| `glovebox run [<dir>]`                       | Run the sync daemon in the foreground (one process per mount)                                         |
+| `glovebox list`                              | Registered mounts + running/stopped                                                                   |
+| `glovebox status [<dir>]`                    | Cursor, tracked files, pending pushes, and the INV-3 deletion stack                                   |
+| `glovebox unmount <dir>`                     | Remove the binding + daemon state (never your files); refuses while running                           |
+| `glovebox pull <path> --workspace <id>`      | Fetch a file's working text and record the merge base                                                 |
+| `glovebox push <path>`                       | Merge local edits into the live document (exit 0 clean · 2 hunks · 3 refuse)                          |
 
 Run `glovebox <command> --help` for per-command options. `--json` gives
 structured output on any command (the default when stdout is not a TTY);
@@ -64,10 +64,11 @@ The server a command talks to is resolved in this order (highest first):
 3. the default recorded at login (`~/.glovebox/config.json`)
 4. the built-in default, **`https://api.glovebox.md`**
 
-A successful `auth device`/`auth login` records its server as the default, so
-after signing in you usually need no `--server`. Set it explicitly any time
-with `glovebox auth use <url>`. `glovebox run`/`status`/`list`/`unmount` use
-the server recorded on the mount itself.
+A successful `auth login` records its server as the default, so after signing
+in you usually need no `--server`. To target a different server, pass
+`--server <url>`, set `GLOVEBOX_SERVER_URL`, or sign in to it (which makes it
+the new default). `glovebox run`/`status`/`list`/`unmount` use the server
+recorded on the mount itself.
 
 ## Editing files (pull / push)
 
