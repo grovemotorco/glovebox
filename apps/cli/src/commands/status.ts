@@ -11,6 +11,7 @@ import {
   type DaemonWorkspaceState,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
+import { renderHelp } from '../cli/help.ts'
 import { printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { lockHolderPid } from '../lib/lockfile.ts'
@@ -215,17 +216,17 @@ export default async function status(args: string[], globals: GlobalFlags): Prom
   })
 
   if (values.help) {
-    console.log(`glovebox status [dir] — show sync status for a mount
-
-Reads the daemon's persisted state directly, so it works whether or not a
-daemon is running. Shows the INV-3 deletion stack: open delete intents with
-their countdowns, held reasons, and mount-suspect state.
-
-Arguments:
-  dir          A mounted directory or any path inside one (default: cwd)
-
-Options:
-  -h, --help   Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox status',
+        summary: 'show sync status for a mount',
+        usage: 'glovebox status [dir] [options]',
+        description:
+          "Reads the daemon's persisted state directly, so it works whether or not a\ndaemon is running. Shows the INV-3 deletion stack: open delete intents with\ntheir countdowns, held reasons, and mount-suspect state.",
+        args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
+        examples: ['glovebox status', 'glovebox status ./notes', 'glovebox --json status ./notes'],
+      }),
+    )
     return
   }
 

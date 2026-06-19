@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util'
 import type { GlobalFlags } from '../cli/index.ts'
+import { renderHelp } from '../cli/help.ts'
 import { printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { lockHolderPid } from '../lib/lockfile.ts'
@@ -43,10 +44,16 @@ export default async function list(args: string[], globals: GlobalFlags): Promis
   })
 
   if (values.help) {
-    console.log(`glovebox list — list registered mounts and their daemon state
-
-Options:
-  -h, --help   Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox list',
+        summary: 'list registered mounts and their daemon state',
+        usage: 'glovebox list [options]',
+        description:
+          'Shows every registered mount with a ● running / ○ stopped daemon indicator\nand the holder pid. Works offline — daemon state is read from the lockfile.',
+        examples: ['glovebox list', 'glovebox --json list'],
+      }),
+    )
     return
   }
 

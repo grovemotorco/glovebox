@@ -36,7 +36,7 @@ reports the resolved server, whether you're authenticated, and reachability.
 | `glovebox whoami`                                         | Show your identity, active workspace, and every workspace you can access     |
 | `glovebox workspaces list` / `create <name>`              | Discover or create workspaces                                                |
 | `glovebox auth status` / `use <url>` / `token` / `logout` | Inspect stored credentials, set the default server, print a token, sign out  |
-| `glovebox doctor`                                         | Check CLI health, the resolved server, auth, and reachability                |
+| `glovebox doctor [--fix]`                                 | Check CLI health, the resolved server, auth, and reachability (`--fix` repairs stale locks) |
 | `glovebox mount <dir> --workspace <id>`                   | Register the directory↔workspace binding (no process starts)                 |
 | `glovebox run [<dir>]`                                    | Run the sync daemon in the foreground (one process per mount)                |
 | `glovebox list`                                           | Registered mounts + running/stopped                                          |
@@ -108,8 +108,9 @@ glovebox run ~/glovebox-demo
 - The per-mount lockfile is mandatory — a second `run` on the same mount
   refuses while the first is alive, and breaks the lock if it died.
 - Watcher events are hints only; a jittered full rescan
-  (`--rescan-interval <s>`, default 30 min) is the correctness backstop, so
-  even with no watcher events nothing is ever missed — just slower.
+  (`--rescan-interval <dur>`, e.g. `30m`/`1h`/bare seconds, default 30 min) is
+  the correctness backstop, so even with no watcher events nothing is ever
+  missed — just slower.
 - `GLOVEBOX_SYNC_OVERRIDES` (JSON env) shrinks delete-policy delays and
   intervals for tests/debugging. Not for production use.
 - **TLS to `.test` domains**: browsers use the OS trust store; Node does

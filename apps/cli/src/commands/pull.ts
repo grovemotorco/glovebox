@@ -1,7 +1,8 @@
 import { parseArgs } from 'node:util'
 import type { GloveboxClient } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
+import { renderHelp } from '../cli/help.ts'
+import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'
 import {
   resolveTextPushClient,
@@ -70,27 +71,40 @@ export default async function pull(args: string[], globals: GlobalFlags): Promis
   })
 
   if (values.help) {
-    console.log(`glovebox pull — fetch a file's working text and record the merge base
-
-Usage: glovebox pull <path> --workspace <id> [options]
-       glovebox pull --file-id <fileId> --workspace <id> [options]
-
-Writes the file at its workspace-relative path under the current directory
-and records the merge base in .glovebox/<fileId>/ (never edit that). Push
-edits back with \`glovebox push <path>\`.
-
-Options:
-  -w, --workspace <id>   Workspace ID (required)
-      --file-id <id>     Pull by file ID instead of path
-  -s, --server <url>     Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)
-  -h, --help             Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox pull',
+        summary: "fetch a file's working text and record the merge base",
+        usage: [
+          'glovebox pull <path> --workspace <id> [options]',
+          'glovebox pull --file-id <fileId> --workspace <id> [options]',
+        ],
+        description:
+          'Writes the file at its workspace-relative path under the current directory\nand records the merge base in .glovebox/<fileId>/ (never edit that). Push\nedits back with `glovebox push <path>`.',
+        options: [
+          ['-w, --workspace <id>', 'Workspace ID (required)'],
+          ['--file-id <id>', 'Pull by file ID instead of path'],
+          ['-s, --server <url>', 'Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
+        ],
+        examples: [
+          'glovebox pull docs/note.md --workspace ws_abc123',
+          'glovebox pull --file-id f_123 --workspace ws_abc123',
+        ],
+      }),
+    )
     return
   }
 
   const workspaceId = values.workspace
-  if (!workspaceId) throw new Error('pull requires --workspace <id>')
+  if (!workspaceId) {
+    usageError('pull requires --workspace <id>', 'glovebox pull')
+    return
+  }
   const path = positionals[0]
-  if (!path && !values['file-id']) throw new Error('pull requires a <path> or --file-id')
+  if (!path && !values['file-id']) {
+    usageError('pull requires a <path> or --file-id', 'glovebox pull')
+    return
+  }
 
   const view = await runPull({
     workspaceId,

@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
+import { renderHelp } from '../cli/help.ts'
+import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { resolveServerUrl } from '../lib/config.ts'
 import { canonicalizeDir, gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
@@ -57,22 +58,32 @@ export default async function mount(args: string[], globals: GlobalFlags): Promi
     strict: true,
   })
 
-  if (values.help || !positionals[0] || !values.workspace) {
-    console.log(`glovebox mount <dir> --workspace <id> — register a directory ↔ workspace binding
-
-Registers only: start syncing with \`glovebox run <dir>\`. Refuses nested or
-overlapping mounts and directories already claimed by another entry.
-
-Arguments:
-  dir                      Directory to bind (created if missing)
-
-Options:
-  -w, --workspace <id>     Workspace ID to bind to (required)
-  -s, --server <url>       Server URL (default: GLOVEBOX_SERVER_URL, config, or ${DEFAULT_SERVER_URL})
-  -h, --help               Show this help message`)
-    if (!values.help) {
-      process.exitCode = 1
-    }
+  if (values.help) {
+    console.log(
+      renderHelp({
+        name: 'glovebox mount',
+        summary: 'register a directory ↔ workspace binding',
+        usage: 'glovebox mount <dir> --workspace <id> [options]',
+        description:
+          'Registers only — no process starts. Start syncing with `glovebox run <dir>`.\nRefuses nested or overlapping mounts and directories already claimed by\nanother entry.',
+        args: [['dir', 'Directory to bind (created if missing)']],
+        options: [
+          ['-w, --workspace <id>', 'Workspace ID to bind to (required)'],
+          [
+            '-s, --server <url>',
+            `Server URL (default: GLOVEBOX_SERVER_URL, config, or ${DEFAULT_SERVER_URL})`,
+          ],
+        ],
+        examples: [
+          'glovebox mount ./notes --workspace ws_abc123',
+          'glovebox mount ./notes -w ws_abc123 -s https://api.glovebox.test',
+        ],
+      }),
+    )
+    return
+  }
+  if (!positionals[0] || !values.workspace) {
+    usageError('mount requires a <dir> and --workspace <id>', 'glovebox mount')
     return
   }
 

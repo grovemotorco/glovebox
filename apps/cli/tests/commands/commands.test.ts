@@ -358,6 +358,19 @@ describe('auth', () => {
     expect(minted).toBe('fresh-ws-token')
   })
 
+  it('shows subcommand help for `auth <sub> --help` instead of erroring', async () => {
+    // Regression: the subcommand parsers are strict and don't declare --help,
+    // so the dispatcher must intercept it before parseArgs throws.
+    for (const sub of ['device', 'login', 'logout', 'status', 'use', 'token', 'mint-dev']) {
+      const lines = await captureStdout(() =>
+        authCommand([sub, '--help'], { json: false, human: false }),
+      )
+      const text = lines.join('\n')
+      expect(text, `${sub} --help`).toContain(`glovebox auth ${sub}`)
+      expect(text, `${sub} --help`).toContain('Show this help message')
+    }
+  })
+
   it('prints the stored token raw by default when stdout is piped', async () => {
     const { paths } = await fixture()
     await runLogin({ server: 'https://api.glovebox.test', token: 'opaque-token', paths })

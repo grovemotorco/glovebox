@@ -6,6 +6,7 @@ import {
   type WorkspaceSummary,
 } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
+import { renderHelp } from '../cli/help.ts'
 import { printHint, printJson, resolveOutputMode } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { resolveAuthedClient } from '../lib/client.ts'
@@ -76,15 +77,19 @@ export default async function whoami(args: string[], globals: GlobalFlags): Prom
   })
 
   if (values.help) {
-    console.log(`glovebox whoami — show your identity and workspaces on a server
-
-Calls the server with your stored credentials and prints the signed-in
-principal, the active workspace, and every workspace you can access. Use this
-to find a workspace ID for \`glovebox mount\`/\`pull\`.
-
-Options:
-  -s, --server <url>   Server (default: GLOVEBOX_SERVER_URL, config, or built-in)
-  -h, --help           Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox whoami',
+        summary: 'show your identity and workspaces on a server',
+        usage: 'glovebox whoami [options]',
+        description:
+          'Calls the server with your stored credentials and prints the signed-in\nprincipal, the active workspace, and every workspace you can access. Use this\nto find a workspace ID for `glovebox mount`/`pull`.',
+        options: [
+          ['-s, --server <url>', 'Server (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
+        ],
+        examples: ['glovebox whoami', 'glovebox whoami --server https://api.glovebox.test'],
+      }),
+    )
     return
   }
 

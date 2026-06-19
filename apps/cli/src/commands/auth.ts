@@ -7,7 +7,15 @@ import {
 } from '@glovebox.md/api'
 import { signWorkspaceToken } from '@glovebox.md/sync/server'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printError, printJson, printSuccess, printWarn, resolveOutputMode } from '../cli/output.ts'
+import { type CommandHelp, renderHelp } from '../cli/help.ts'
+import {
+  printError,
+  printJson,
+  printSuccess,
+  printWarn,
+  resolveOutputMode,
+  usageError,
+} from '../cli/output.ts'
 import { colors, stderrColors } from '../cli/colors.ts'
 import {
   decodeTokenClaims,
@@ -257,9 +265,106 @@ The server is chosen by: --server flag → GLOVEBOX_SERVER_URL → the default
 set at login (config) → the built-in default. A successful login records the
 default, so most commands afterward need no --server.
 
+Run \`glovebox auth <command> --help\` for a subcommand's options.
+
 Dev:
   glovebox auth mint-dev --secret <s> --workspace <id> [--save] [...]
                                           sign a token locally (dev workers/tests only)`
+
+/**
+ * Per-subcommand help screens. The dispatcher routes `auth <sub> --help` here
+ * BEFORE the subcommand's strict `parseArgs` runs — otherwise `--help` is an
+ * unknown option and throws (the bug this map fixes). `whoami` is intentionally
+ * absent: it forwards to the `whoami` command, which renders its own help.
+ */
+const AUTH_SUBHELP: Record<string, CommandHelp> = {
+  device: {
+    name: 'glovebox auth device',
+    summary: 'browser device login; stores a gbx_ API key',
+    usage: 'glovebox auth device [--workspace <id>]... [options]',
+    description:
+      'Runs the browser device-authorization flow: prints a verification URL and\ncode, polls until you approve, then stores the returned gbx_ key and records\nthe server as your default.',
+    options: [
+      ['-w, --workspace <id>', 'Scope the key to a workspace (repeatable; empty = account-scoped)'],
+      ['-s, --server <url>', 'Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
+      ['--scope <s>', 'Capability scope (repeatable; default workspace:read + workspace:write)'],
+      ['--purpose <p>', 'Key purpose: cli, agent, or api (default cli)'],
+    ],
+    examples: [
+      'glovebox auth device --workspace ws_abc123',
+      'glovebox auth device -w ws_abc123 --server https://api.glovebox.test',
+    ],
+  },
+  login: {
+    name: 'glovebox auth login',
+    summary: 'store a pre-minted token',
+    usage: 'glovebox auth login [--token <t>] [options]',
+    description:
+      'Stores a token you already hold (and records the server as your default).\nPass it with --token, or pipe it on stdin — it is never echoed.',
+    options: [
+      ['-t, --token <t>', 'The token to store (or pipe it on stdin)'],
+      ['-s, --server <url>', 'Server URL (default: GLOVEBOX_SERVER_URL, config, or built-in)'],
+    ],
+    examples: [
+      'glovebox auth login --token gbx_… --server https://api.glovebox.test',
+      'pbpaste | glovebox auth login',
+    ],
+  },
+  logout: {
+    name: 'glovebox auth logout',
+    summary: 'forget a stored token',
+    usage: 'glovebox auth logout [options]',
+    options: [
+      ['-s, --server <url>', 'Server whose token to forget (default: the resolved server)'],
+    ],
+    examples: ['glovebox auth logout', 'glovebox auth logout --server https://api.glovebox.test'],
+  },
+  status: {
+    name: 'glovebox auth status',
+    summary: 'list stored credentials (decoded, not verified)',
+    usage: 'glovebox auth status',
+    description:
+      'Lists every server you have a stored token for, with the decoded claims when\navailable. Offline — it never contacts a server (use `glovebox whoami` for the\nverified, online identity).',
+    examples: ['glovebox auth status', 'glovebox --json auth status'],
+  },
+  use: {
+    name: 'glovebox auth use',
+    summary: 'set the default server for later commands',
+    usage: 'glovebox auth use <url>',
+    description: 'Records <url> as the default server, so later commands need no --server.',
+    args: [['url', 'The server URL to make default']],
+    examples: ['glovebox auth use https://api.glovebox.test'],
+  },
+  token: {
+    name: 'glovebox auth token',
+    summary: 'print the stored token (for scripting)',
+    usage: 'glovebox auth token [options]',
+    description:
+      'Prints the raw stored token to stdout (exit 1 if none), so it can be captured:\n`TOKEN=$(glovebox auth token)`.',
+    options: [['-s, --server <url>', 'Server whose token to print (default: the resolved server)']],
+    examples: ['glovebox auth token', 'TOKEN=$(glovebox auth token)'],
+  },
+  'mint-dev': {
+    name: 'glovebox auth mint-dev',
+    summary: 'sign a workspace token locally (dev workers/tests only)',
+    usage: 'glovebox auth mint-dev --secret <s> --workspace <id> [options]',
+    description:
+      'Signs a workspace token locally with a supplied WS_AUTH_SECRET. For dev\nworkers and tests only — production tokens come from the server.',
+    options: [
+      ['--secret <s>', 'The signing secret (WS_AUTH_SECRET; required)'],
+      ['-w, --workspace <id>', 'Workspace ID to sign for (required)'],
+      ['--principal <id>', 'Principal ID (default dev-cli)'],
+      ['--principal-type <t>', 'human or agent (default human)'],
+      ['--role <r>', 'viewer, commenter, or editor (default editor)'],
+      ['--owner <bool>', 'Owner flag (default true)'],
+      ['--epoch <n>', 'Auth epoch (default 0)'],
+      ['--ttl-hours <n>', 'Token lifetime in hours (default 12)'],
+      ['-s, --server <url>', 'Server URL the token targets'],
+      ['--save', 'Also store the minted token as the default credential'],
+    ],
+    examples: ['glovebox auth mint-dev --secret dev-secret --workspace ws_abc123 --save'],
+  },
+}
 
 export default async function auth(args: string[], globals: GlobalFlags): Promise<void> {
   const sub = args[0]
@@ -268,6 +373,13 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
 
   if (!sub || sub === '--help' || sub === '-h') {
     console.log(HELP)
+    return
+  }
+
+  // Intercept `auth <sub> --help` before the subcommand's strict parser sees
+  // `--help` (which it doesn't declare, so it would throw "Unknown option").
+  if ((rest.includes('--help') || rest.includes('-h')) && AUTH_SUBHELP[sub]) {
+    console.log(renderHelp(AUTH_SUBHELP[sub]))
     return
   }
 
@@ -373,8 +485,7 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
       const { positionals } = parseArgs({ args: rest, allowPositionals: true, strict: true })
       const target = positionals[0]
       if (!target) {
-        printError('auth use requires a <url>')
-        process.exitCode = 1
+        usageError('auth use requires a <url>', 'glovebox auth use')
         return
       }
       const result = await runAuthUse({ server: target })
@@ -437,8 +548,7 @@ export default async function auth(args: string[], globals: GlobalFlags): Promis
         strict: true,
       })
       if (!values.secret || !values.workspace) {
-        printError('mint-dev requires --secret and --workspace')
-        process.exitCode = 1
+        usageError('mint-dev requires --secret and --workspace', 'glovebox auth mint-dev')
         return
       }
       const result = await runMintDev({

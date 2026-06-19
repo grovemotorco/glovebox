@@ -8,6 +8,73 @@ export function getVersion(): string {
   return pkg.version
 }
 
+/**
+ * Declarative spec for one command's `--help` screen. Every command builds one
+ * of these and renders it through {@link renderHelp}, so the section order,
+ * column alignment, and the trailing `-h, --help` row stay identical across the
+ * whole surface (the inconsistency the pre-overhaul per-command strings had).
+ */
+export interface CommandHelp {
+  /** Fully-qualified invocation, e.g. `glovebox auth device`. */
+  name: string
+  /** One-line tagline shown after the em-dash on the title row. */
+  summary: string
+  /** A single `Usage: …` line, or several rendered under a `Usage:` block. */
+  usage: string | string[]
+  /** Optional prose paragraph(s); embedded newlines are preserved. */
+  description?: string
+  /** Positional arguments as `[name, description]` rows. */
+  args?: [string, string][]
+  /** Flags as `[flag, description]` rows; `-h, --help` is appended for you. */
+  options?: [string, string][]
+  /** Copy-pasteable example invocations. */
+  examples?: string[]
+}
+
+/** Render a {@link CommandHelp} to the shared, aligned help layout. */
+export function renderHelp(help: CommandHelp): string {
+  const lines: string[] = [`${help.name} — ${help.summary}`, '']
+
+  const usages = Array.isArray(help.usage) ? help.usage : [help.usage]
+  if (usages.length === 1) {
+    lines.push(`Usage: ${usages[0]}`)
+  } else {
+    lines.push('Usage:')
+    for (const usage of usages) lines.push(`  ${usage}`)
+  }
+
+  if (help.description) {
+    lines.push('', help.description.trim())
+  }
+
+  // Every command gets the same help row, so callers never repeat it.
+  const options: [string, string][] = [
+    ...(help.options ?? []),
+    ['-h, --help', 'Show this help message'],
+  ]
+  const pad =
+    Math.max(
+      0,
+      ...(help.args ?? []).map(([label]) => label.length),
+      ...options.map(([label]) => label.length),
+    ) + 3
+
+  if (help.args && help.args.length > 0) {
+    lines.push('', 'Arguments:')
+    for (const [label, desc] of help.args) lines.push(`  ${label.padEnd(pad)}${desc}`)
+  }
+
+  lines.push('', 'Options:')
+  for (const [label, desc] of options) lines.push(`  ${label.padEnd(pad)}${desc}`)
+
+  if (help.examples && help.examples.length > 0) {
+    lines.push('', 'Examples:')
+    for (const example of help.examples) lines.push(`  ${example}`)
+  }
+
+  return lines.join('\n')
+}
+
 export function printUsage(commands: RootCommand[]): void {
   const visible = commands.filter((c) => !c.hidden)
   const groups = [...new Set(visible.map((c) => c.group))]
@@ -33,6 +100,8 @@ export function printUsage(commands: RootCommand[]): void {
     }
   }
   lines.push(
+    '',
+    "Run 'glovebox <command> --help' for a command's arguments and examples.",
     '',
     'Global options:',
     '  --json          Structured JSON output (default when stdout is not a TTY)',

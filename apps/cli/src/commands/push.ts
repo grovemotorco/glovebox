@@ -2,7 +2,15 @@ import { readFile } from 'node:fs/promises'
 import { parseArgs } from 'node:util'
 import type { GloveboxClient, TextPushResult } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printError, printJson, printSuccess, printWarn, resolveOutputMode } from '../cli/output.ts'
+import { renderHelp } from '../cli/help.ts'
+import {
+  printError,
+  printJson,
+  printSuccess,
+  printWarn,
+  resolveOutputMode,
+  usageError,
+} from '../cli/output.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'
 import {
   findBookkeepingByPath,
@@ -122,26 +130,32 @@ export default async function push(args: string[], globals: GlobalFlags): Promis
   })
 
   if (values.help) {
-    console.log(`glovebox push — merge local edits into the live document
-
-Usage: glovebox push <path> [options]
-
-Merges your edits (diffed against the recorded base from \`glovebox pull\`)
-into the live document server-side; concurrent edits are preserved. On a
-clean merge the local file and base advance to the merged result.
-
-Exit codes: 0 clean · 2 failed hunks (printed verbatim; base unchanged) ·
-3 degenerate-rewrite refused (use --force only intentionally) · 1 other.
-
-Options:
-      --force        Apply even a degenerate rewrite (>60% deletion)
-  -s, --server <url> Server URL (default: the server recorded at pull time)
-  -h, --help         Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox push',
+        summary: 'merge local edits into the live document',
+        usage: 'glovebox push <path> [options]',
+        description:
+          'Merges your edits (diffed against the recorded base from `glovebox pull`)\n' +
+          'into the live document server-side; concurrent edits are preserved. On a\n' +
+          'clean merge the local file and base advance to the merged result.\n\n' +
+          'Exit codes: 0 clean · 2 failed hunks (printed verbatim; base unchanged) ·\n' +
+          '3 degenerate-rewrite refused (use --force only intentionally) · 1 other.',
+        options: [
+          ['--force', 'Apply even a degenerate rewrite (>60% deletion)'],
+          ['-s, --server <url>', 'Server URL (default: the server recorded at pull time)'],
+        ],
+        examples: ['glovebox push docs/note.md', 'glovebox push docs/note.md --force'],
+      }),
+    )
     return
   }
 
   const path = positionals[0]
-  if (!path) throw new Error('push requires a <path>')
+  if (!path) {
+    usageError('push requires a <path>', 'glovebox push')
+    return
+  }
 
   const outcome = await runPush({ path, force: values.force, serverUrl: values.server })
   const json = resolveOutputMode(globals) === 'json'
