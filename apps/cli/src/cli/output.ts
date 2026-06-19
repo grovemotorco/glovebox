@@ -68,6 +68,17 @@ export function printWarn(msg: string): void {
   console.error(`${stderrColors.yellow}warning${stderrColors.reset}: ${msg}`)
 }
 
+/**
+ * A missing-argument / bad-invocation error. Prints a one-line reason plus a
+ * pointer to the command's `--help` (never the whole help screen) and sets a
+ * non-zero exit code — uniform across every command's usage paths.
+ */
+export function usageError(message: string, command: string): void {
+  printError(message)
+  printHint(`Run \`${command} --help\` for usage.`)
+  process.exitCode = 1
+}
+
 export function printSuccess(msg: string): void {
   console.log(`${colors.green}✓${colors.reset} ${msg}`)
 }

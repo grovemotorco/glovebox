@@ -1,7 +1,14 @@
 import { parseArgs } from 'node:util'
 import type { GloveboxClient, WorkspaceSummary } from '@glovebox.md/api'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printError, printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
+import { renderHelp } from '../cli/help.ts'
+import {
+  printError,
+  printJson,
+  printSuccess,
+  resolveOutputMode,
+  usageError,
+} from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
 import { resolveAuthedClient } from '../lib/client.ts'
 import type { GloveboxPaths } from '../lib/paths.ts'
@@ -43,15 +50,16 @@ export async function runWorkspaceCreate(
   return { serverUrl, workspace }
 }
 
-const HELP = `glovebox workspaces — list and create workspaces
-
-Usage:
-  glovebox workspaces [list] [--server <url>]
-  glovebox workspaces create <name> [--slug <slug>] [--server <url>]
-
-Options:
-  -s, --server <url>   Server (default: GLOVEBOX_SERVER_URL, config, or built-in)
-  -h, --help           Show this help message`
+const HELP = renderHelp({
+  name: 'glovebox workspaces',
+  summary: 'list and create workspaces',
+  usage: [
+    'glovebox workspaces [list] [--server <url>]',
+    'glovebox workspaces create <name> [--slug <slug>] [--server <url>]',
+  ],
+  options: [['-s, --server <url>', 'Server (default: GLOVEBOX_SERVER_URL, config, or built-in)']],
+  examples: ['glovebox workspaces list', 'glovebox workspaces create "My Notes" --slug my-notes'],
+})
 
 const SUBCOMMAND_SCAN_OPTIONS = {
   server: { type: 'string', short: 's' },
@@ -134,8 +142,7 @@ export default async function workspaces(args: string[], globals: GlobalFlags): 
     }
     const name = positionals[0]
     if (!name) {
-      printError('workspaces create requires a <name>')
-      process.exitCode = 1
+      usageError('workspaces create requires a <name>', 'glovebox workspaces create')
       return
     }
     const { workspace, serverUrl } = await runWorkspaceCreate({

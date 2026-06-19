@@ -3,7 +3,8 @@ import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { DEFAULT_DELETE_POLICY } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
-import { printJson, printSuccess, resolveOutputMode } from '../cli/output.ts'
+import { renderHelp } from '../cli/help.ts'
+import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import { lockHolderPid } from '../lib/lockfile.ts'
 import { parseSyncOverrides } from '../lib/overrides.ts'
 import { canonicalizeDir, gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
@@ -61,21 +62,22 @@ export default async function unmount(args: string[], globals: GlobalFlags): Pro
     strict: true,
   })
 
-  if (values.help || !positionals[0]) {
-    console.log(`glovebox unmount <dir> — remove a mount binding (keeps your files)
-
-Removes the registry entry, the daemon's state directory, and the in-mount
-.glovebox.json sentinel. Refuses while a daemon is running on the mount.
-User files are never touched.
-
-Arguments:
-  dir          The mounted directory (exact mount root)
-
-Options:
-  -h, --help   Show this help message`)
-    if (!values.help) {
-      process.exitCode = 1
-    }
+  if (values.help) {
+    console.log(
+      renderHelp({
+        name: 'glovebox unmount',
+        summary: 'remove a mount binding (keeps your files)',
+        usage: 'glovebox unmount <dir> [options]',
+        description:
+          "Removes the registry entry, the daemon's state directory, and the in-mount\n.glovebox.json sentinel. Refuses while a daemon is running on the mount.\nUser files are never touched.",
+        args: [['dir', 'The mounted directory (exact mount root)']],
+        examples: ['glovebox unmount ./notes'],
+      }),
+    )
+    return
+  }
+  if (!positionals[0]) {
+    usageError('unmount requires a <dir>', 'glovebox unmount')
     return
   }
 

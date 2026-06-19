@@ -8,6 +8,7 @@ import {
   createNodeFS,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
+import { renderHelp } from '../cli/help.ts'
 import { printError, printHint, printWarn } from '../cli/output.ts'
 import { getToken } from '../lib/auth-store.ts'
 import { acquireLock } from '../lib/lockfile.ts'
@@ -216,6 +217,19 @@ export async function resolveWorkspaceSocketToken(options: {
   return minted.token ?? undefined
 }
 
+/**
+ * Parse a human-friendly duration into whole seconds. Accepts a bare number
+ * (seconds, the historical form) or a `s`/`m`/`h` suffix. Returns null on a
+ * malformed or non-positive value so the caller can report a usage error.
+ */
+export function parseDurationSeconds(value: string): number | null {
+  const match = /^(\d+(?:\.\d+)?)(s|m|h)?$/.exec(value.trim())
+  if (!match) return null
+  const factor = match[2] === 'h' ? 3600 : match[2] === 'm' ? 60 : 1
+  const seconds = Number(match[1]) * factor
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null
+}
+
 export default async function run(args: string[], _globals: GlobalFlags): Promise<void> {
   const { positionals, values } = parseArgs({
     args,
@@ -228,33 +242,39 @@ export default async function run(args: string[], _globals: GlobalFlags): Promis
   })
 
   if (values.help) {
-    console.log(`glovebox run [dir] — run the sync daemon for a mount (foreground)
-
-One process per mount, guarded by a mandatory lockfile. The first cycle
-adopts the directory (sentinel write; existing files bind to workspace
-files by path, unknown paths become creates). Watcher events only hint a
-rescan — the jittered rescan loop is the correctness backstop.
-
-Arguments:
-  dir                        A mounted directory or any path inside one (default: cwd)
-
-Options:
-      --rescan-interval <s>  Periodic full-rescan interval in seconds
-                             (default ${1800}, jittered)
-  -h, --help                 Show this help message`)
+    console.log(
+      renderHelp({
+        name: 'glovebox run',
+        summary: 'run the sync daemon for a mount (foreground)',
+        usage: 'glovebox run [dir] [options]',
+        description:
+          'One process per mount, guarded by a mandatory lockfile. The first cycle\nadopts the directory (sentinel write; existing files bind to workspace\nfiles by path, unknown paths become creates). Watcher events only hint a\nrescan — the jittered rescan loop is the correctness backstop.',
+        args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
+        options: [
+          [
+            '--rescan-interval <dur>',
+            'Periodic full-rescan interval, e.g. 30m, 1h, or bare seconds (default 30m, jittered)',
+          ],
+        ],
+        examples: [
+          'glovebox run ./notes',
+          'glovebox run',
+          'glovebox run ./notes --rescan-interval 10m',
+        ],
+      }),
+    )
     return
   }
 
-  const rescanIntervalSec = values['rescan-interval']
-    ? Number(values['rescan-interval'])
-    : undefined
-  if (
-    rescanIntervalSec !== undefined &&
-    (!Number.isFinite(rescanIntervalSec) || rescanIntervalSec <= 0)
-  ) {
-    printError('--rescan-interval must be a positive number of seconds')
-    process.exitCode = 1
-    return
+  let rescanIntervalSec: number | undefined
+  if (values['rescan-interval']) {
+    const parsed = parseDurationSeconds(values['rescan-interval'])
+    if (parsed === null) {
+      printError('--rescan-interval must be a positive duration, e.g. 30m, 1h, or 1800')
+      process.exitCode = 1
+      return
+    }
+    rescanIntervalSec = parsed
   }
 
   await runRun(positionals[0], { rescanIntervalSec })
