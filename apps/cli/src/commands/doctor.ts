@@ -8,7 +8,7 @@ import { printHint, printJson, printSuccess, resolveOutputMode } from '../cli/ou
 import { colors } from '../cli/colors.ts'
 import { loadAuth } from '../lib/auth-store.ts'
 import { resolveServer } from '../lib/config.ts'
-import { isProcessAlive, readLockRecord } from '../lib/lockfile.ts'
+import { lockRecordMatchesProcess, readLockRecord } from '../lib/lockfile.ts'
 import { gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
 import { loadRegistry } from '../lib/registry.ts'
 
@@ -91,12 +91,16 @@ export async function runDoctor(
   checks.push({ name: 'Reachability', status: reachable ? 'ok' : 'error', detail: reachDetail })
 
   const registry = await loadRegistry(paths)
-  // A lock whose holder pid is no longer alive is stale — it would refuse a
-  // future `unmount` until removed. Safe to clear automatically.
+  // A lock whose holder is no longer the live daemon is stale — it would
+  // refuse a future `unmount` until removed. Safe to clear automatically.
+  // Use the same token-aware predicate as `acquireLock`/`unmount` so a pid
+  // recycled across a reboot (live pid, mismatched process-start token) is
+  // reported stale here too, instead of `doctor` disagreeing with the
+  // lock-breaking logic it exists to surface.
   const staleMountIds: string[] = []
   for (const mount of registry.mounts) {
     const record = await readLockRecord(paths, mount.mountId)
-    if (record && !isProcessAlive(record.pid)) staleMountIds.push(mount.mountId)
+    if (record && !lockRecordMatchesProcess(record)) staleMountIds.push(mount.mountId)
   }
   if (staleMountIds.length > 0) {
     checks.push({

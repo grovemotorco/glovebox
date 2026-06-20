@@ -7,9 +7,8 @@ import { base64ToBytes } from '@glovebox.md/sync/loro'
 import {
   DEFAULT_DELETE_POLICY,
   NodeDaemonStorage,
-  STATE_ARTIFACT,
   envelopeName,
-  type DaemonWorkspaceState,
+  readWorkspaceState,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
 import { withNextActions } from '../cli/envelope.ts'
@@ -22,10 +21,12 @@ import { canonicalizeDir, gloveboxPaths, type GloveboxPaths } from '../lib/paths
 import { findMountForDir, loadRegistry } from '../lib/registry.ts'
 
 /**
- * Status reads the persisted state artifact DIRECTLY (plain JSON parse) —
- * never through `DaemonStateStore.load()`, whose reconcile persists
- * repairs. Works with or without a running daemon; artifact writes are
- * atomic, so a mid-cycle read sees a consistent (if slightly stale) pair.
+ * Status reads the persisted state artifact through the shared, schema-gated
+ * `readWorkspaceState` (a pure read — an unparseable or invalid file reports
+ * as not-initialized) — never through `DaemonStateStore.load()`, whose
+ * reconcile persists repairs. Works with or without a running daemon; artifact
+ * writes are atomic, so a mid-cycle read sees a consistent (if slightly stale)
+ * pair.
  *
  * The INV-3 stack is the point of this command: a held delete that never
  * propagates is a support case unless the user can SEE why.
@@ -89,8 +90,8 @@ export async function runStatus(
   )
 
   const storage = new NodeDaemonStorage(paths.stateDir(mount.mountId))
-  const stateBytes = await storage.read(STATE_ARTIFACT)
-  if (!stateBytes) {
+  const state = await readWorkspaceState(storage)
+  if (!state) {
     return {
       dir: mount.dir,
       mountId: mount.mountId,
@@ -110,7 +111,6 @@ export async function runStatus(
     }
   }
 
-  const state = JSON.parse(new TextDecoder().decode(stateBytes)) as DaemonWorkspaceState
   const files = Object.entries(state.files ?? {})
 
   let pendingPushes = 0

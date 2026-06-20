@@ -4,6 +4,7 @@ import {
   NodeDaemonStorage,
   STATE_ARTIFACT,
   deleteResolutionName,
+  readWorkspaceState,
   type DaemonWorkspaceState,
   type DeleteResolutionCommand,
   type PendingDelete,
@@ -164,18 +165,16 @@ export async function runSyncDeletes(
   }
 }
 
-async function readWorkspaceState(
-  storage: NodeDaemonStorage,
-): Promise<DaemonWorkspaceState | null> {
-  const bytes = await storage.read(STATE_ARTIFACT)
-  if (bytes === null) return null
-  return JSON.parse(new TextDecoder().decode(bytes)) as DaemonWorkspaceState
-}
-
 function selectHeldDeletes(deletes: PendingDelete[], target: string): PendingDelete[] {
   const held = deletes.filter((intent) => intent.held !== undefined)
+  // An exact path/fileId match always wins over the `all` keyword, so a held
+  // file literally named `all` can still be targeted on its own — and a stray
+  // `--confirm all` can never release every held delete by accident when such
+  // a file exists.
+  const exact = held.filter((intent) => intent.path === target || intent.fileId === target)
+  if (exact.length > 0) return exact
   if (target === 'all') return held
-  return held.filter((intent) => intent.path === target || intent.fileId === target)
+  return []
 }
 
 function applyResolutionCommandToState(
@@ -325,7 +324,7 @@ async function deletes(args: string[], globals: GlobalFlags): Promise<void> {
           'glovebox sync deletes [dir] --restore <path|all>',
         ],
         description:
-          'Shows pending local delete intents. Held deletes are suspected bulk/startup wipes\nand never propagate until explicitly confirmed or restored.',
+          'Shows pending local delete intents. Held deletes are suspected bulk/startup wipes\nand never propagate until explicitly confirmed or restored.\n`all` targets every held delete; an exact path or file id always takes precedence.',
         args: [['dir', 'A mounted directory or any path inside one (default: cwd)']],
         options: [
           ['--list', 'List held and free pending deletes (default action)'],

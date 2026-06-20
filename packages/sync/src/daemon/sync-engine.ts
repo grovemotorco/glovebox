@@ -308,6 +308,15 @@ export class DaemonSyncEngine {
     }
   }
 
+  /** Drop the warn-once dedup keys for a file leaving the held state, so a
+   *  genuinely new hold of the SAME file later in this session warns again
+   *  (the set is keyed by held-reason + fileId and would otherwise grow
+   *  unbounded across delete/restore churn and silently suppress re-warns). */
+  #clearHeldWarning(fileId: string): void {
+    this.#warnedHeldDeletes.delete(`bulk-startup:${fileId}`)
+    this.#warnedHeldDeletes.delete(`bulk-window:${fileId}`)
+  }
+
   async #applyDeleteResolutionCommands(): Promise<void> {
     // Each command is its own file under DELETE_RESOLUTION_DIR. We read the
     // set present NOW; any file the CLI writes after this list() is a brand
@@ -355,6 +364,7 @@ export class DaemonSyncEngine {
           if (intent?.held !== undefined) {
             delete intent.held
             intent.confirmedAtMs = command.createdAt
+            this.#clearHeldWarning(fileId)
             pendingChanged = true
           }
           continue
@@ -381,6 +391,7 @@ export class DaemonSyncEngine {
         this.#pendingDeletes.set(fileId, intent)
       }
       for (const fileId of restored) {
+        this.#clearHeldWarning(fileId)
         this.#markForRestore(fileId)
       }
     }
@@ -1799,6 +1810,7 @@ export class DaemonSyncEngine {
     this.#opaqueInFlight.delete(fileId)
     this.#opaqueRefused.delete(fileId)
     this.#renameReconcile.delete(fileId)
+    this.#clearHeldWarning(fileId)
     await this.#store.removeFile(fileId)
   }
 
@@ -1973,6 +1985,7 @@ export class DaemonSyncEngine {
 
   async #cancelDeleteIntent(fileId: string): Promise<void> {
     if (!this.#pendingDeletes.delete(fileId)) return
+    this.#clearHeldWarning(fileId)
     await this.#store.setPendingDeletes([...this.#pendingDeletes.values()])
   }
 }

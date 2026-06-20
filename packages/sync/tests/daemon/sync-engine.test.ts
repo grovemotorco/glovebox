@@ -230,6 +230,102 @@ describe('DaemonSyncEngine cycle isolation and opaque observability (ISSUE-0053)
 })
 
 describe('DaemonSyncEngine delete holds and resolution', () => {
+  it('treats schema-invalid nested state as fresh on start instead of crashing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      const storage = new MemoryDaemonStorage()
+      // Top-level shape is valid, but the nested entries are invalid: a null
+      // file value (would crash reconcile on fileState.contentKind), a file
+      // missing its watermark fields (would hydrate a view with an undefined
+      // lastWrittenHash), and a pending delete missing opId/baseSeq (would
+      // build a submitBatch op with undefined identifiers). The deep gate makes
+      // load() fall back to fresh instead.
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson({
+          workspaceId: 'ws-test',
+          mountId: 'mount-test',
+          deviceId: 'device-test',
+          lastAckedSeq: 0,
+          files: {
+            'f-null': null,
+            'f-partial': { path: 'p.md', contentKind: 'markdown' },
+          },
+          pendingRenames: [],
+          pendingDeletes: [{ fileId: 'f-x', path: 'x.md', observedMissingAtMs: 1 }],
+        }),
+      )
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => 1_000_000,
+      })
+
+      await expect(engine.start()).resolves.toBeUndefined()
+      expect(engine.files()).toEqual([])
+      expect(engine.pendingDeletes()).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-warns a genuinely new bulk hold of a file that was previously held then cleared', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      // Sentinel present so the mount is never suspect (which would freeze
+      // delete processing). Two opaque files so a low-threshold bulk-window
+      // guard trips on their disappearance.
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'a.bin'), new Uint8Array([1, 2, 3]))
+      await writeFile(join(root, 'b.bin'), new Uint8Array([4, 5, 6]))
+      const T0 = 1_000_000
+      const warnings: DaemonSyncWarning[] = []
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage: new MemoryDaemonStorage(),
+        transport: new FakeTransport(),
+        now: () => T0,
+        deletePolicy: { bulkMinCount: 2, bulkRatioFloor: 2, bulkRatio: 0.5 },
+        onWarning: (warning) => warnings.push(warning),
+      })
+      const heldWarnings = () => warnings.filter((w) => w.type === 'delete-intents-held')
+
+      await engine.start()
+      await engine.runCycle() // register + opaque-submit both files
+      await engine.runCycle() // settle (watermarks now non-empty)
+
+      // First bulk delete → both held by the window guard → one warning.
+      await rm(join(root, 'a.bin'))
+      await rm(join(root, 'b.bin'))
+      await engine.runCycle()
+      expect(engine.pendingDeletes().map((i) => i.held)).toEqual(['bulk-window', 'bulk-window'])
+      expect(heldWarnings()).toHaveLength(1)
+
+      // Files reappear (transient absence) → intents canceled, dedup keys pruned.
+      await writeFile(join(root, 'a.bin'), new Uint8Array([1, 2, 3]))
+      await writeFile(join(root, 'b.bin'), new Uint8Array([4, 5, 6]))
+      await engine.runCycle()
+      expect(engine.pendingDeletes()).toEqual([])
+
+      // A genuinely new bulk delete of the SAME files must warn AGAIN — before
+      // the fix the stale `bulk-window:<fileId>` keys suppressed this.
+      await rm(join(root, 'a.bin'))
+      await rm(join(root, 'b.bin'))
+      await engine.runCycle()
+      expect(engine.pendingDeletes().map((i) => i.held)).toEqual(['bulk-window', 'bulk-window'])
+      expect(heldWarnings()).toHaveLength(2)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces persisted held deletes on start and skips them in nextWakeMs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
     try {

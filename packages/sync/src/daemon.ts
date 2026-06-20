@@ -14,6 +14,7 @@ export {
   STATE_ARTIFACT,
   deleteResolutionName,
   envelopeName,
+  readWorkspaceState,
   type DaemonFileState,
   type DaemonReadyFile,
   type DaemonReconcileResult,
