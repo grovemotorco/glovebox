@@ -135,11 +135,7 @@ export async function runSyncDeletes(
           storage,
           command,
         )
-        if (wroteState) {
-          // We are the writer — reflect the projection we just persisted in
-          // this command's own output so it matches the on-disk state.
-          applyResolutionCommandToState(state, command)
-        } else {
+        if (!wroteState) {
           daemonRecord = liveDaemonRecord(await readLockRecord(paths, mount.mountId))
           if (daemonRecord !== null && options.signalDaemon !== false) {
             signaled = signalDaemon(daemonRecord)
@@ -156,7 +152,14 @@ export async function runSyncDeletes(
     }
   }
 
-  const outputState = state ?? null
+  // Build output from the AUTHORITATIVE on-disk state, re-read after any
+  // resolution write/queue, so it can never claim a hold is cleared that isn't
+  // actually persisted: a live daemon owns the file (holds stay listed until it
+  // drains), the CLI persisted the projection (holds cleared), or the state was
+  // removed concurrently under the lock (empty — so a `writeProjectedState`
+  // success on missing state can't fabricate a cleared hold). This is exactly
+  // what `glovebox status` would report.
+  const outputState = options.action ? await readWorkspaceState(storage) : state
   const intents = (outputState?.pendingDeletes ?? []).map(
     (intent): SyncDeleteIntentView => ({
       fileId: intent.fileId,
