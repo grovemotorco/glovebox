@@ -26,9 +26,9 @@ import {
   type WorkspaceSyncTransport,
 } from '@glovebox.md/sync/client'
 import {
-  DELETE_RESOLUTION_ARTIFACT,
   DaemonSyncEngine,
   MemoryDaemonStorage,
+  deleteResolutionName,
   type BatchSubmitResult,
   type DaemonDeletePolicy,
   type DaemonStorage,
@@ -880,11 +880,9 @@ describe('DaemonSyncEngine INV-3 deletion stack', () => {
     )
 
     await daemon.storage.writeAtomic(
-      DELETE_RESOLUTION_ARTIFACT,
+      deleteResolutionName('confirm-all'),
       new TextEncoder().encode(
-        JSON.stringify({
-          commands: [{ id: 'confirm-all', action: 'confirm', fileIds, createdAt: clock.nowMs }],
-        }),
+        JSON.stringify({ id: 'confirm-all', action: 'confirm', fileIds, createdAt: clock.nowMs }),
       ),
     )
     clock.nowMs += 31_000

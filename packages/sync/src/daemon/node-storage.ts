@@ -58,10 +58,16 @@ export class NodeDaemonStorage implements DaemonStorage {
     await rm(this.#resolve(name), { force: true })
   }
 
-  async list(): Promise<string[]> {
+  async list(prefix?: string): Promise<string[]> {
+    // Scope the walk to `prefix` (a directory) when given, so the common
+    // per-cycle drain of an empty spool dir is a single readdir, not a
+    // recursive walk of every envelope in the data dir.
+    const root =
+      prefix === undefined ? this.dataDir : join(this.dataDir, ...prefix.split('/').filter(Boolean))
+    const base = prefix === undefined ? '' : prefix.endsWith('/') ? prefix : `${prefix}/`
     let entries
     try {
-      entries = await readdir(this.dataDir, { recursive: true, withFileTypes: true })
+      entries = await readdir(root, { recursive: true, withFileTypes: true })
     } catch (error) {
       if (isNotFound(error)) return []
       throw error
@@ -71,8 +77,8 @@ export class NodeDaemonStorage implements DaemonStorage {
       if (!entry.isFile()) continue
       if (entry.name.endsWith('.tmp')) continue
       const absolute = join(entry.parentPath, entry.name)
-      const relative = absolute.slice(this.dataDir.length + 1)
-      names.push(relative.split(sep).join('/'))
+      const relative = absolute.slice(root.length + 1)
+      names.push(base + relative.split(sep).join('/'))
     }
     return names.sort()
   }

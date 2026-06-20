@@ -205,6 +205,37 @@ describe('DaemonRunner (INV-8: jittered rescan + restart scan)', () => {
     runner.stop()
   })
 
+  it('re-arms the wake timer after a kicked cycle so a freshly observed delete is not delayed', async () => {
+    const timers = new FakeTimers()
+    const engine = new FakeEngine()
+    const now = 100_000
+    const runner = new DaemonRunner({
+      engine,
+      intervalMs: 10_000,
+      jitterMin: 1,
+      jitterMax: 1,
+      random: () => 0,
+      now: () => now,
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+    })
+
+    await runner.start()
+    // No pending delete yet → the long periodic timer is armed.
+    expect(timers.scheduled[0]!.delayMs).toBe(10_000)
+
+    // A delete is observed off the timer path (watcher/SIGUSR2 → kick); its
+    // tombstone expires in 2.5s. The kick must re-arm against that hint
+    // rather than leaving the 10s periodic timer to fire first.
+    engine.wakeAt = 102_500
+    await runner.kick()
+
+    expect(engine.cycles).toBe(2)
+    expect(timers.pending()).toBe(1)
+    expect(timers.scheduled.find((entry) => !entry.cleared)!.delayMs).toBe(2_500)
+    runner.stop()
+  })
+
   it('kicks serialize behind an in-flight cycle — cycles never overlap', async () => {
     const timers = new FakeTimers()
     const engine = new FakeEngine()

@@ -1,4 +1,6 @@
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { link, mkdir, readFile, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { ensureDir, type GloveboxPaths } from './paths.ts'
@@ -31,6 +33,7 @@ export interface LockRecord {
   pid: number
   nonce: string
   startedAt: string
+  processStartToken?: string
 }
 
 export class LockHeldError extends Error {
@@ -90,20 +93,41 @@ function parseLockRecord(raw: string): LockRecord | null {
       parsed.pid <= 0 ||
       typeof parsed.nonce !== 'string' ||
       parsed.nonce.length === 0 ||
-      typeof parsed.startedAt !== 'string'
+      typeof parsed.startedAt !== 'string' ||
+      (parsed.processStartToken !== undefined && typeof parsed.processStartToken !== 'string')
     ) {
       return null
     }
-    return { version: 1, pid: parsed.pid, nonce: parsed.nonce, startedAt: parsed.startedAt }
+    return {
+      version: 1,
+      pid: parsed.pid,
+      nonce: parsed.nonce,
+      startedAt: parsed.startedAt,
+      processStartToken: parsed.processStartToken,
+    }
   } catch {
     return null
   }
 }
 
+export function processStartToken(pid: number): string | null {
+  return linuxProcessStartToken(pid) ?? psProcessStartToken(pid)
+}
+
+export function lockRecordMatchesProcess(
+  record: LockRecord,
+  startTokenOf: (pid: number) => string | null = processStartToken,
+): boolean {
+  if (!isProcessAlive(record.pid)) return false
+  if (record.processStartToken === undefined) return true
+  const current = startTokenOf(record.pid)
+  return current === null || current === record.processStartToken
+}
+
 /** Live holder's pid, or null (no lock, stale lock, corrupt lock). */
 export async function lockHolderPid(paths: GloveboxPaths, mountId: string): Promise<number | null> {
   const record = await readLockRecord(paths, mountId)
-  if (!record || !isProcessAlive(record.pid)) {
+  if (!record || !lockRecordMatchesProcess(record)) {
     return null
   }
   return record.pid
@@ -126,6 +150,8 @@ export async function acquireLock(
       nonce: randomUUID(),
       startedAt: new Date().toISOString(),
     }
+    const token = processStartToken(pid)
+    if (token !== null) record.processStartToken = token
 
     // Publish atomically: full record first, then link into place.
     const tmpPath = `${lockPath}.${record.nonce}.tmp`
@@ -152,7 +178,7 @@ export async function acquireLock(
     }
 
     const existing = await readLockRecord(paths, mountId)
-    if (existing && isProcessAlive(existing.pid)) {
+    if (existing && lockRecordMatchesProcess(existing)) {
       throw new LockHeldError(mountId, existing, lockPath)
     }
     // Stale (dead holder) or corrupt: break it under the mutex, then retry.
@@ -200,11 +226,44 @@ async function breakStaleLock(lockPath: string): Promise<void> {
       return // Absent — a previous breaker already handled it.
     }
     const current = parseLockRecord(raw)
-    if (current && isProcessAlive(current.pid)) {
+    if (current && lockRecordMatchesProcess(current)) {
       return // A live holder took over since we judged — nothing to break.
     }
     await unlink(lockPath).catch(() => {})
   } finally {
     await rmdir(mutexPath).catch(() => {})
+  }
+}
+
+function linuxProcessStartToken(pid: number): string | null {
+  try {
+    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim()
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8')
+    const endComm = stat.lastIndexOf(')')
+    if (endComm === -1) return null
+    const fields = stat
+      .slice(endComm + 2)
+      .trim()
+      .split(/\s+/)
+    const startTicks = fields[19]
+    if (!bootId || !startTicks) return null
+    return `linux:${bootId}:${startTicks}`
+  } catch {
+    return null
+  }
+}
+
+function psProcessStartToken(pid: number): string | null {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf-8',
+      env: { ...process.env, LC_ALL: 'C' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    if (out === '') return null
+    const ms = Date.parse(out)
+    return Number.isNaN(ms) ? null : `ps-lstart:${ms}`
+  } catch {
+    return null
   }
 }

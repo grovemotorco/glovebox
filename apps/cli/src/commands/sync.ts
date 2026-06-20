@@ -1,12 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { parseArgs } from 'node:util'
 import {
-  DELETE_RESOLUTION_ARTIFACT,
   NodeDaemonStorage,
   STATE_ARTIFACT,
+  deleteResolutionName,
   type DaemonWorkspaceState,
   type DeleteResolutionCommand,
-  type DeleteResolutionQueue,
   type PendingDelete,
 } from '@glovebox.md/sync/daemon'
 import type { GlobalFlags } from '../cli/index.ts'
@@ -14,7 +13,14 @@ import { withNextActions } from '../cli/envelope.ts'
 import { renderHelp } from '../cli/help.ts'
 import { printJson, printSuccess, resolveOutputMode, usageError } from '../cli/output.ts'
 import { colors } from '../cli/colors.ts'
-import { lockHolderPid } from '../lib/lockfile.ts'
+import {
+  LockHeldError,
+  acquireLock,
+  isProcessAlive,
+  processStartToken,
+  readLockRecord,
+  type LockRecord,
+} from '../lib/lockfile.ts'
 import { canonicalizeDir, gloveboxPaths, type GloveboxPaths } from '../lib/paths.ts'
 import { findMountForDir, loadRegistry } from '../lib/registry.ts'
 
@@ -71,7 +77,8 @@ export async function runSyncDeletes(
 
   const storage = new NodeDaemonStorage(paths.stateDir(mount.mountId))
   const state = await readWorkspaceState(storage)
-  const pid = await lockHolderPid(paths, mount.mountId)
+  const lockRecord = await readLockRecord(paths, mount.mountId)
+  let daemonRecord = liveDaemonRecord(lockRecord)
   let signaled = false
 
   let actionResult: SyncDeletesResult['action'] = null
@@ -84,18 +91,45 @@ export async function runSyncDeletes(
       throw new Error(`sync deletes --${options.action} requires <path|all>`)
     }
     const targets = selectHeldDeletes(state.pendingDeletes ?? [], resolutionTarget)
+    if (targets.length === 0 && resolutionTarget !== 'all') {
+      throw new Error(
+        `no held delete matches "${resolutionTarget}" — run \`glovebox sync deletes\` to list held deletes`,
+      )
+    }
     const resolvedAtMs = now()
-    applyResolutionToState(state, options.action, targets, resolvedAtMs)
-    await storage.writeAtomic(STATE_ARTIFACT, encodeJson(state))
+    const command: DeleteResolutionCommand = {
+      id: randomUUID(),
+      action: options.action,
+      fileIds: targets.map((intent) => intent.fileId),
+      createdAt: resolvedAtMs,
+    }
+    applyResolutionCommandToState(state, command)
     if (targets.length > 0) {
-      await enqueueDeleteResolution(storage, {
-        id: randomUUID(),
-        action: options.action,
-        fileIds: targets.map((intent) => intent.fileId),
-        createdAt: resolvedAtMs,
-      })
-      if (pid !== null && options.signalDaemon !== false) {
-        signaled = signalDaemon(pid)
+      await enqueueDeleteResolution(storage, command)
+      if (daemonRecord !== null) {
+        // A live daemon is the single writer of workspace-state.json; the
+        // queued command above is the resolution channel. Writing state here
+        // would race the daemon's own whole-file persists and revert its
+        // progress, so only signal it to drain the queue.
+        if (options.signalDaemon !== false) signaled = signalDaemon(daemonRecord)
+      } else {
+        // No live daemon owns the state file — persist the projected result
+        // so a later `status` reflects it before the next `glovebox run` (the
+        // queue is re-applied idempotently when the daemon next starts). Take
+        // the mount lock for the write so a concurrently-starting daemon
+        // cannot become the state owner between our liveness check and write.
+        const wroteState = await writeProjectedStateUnderLock(
+          paths,
+          mount.mountId,
+          storage,
+          command,
+        )
+        if (!wroteState) {
+          daemonRecord = liveDaemonRecord(await readLockRecord(paths, mount.mountId))
+          if (daemonRecord !== null && options.signalDaemon !== false) {
+            signaled = signalDaemon(daemonRecord)
+          }
+        }
       }
     }
     actionResult = {
@@ -122,7 +156,7 @@ export async function runSyncDeletes(
     mountId: mount.mountId,
     workspaceId: mount.workspaceId,
     serverUrl: mount.serverUrl,
-    daemon: { running: pid !== null, pid, signaled },
+    daemon: { running: daemonRecord !== null, pid: daemonRecord?.pid ?? null, signaled },
     heldDeleteIntents: intents.filter((intent) => intent.held !== null).length,
     freeDeleteIntents: intents.filter((intent) => intent.held === null).length,
     deleteIntents: intents,
@@ -144,18 +178,16 @@ function selectHeldDeletes(deletes: PendingDelete[], target: string): PendingDel
   return held.filter((intent) => intent.path === target || intent.fileId === target)
 }
 
-function applyResolutionToState(
+function applyResolutionCommandToState(
   state: DaemonWorkspaceState,
-  action: DeleteResolutionAction,
-  targets: PendingDelete[],
-  resolvedAtMs: number,
+  command: DeleteResolutionCommand,
 ): void {
-  const ids = new Set(targets.map((intent) => intent.fileId))
-  if (action === 'confirm') {
+  const ids = new Set(command.fileIds)
+  if (command.action === 'confirm') {
     for (const intent of state.pendingDeletes ?? []) {
       if (ids.has(intent.fileId)) {
         delete intent.held
-        intent.confirmedAtMs = resolvedAtMs
+        intent.confirmedAtMs = command.createdAt
       }
     }
     return
@@ -176,27 +208,67 @@ async function enqueueDeleteResolution(
   storage: NodeDaemonStorage,
   command: DeleteResolutionCommand,
 ): Promise<void> {
-  const bytes = await storage.read(DELETE_RESOLUTION_ARTIFACT)
-  let queue: DeleteResolutionQueue = { commands: [] }
-  if (bytes !== null) {
-    try {
-      const parsed = JSON.parse(new TextDecoder().decode(bytes)) as DeleteResolutionQueue
-      if (Array.isArray(parsed.commands)) queue = parsed
-    } catch {
-      queue = { commands: [] }
-    }
-  }
-  queue.commands.push(command)
-  await storage.writeAtomic(DELETE_RESOLUTION_ARTIFACT, encodeJson(queue))
+  // One file per command, named by its unique id: a concurrent `sync deletes`
+  // enqueue or the daemon's drain can never overwrite or drop it. There is no
+  // shared read-modify-write, so no lock is required.
+  await storage.writeAtomic(deleteResolutionName(command.id), encodeJson(command))
 }
 
-function signalDaemon(pid: number): boolean {
+async function writeProjectedStateUnderLock(
+  paths: GloveboxPaths,
+  mountId: string,
+  storage: NodeDaemonStorage,
+  command: DeleteResolutionCommand,
+): Promise<boolean> {
+  let lock
   try {
-    process.kill(pid, 'SIGUSR2')
+    lock = await acquireLock(paths, mountId)
+  } catch (error) {
+    if (error instanceof LockHeldError) return false
+    throw error
+  }
+  try {
+    const state = await readWorkspaceState(storage)
+    if (state === null) return true
+    applyResolutionCommandToState(state, command)
+    await storage.writeAtomic(STATE_ARTIFACT, encodeJson(state))
+    return true
+  } finally {
+    await lock.release()
+  }
+}
+
+function liveDaemonRecord(record: LockRecord | null): LockRecord | null {
+  return record !== null && isCurrentDaemonProcess(record) ? record : null
+}
+
+function signalDaemon(
+  record: LockRecord,
+  startTokenOf: (pid: number) => string | null = processStartToken,
+): boolean {
+  // PID-reuse guard: SIGUSR2's default disposition is to terminate, so the
+  // lock's process-start token must match the currently-live process before
+  // we signal it. If identity can't be positively confirmed we do NOT signal
+  // — the daemon drains the spool on its next cycle regardless, so a missed
+  // wake costs latency, never correctness.
+  if (!isCurrentDaemonProcess(record, startTokenOf)) return false
+  try {
+    process.kill(record.pid, 'SIGUSR2')
     return true
   } catch {
     return false
   }
+}
+
+/** True only if the process at record.pid matches the lock's start token. */
+export function isCurrentDaemonProcess(
+  record: LockRecord,
+  startTokenOf: (pid: number) => string | null = processStartToken,
+): boolean {
+  if (!isProcessAlive(record.pid)) return false
+  if (record.processStartToken === undefined) return false
+  const current = startTokenOf(record.pid)
+  return current !== null && current === record.processStartToken
 }
 
 function encodeJson(value: unknown): Uint8Array {
@@ -273,19 +345,24 @@ async function deletes(args: string[], globals: GlobalFlags): Promise<void> {
   if (positionals.length > 1) {
     return usageError('sync deletes accepts at most one [dir]', 'glovebox sync deletes')
   }
-  if (values.confirm && values.restore) {
+  // `!== undefined`, not truthiness: `--confirm ""` is a provided-but-empty
+  // value that must fail loudly with "requires <path|all>", not silently fall
+  // through to a plain listing as if no action was requested.
+  const wantsConfirm = values.confirm !== undefined
+  const wantsRestore = values.restore !== undefined
+  if (wantsConfirm && wantsRestore) {
     return usageError('choose only one of --confirm or --restore', 'glovebox sync deletes')
   }
-  if (values.list && (values.confirm || values.restore)) {
+  if (values.list && (wantsConfirm || wantsRestore)) {
     return usageError(
       '--list cannot be combined with --confirm or --restore',
       'glovebox sync deletes',
     )
   }
 
-  const action: DeleteResolutionAction | undefined = values.confirm
+  const action: DeleteResolutionAction | undefined = wantsConfirm
     ? 'confirm'
-    : values.restore
+    : wantsRestore
       ? 'restore'
       : undefined
   const result = await runSyncDeletes(positionals[0], {
