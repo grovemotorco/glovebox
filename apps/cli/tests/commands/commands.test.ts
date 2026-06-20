@@ -417,6 +417,15 @@ describe('sync deletes', () => {
       expect(result.daemon.running).toBe(true)
       expect(result.action).toMatchObject({ matched: 1, queued: true })
 
+      // With a live daemon owning the file, the OUTPUT must reflect the
+      // unmutated on-disk state — the hold is still listed (only queued) so
+      // `sync deletes` agrees with `glovebox status` until the daemon drains,
+      // rather than claiming the resolution already applied.
+      expect(result.heldDeleteIntents).toBe(1)
+      expect(result.deleteIntents.find((intent) => intent.path === 'held.md')?.held).toBe(
+        'bulk-window',
+      )
+
       // The daemon is the single writer of state; the CLI must leave the file
       // untouched and let the queued command carry the resolution.
       const state = JSON.parse(

@@ -88,6 +88,7 @@ export async function runRun(
   let teardown: () => Promise<void> = async () => {}
   let runner: DaemonRunner | null = null
   let deleteResolutionKickPending = false
+  let runnerStarted = false
   const shutdown = async (code: number, terminal?: TerminalPayload): Promise<void> => {
     if (exiting) {
       return
@@ -100,7 +101,12 @@ export async function runRun(
   }
   const requestDeleteResolutionCycle = (): void => {
     deleteResolutionKickPending = true
-    if (runner === null) return
+    // Only kick once the runner is actually RUNNING. Between `runner =
+    // createdRunner` and the end of `await createdRunner.start()`, the runner is
+    // assigned but still stopped, so `kick()` is a no-op; leaving the flag
+    // latched lets the post-start replay below deliver the wake instead of
+    // dropping it until the next periodic cycle.
+    if (runner === null || !runnerStarted) return
     deleteResolutionKickPending = false
     reporter.log('info', 'delete resolution requested; running a sync cycle')
     void runner.kick()
@@ -223,6 +229,7 @@ export async function runRun(
     // first-cycle connection diagnostics.
     reporter.start()
     await createdRunner.start()
+    runnerStarted = true
     if (deleteResolutionKickPending) {
       requestDeleteResolutionCycle()
     }
@@ -288,6 +295,8 @@ function renderDaemonSyncWarning(warning: DaemonSyncWarning): string {
       const more = warning.paths.length > 5 ? `, +${warning.paths.length - 5} more` : ''
       return `${warning.count} deletion(s) held (${warning.held}): ${shown}${more}. Review with \`glovebox sync deletes\`; release with \`glovebox sync deletes --confirm all\` or restore with \`glovebox sync deletes --restore all\`.`
     }
+    case 'delete-resolution-invalid':
+      return `dropped an unrecognized delete-resolution command (${warning.name}); re-run \`glovebox sync deletes --confirm <path|all>\` or \`--restore <path|all>\` to retry.`
   }
 }
 
