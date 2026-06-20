@@ -454,6 +454,165 @@ describe('sync deletes', () => {
       else process.env.GLOVEBOX_HOME = prevHome
     }
   })
+
+  it('does not crash on a truncated or schema-invalid state file', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+
+    // A half-written state file (an older daemon crashed mid-persist): the
+    // unvalidated `JSON.parse(...) as DaemonWorkspaceState` the CLI used to do
+    // threw an uncaught SyntaxError and crashed both commands.
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode('{"workspaceId":"ws-1","files":{'),
+    )
+    await expect(runSyncDeletes(mountDir, { paths, env: {} })).resolves.toMatchObject({
+      deleteIntents: [],
+      heldDeleteIntents: 0,
+    })
+    await expect(runStatus(mountDir, { paths, env: {} })).resolves.toMatchObject({
+      deleteIntents: [],
+      trackedFiles: null,
+    })
+
+    // The confirm/restore ACTION path must also stay non-crashing: corrupt
+    // state reads as null, so it throws a clear error instead of an uncaught
+    // SyntaxError (and never enqueues a resolution against garbage state).
+    await expect(
+      runSyncDeletes(mountDir, {
+        action: 'confirm',
+        resolutionTarget: 'all',
+        paths,
+        env: {},
+        signalDaemon: false,
+      }),
+    ).rejects.toThrow(/no daemon state yet/)
+
+    // Valid JSON that fails the schema gate (missing required fields) must be
+    // treated as no-state, not cast-trusted into a confident-but-wrong listing.
+    await storage.writeAtomic(STATE_ARTIFACT, new TextEncoder().encode('{"unexpected":true}'))
+    expect((await runSyncDeletes(mountDir, { paths, env: {} })).deleteIntents).toEqual([])
+    expect((await runStatus(mountDir, { paths, env: {} })).trackedFiles).toBeNull()
+
+    // Schema-valid TOP-LEVEL but malformed NESTED entries (a null file value, a
+    // null pending-delete) must also be rejected as no-state — the deep gate
+    // stops consumers from crashing on fileState.contentKind / intent.fileId.
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(
+        JSON.stringify({
+          workspaceId: 'ws-1',
+          mountId: entry.mountId,
+          deviceId: entry.deviceId,
+          lastAckedSeq: 0,
+          files: { 'f-x': null },
+          pendingRenames: [],
+          pendingDeletes: [null],
+        }),
+      ),
+    )
+    expect((await runSyncDeletes(mountDir, { paths, env: {} })).deleteIntents).toEqual([])
+    expect((await runStatus(mountDir, { paths, env: {} })).trackedFiles).toBeNull()
+
+    // Nested entries that ARE objects but miss required fields (an intent with
+    // no opId/baseSeq, a file with no watermark) must also be rejected — else
+    // the daemon would build ops with undefined identifiers or hydrate views
+    // with invalid watermarks.
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(
+        JSON.stringify({
+          workspaceId: 'ws-1',
+          mountId: entry.mountId,
+          deviceId: entry.deviceId,
+          lastAckedSeq: 0,
+          files: { 'f-x': { path: 'x.md', contentKind: 'markdown' } },
+          pendingRenames: [],
+          pendingDeletes: [{ fileId: 'f-x', path: 'x.md', observedMissingAtMs: 1 }],
+        }),
+      ),
+    )
+    expect((await runSyncDeletes(mountDir, { paths, env: {} })).deleteIntents).toEqual([])
+    expect((await runStatus(mountDir, { paths, env: {} })).trackedFiles).toBeNull()
+
+    // `files` as an ARRAY (even of fully-valid file states) must be rejected:
+    // it is a non-null object whose keys are numeric indexes, so the daemon
+    // would otherwise adopt "0" as a fileId.
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(
+        JSON.stringify({
+          workspaceId: 'ws-1',
+          mountId: entry.mountId,
+          deviceId: entry.deviceId,
+          lastAckedSeq: 0,
+          files: [
+            {
+              path: 'a.md',
+              contentKind: 'markdown',
+              nodeId: null,
+              syncedVVB64: '',
+              lastWrittenHash: 'h',
+              sizeBytes: 1,
+              savedAt: 1,
+            },
+          ],
+          pendingRenames: [],
+          pendingDeletes: [],
+        }),
+      ),
+    )
+    expect((await runStatus(mountDir, { paths, env: {} })).trackedFiles).toBeNull()
+    expect((await runSyncDeletes(mountDir, { paths, env: {} })).deleteIntents).toEqual([])
+  })
+
+  it('targets a held delete named "all" individually, not every held delete', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    const state = deleteState(entry.mountId, entry.deviceId)
+    // A held delete whose path is literally "all", alongside held "held.md".
+    state.files['f-all'] = {
+      path: 'all',
+      contentKind: 'markdown',
+      nodeId: '0:3',
+      syncedVVB64: '',
+      lastWrittenHash: 'all-hash',
+      sizeBytes: 3,
+      savedAt: 1_000_000,
+    }
+    state.pendingDeletes.push({
+      opId: 'd-all',
+      fileId: 'f-all',
+      path: 'all',
+      baseSeq: 7,
+      observedMissingAtMs: 1_000_000,
+      held: 'bulk-window',
+    })
+    await storage.writeAtomic(STATE_ARTIFACT, new TextEncoder().encode(JSON.stringify(state)))
+
+    const result = await runSyncDeletes(mountDir, {
+      action: 'confirm',
+      resolutionTarget: 'all',
+      paths,
+      env: {},
+      signalDaemon: false,
+      now: () => 123,
+    })
+
+    // Exact path match wins over the `all` keyword: only the file named "all"
+    // is confirmed; the other held delete must remain held.
+    expect(result.action).toMatchObject({ target: 'all', matched: 1, paths: ['all'] })
+
+    const after = JSON.parse(
+      new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+    ) as DaemonWorkspaceState
+    expect(after.pendingDeletes.find((intent) => intent.path === 'all')?.held).toBeUndefined()
+    expect(after.pendingDeletes.find((intent) => intent.path === 'held.md')?.held).toBe(
+      'bulk-window',
+    )
+  })
 })
 
 describe('sync deletes daemon-signal PID-reuse guard', () => {

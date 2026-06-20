@@ -390,10 +390,7 @@ export class DaemonStateStore {
   }
 
   async #readState(): Promise<DaemonWorkspaceState | null> {
-    const bytes = await this.#storage.read(STATE_ARTIFACT)
-    if (bytes === null) return null
-    const value = decodeJson(bytes)
-    return isWorkspaceState(value) ? value : null
+    return readWorkspaceState(this.#storage)
   }
 
   async #readEnvelope(fileId: string): Promise<SnapshotEnvelope | null> {
@@ -455,6 +452,92 @@ function importable(snapshotB64: string): boolean {
   }
 }
 
+/**
+ * Read and VALIDATE the workspace-state artifact, returning null when it is
+ * absent, unparseable, or fails the schema gate — it never throws on a
+ * truncated/corrupt file. This is the single reader the daemon's own load()
+ * uses; the CLI (`status`, `sync deletes`) MUST go through it too, so a
+ * half-written state can't crash those commands or be cast-trusted into a
+ * confident-but-wrong listing.
+ */
+export async function readWorkspaceState(
+  storage: DaemonStorage,
+): Promise<DaemonWorkspaceState | null> {
+  const bytes = await storage.read(STATE_ARTIFACT)
+  if (bytes === null) return null
+  const value = decodeJson(bytes)
+  return isWorkspaceState(value) ? value : null
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+// A plain-object record, NOT an array. `files` must be keyed by fileId; an
+// array like `[fileState]` is a non-null object whose Object.entries keys are
+// numeric indexes ("0", "1") — it would otherwise pass and the daemon would
+// adopt array indexes as file IDs.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return isObject(value) && !Array.isArray(value)
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string'
+}
+
+function isOptionalNumber(value: unknown): boolean {
+  return value === undefined || typeof value === 'number'
+}
+
+// Element guards validate EVERY required field of each nested entry (and the
+// type of each optional field when present) — not just that the entry is a
+// non-null object. A shallow check lets a record with a missing/garbage opId,
+// baseSeq, or watermark pass readWorkspaceState; the daemon would then build
+// submitBatch ops with undefined identifiers (#propagateTreeOps) or hydrate
+// views with invalid watermarks (start()) — the same "trust invalid persisted
+// state" hazard this gate exists to stop. A failing entry makes the WHOLE
+// state read as null (CLI: not-initialized; daemon: fresh + re-sync), the same
+// safe path as truncated JSON. The daemon always writes complete records, so
+// only genuinely-corrupt state is rejected.
+function isFileState(value: unknown): value is DaemonFileState {
+  return (
+    isRecord(value) &&
+    typeof value.path === 'string' &&
+    (value.contentKind === 'markdown' || value.contentKind === 'opaque') &&
+    (value.nodeId === null || typeof value.nodeId === 'string') &&
+    typeof value.syncedVVB64 === 'string' &&
+    typeof value.lastWrittenHash === 'string' &&
+    typeof value.sizeBytes === 'number' &&
+    typeof value.savedAt === 'number' &&
+    isOptionalString(value.lastWrittenVVB64) &&
+    isOptionalString(value.opaqueHash)
+  )
+}
+
+function isPendingDelete(value: unknown): value is PendingDelete {
+  return (
+    isRecord(value) &&
+    typeof value.opId === 'string' &&
+    typeof value.fileId === 'string' &&
+    typeof value.path === 'string' &&
+    typeof value.baseSeq === 'number' &&
+    typeof value.observedMissingAtMs === 'number' &&
+    (value.held === undefined || value.held === 'bulk-startup' || value.held === 'bulk-window') &&
+    isOptionalNumber(value.confirmedAtMs)
+  )
+}
+
+function isPendingRename(value: unknown): value is PendingRename {
+  return (
+    isRecord(value) &&
+    typeof value.opId === 'string' &&
+    typeof value.fileId === 'string' &&
+    typeof value.fromPath === 'string' &&
+    typeof value.toPath === 'string' &&
+    typeof value.baseSeq === 'number'
+  )
+}
+
 function isWorkspaceState(value: unknown): value is DaemonWorkspaceState {
   if (typeof value !== 'object' || value === null) return false
   const state = value as DaemonWorkspaceState
@@ -463,10 +546,12 @@ function isWorkspaceState(value: unknown): value is DaemonWorkspaceState {
     typeof state.mountId === 'string' &&
     typeof state.deviceId === 'string' &&
     typeof state.lastAckedSeq === 'number' &&
-    typeof state.files === 'object' &&
-    state.files !== null &&
+    isRecord(state.files) &&
+    Object.values(state.files).every(isFileState) &&
     Array.isArray(state.pendingRenames) &&
-    Array.isArray(state.pendingDeletes)
+    state.pendingRenames.every(isPendingRename) &&
+    Array.isArray(state.pendingDeletes) &&
+    state.pendingDeletes.every(isPendingDelete)
   )
 }
 
