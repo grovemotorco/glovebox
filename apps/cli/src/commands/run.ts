@@ -86,6 +86,8 @@ export async function runRun(
 
   let exiting = false
   let teardown: () => Promise<void> = async () => {}
+  let runner: DaemonRunner | null = null
+  let deleteResolutionKickPending = false
   const shutdown = async (code: number, terminal?: TerminalPayload): Promise<void> => {
     if (exiting) {
       return
@@ -96,6 +98,20 @@ export async function runRun(
     reporter.terminal(code, terminal)
     process.exit(code)
   }
+  const requestDeleteResolutionCycle = (): void => {
+    deleteResolutionKickPending = true
+    if (runner === null) return
+    deleteResolutionKickPending = false
+    reporter.log('info', 'delete resolution requested; running a sync cycle')
+    void runner.kick()
+  }
+  const handleSigint = () => void shutdown(0)
+  const handleSigterm = () => void shutdown(0)
+  const handleSigusr2 = () => requestDeleteResolutionCycle()
+
+  process.on('SIGINT', handleSigint)
+  process.on('SIGTERM', handleSigterm)
+  process.on('SIGUSR2', handleSigusr2)
 
   try {
     const transport = new WsDaemonTransport({
@@ -154,7 +170,7 @@ export async function runRun(
     // (undici's ErrorEvent is empty) — when one shows up, probe the TLS
     // handshake directly ONCE and name the real problem.
     let tlsDiagnosed = false
-    const runner = new DaemonRunner({
+    const createdRunner = new DaemonRunner({
       engine,
       intervalMs:
         options.rescanIntervalSec !== undefined
@@ -185,35 +201,35 @@ export async function runRun(
         }
       },
     })
+    runner = createdRunner
 
     const hints = createHintDebouncer(() => {
-      void runner.kick()
+      void createdRunner.kick()
     }, overrides.watchDebounceMs ?? 200)
     const watcher = startWatchHints(mount.dir, () => hints.poke())
 
     teardown = async () => {
       watcher.close()
       hints.cancel()
-      runner.stop()
+      createdRunner.stop()
       // Let an in-flight cycle finish its persistence writes — kill -9
       // mid-write is survivable, but a clean stop shouldn't rely on the
       // crash reconcile.
-      await runner.settle()
+      await createdRunner.settle()
       transport.stop()
     }
-
-    process.on('SIGINT', () => void shutdown(0))
-    process.on('SIGTERM', () => void shutdown(0))
-    process.on('SIGUSR2', () => {
-      reporter.log('info', 'delete resolution requested; running a sync cycle')
-      void runner.kick()
-    })
 
     // Emit the start banner before starting the loop so it precedes any
     // first-cycle connection diagnostics.
     reporter.start()
-    await runner.start()
+    await createdRunner.start()
+    if (deleteResolutionKickPending) {
+      requestDeleteResolutionCycle()
+    }
   } catch (error) {
+    process.off('SIGINT', handleSigint)
+    process.off('SIGTERM', handleSigterm)
+    process.off('SIGUSR2', handleSigusr2)
     await teardown()
     await lock.release()
     // Ensure the --json NDJSON stream always ends on a terminal line, even when

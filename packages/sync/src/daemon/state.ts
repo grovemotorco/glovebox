@@ -24,7 +24,9 @@ export interface DaemonStorage {
    */
   writeAtomic(name: string, bytes: Uint8Array): Promise<void>
   delete(name: string): Promise<void>
-  list(): Promise<string[]>
+  /** Artifact names, optionally restricted to those under `prefix` (a
+   *  directory-style prefix ending in `/`). */
+  list(prefix?: string): Promise<string[]>
 }
 
 /** Tree-level intent not yet acked — re-driven on each push (bounded). */
@@ -62,10 +64,6 @@ export interface DeleteResolutionCommand {
   action: 'confirm' | 'restore'
   fileIds: string[]
   createdAt: number
-}
-
-export interface DeleteResolutionQueue {
-  commands: DeleteResolutionCommand[]
 }
 
 export interface DaemonFileState {
@@ -133,7 +131,16 @@ export interface DaemonReconcileResult {
 }
 
 export const STATE_ARTIFACT = 'workspace-state.json'
-export const DELETE_RESOLUTION_ARTIFACT = 'delete-resolutions.json'
+/** Spool directory for delete-resolution commands. One file per command
+ *  (named by its unique id) so enqueue (CLI) and drain (daemon) are
+ *  independent atomic file operations — no shared read-modify-write, no lock,
+ *  no lost commands under concurrent `glovebox sync deletes`. */
+export const DELETE_RESOLUTION_DIR = 'delete-resolutions/'
+
+export function deleteResolutionName(id: string): string {
+  return `${DELETE_RESOLUTION_DIR}${encodeURIComponent(id)}.json`
+}
+
 const ENVELOPE_PREFIX = 'loro/'
 const ENVELOPE_SUFFIX = '.snapshot.json'
 
@@ -292,6 +299,29 @@ export class DaemonStateStore {
   async setPendingDeletes(deletes: PendingDelete[]): Promise<void> {
     const state = await this.#loadStateOrFresh()
     state.pendingDeletes = deletes
+    await this.#saveState(state)
+  }
+
+  /**
+   * Commit a delete-resolution pass atomically: the surviving pending deletes
+   * AND the watermark clears for restored files land in ONE state write. Two
+   * separate writes (setPendingDeletes + updateFileMeta) leave a crash window
+   * where a restored file has an emptied watermark while its delete intent is
+   * still persisted — a restart re-holds it and a later confirm would delete
+   * the very file the user asked to restore.
+   */
+  async commitDeleteResolutions(
+    deletes: PendingDelete[],
+    restoredFileIds: Iterable<string>,
+  ): Promise<void> {
+    const state = await this.#loadStateOrFresh()
+    state.pendingDeletes = deletes
+    for (const fileId of restoredFileIds) {
+      const file = state.files[fileId]
+      if (!file) continue
+      file.lastWrittenHash = ''
+      if (file.contentKind === 'opaque') file.opaqueHash = ''
+    }
     await this.#saveState(state)
   }
 
@@ -468,7 +498,8 @@ export class MemoryDaemonStorage implements DaemonStorage {
     this.#artifacts.delete(name)
   }
 
-  async list(): Promise<string[]> {
-    return [...this.#artifacts.keys()]
+  async list(prefix?: string): Promise<string[]> {
+    const names = [...this.#artifacts.keys()]
+    return (prefix === undefined ? names : names.filter((name) => name.startsWith(prefix))).sort()
   }
 }

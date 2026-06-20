@@ -9,9 +9,10 @@ export {
 } from './daemon/scanner.ts'
 export {
   DaemonStateStore,
-  DELETE_RESOLUTION_ARTIFACT,
+  DELETE_RESOLUTION_DIR,
   MemoryDaemonStorage,
   STATE_ARTIFACT,
+  deleteResolutionName,
   envelopeName,
   type DaemonFileState,
   type DaemonReadyFile,
@@ -20,7 +21,6 @@ export {
   type DaemonStorage,
   type DaemonWorkspaceState,
   type DeleteResolutionCommand,
-  type DeleteResolutionQueue,
   type PendingDelete,
   type PendingRename,
 } from './daemon/state.ts'

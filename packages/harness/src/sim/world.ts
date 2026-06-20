@@ -495,8 +495,8 @@ class FusedDaemonStorage implements DaemonStorage {
     return this.inner.delete(name)
   }
 
-  list(): Promise<string[]> {
-    return this.inner.list()
+  list(prefix?: string): Promise<string[]> {
+    return this.inner.list(prefix)
   }
 }
 

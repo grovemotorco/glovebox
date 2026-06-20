@@ -7,11 +7,11 @@ import { sha256Hex } from '../../src/fs/hash.ts'
 import { LoroFileDoc } from '../../src/loro/file-doc.ts'
 import { bytesToBase64 } from '../../src/loro/base64.ts'
 import {
-  DELETE_RESOLUTION_ARTIFACT,
+  DELETE_RESOLUTION_DIR,
   MemoryDaemonStorage,
   STATE_ARTIFACT,
+  deleteResolutionName,
   type DaemonWorkspaceState,
-  type DeleteResolutionQueue,
   type PendingDelete,
 } from '../../src/daemon/state.ts'
 import {
@@ -321,10 +321,8 @@ describe('DaemonSyncEngine delete holds and resolution', () => {
         encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
       )
       await storage.writeAtomic(
-        DELETE_RESOLUTION_ARTIFACT,
-        encodeJson({
-          commands: [{ id: 'cmd-1', action: 'confirm', fileIds: ['f-held'], createdAt: T0 }],
-        } satisfies DeleteResolutionQueue),
+        deleteResolutionName('cmd-1'),
+        encodeJson({ id: 'cmd-1', action: 'confirm', fileIds: ['f-held'], createdAt: T0 }),
       )
       const transport = new FakeTransport()
       const engine = new DaemonSyncEngine({
@@ -348,7 +346,7 @@ describe('DaemonSyncEngine delete holds and resolution', () => {
         path: 'held.md',
       })
       expect(engine.pendingDeletes()).toEqual([])
-      expect(await storage.read(DELETE_RESOLUTION_ARTIFACT)).toBeNull()
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -365,10 +363,8 @@ describe('DaemonSyncEngine delete holds and resolution', () => {
         encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
       )
       await storage.writeAtomic(
-        DELETE_RESOLUTION_ARTIFACT,
-        encodeJson({
-          commands: [{ id: 'cmd-1', action: 'restore', fileIds: ['f-held'], createdAt: T0 }],
-        } satisfies DeleteResolutionQueue),
+        deleteResolutionName('cmd-1'),
+        encodeJson({ id: 'cmd-1', action: 'restore', fileIds: ['f-held'], createdAt: T0 }),
       )
       const engine = new DaemonSyncEngine({
         workspaceId: 'ws-test',
@@ -390,6 +386,238 @@ describe('DaemonSyncEngine delete holds and resolution', () => {
       ) as DaemonWorkspaceState
       expect(state.pendingDeletes).toEqual([])
       expect(state.files['f-held']!.lastWrittenHash).not.toBe('held-hash')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not schedule a wake for an already-ripe unheld delete (avoids the 1s busy-loop)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      const T0 = 1_000_000
+      const storage = new MemoryDaemonStorage()
+      // Unheld delete whose 30s tombstone is already well in the past.
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson(deleteState({ observedAt: T0 - 60_000, held: undefined })),
+      )
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+      })
+
+      await engine.start()
+
+      // A past-due delete must not pin the runner to its 1s wake floor.
+      expect(engine.nextWakeMs(T0)).toBeNull()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores a restore command for a file that is not pending-deleted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const T0 = 1_000_000
+      const storage = new MemoryDaemonStorage()
+      const state: DaemonWorkspaceState = {
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        lastAckedSeq: 7,
+        files: {
+          'f-live': {
+            path: 'live.md',
+            contentKind: 'markdown',
+            nodeId: '0:1',
+            syncedVVB64: '',
+            lastWrittenHash: 'live-hash',
+            sizeBytes: 5,
+            savedAt: T0,
+          },
+        },
+        pendingRenames: [],
+        pendingDeletes: [],
+      }
+      await storage.writeAtomic(STATE_ARTIFACT, encodeJson(state))
+      await storage.writeAtomic(
+        deleteResolutionName('cmd-1'),
+        encodeJson({ id: 'cmd-1', action: 'restore', fileIds: ['f-live'], createdAt: T0 }),
+      )
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      // A stale/duplicate restore for a live file must not wipe its watermark
+      // (which would force a resurrect-checkout over it); the command is still
+      // consumed.
+      const after = JSON.parse(
+        new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+      ) as DaemonWorkspaceState
+      expect(after.files['f-live']!.lastWrittenHash).toBe('live-hash')
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-applies a confirm command idempotently after a crash before the queue is cleared', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const T0 = 1_000_000
+      const storage = new MemoryDaemonStorage()
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
+      )
+      const command = encodeJson({
+        id: 'cmd-1',
+        action: 'confirm',
+        fileIds: ['f-held'],
+        createdAt: T0,
+      })
+      await storage.writeAtomic(deleteResolutionName('cmd-1'), command)
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+      })
+
+      await engine.start()
+      await engine.runCycle()
+      // Simulate a crash that committed state but left the command file on
+      // disk: it is re-read on the next cycle and must be a safe no-op.
+      await storage.writeAtomic(deleteResolutionName('cmd-1'), command)
+      await engine.runCycle()
+
+      expect(engine.pendingDeletes()).toEqual([])
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a command pending when the resolution state commit fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const T0 = 1_000_000
+      class FailOnceStateStorage extends MemoryDaemonStorage {
+        failNextStateWrite = false
+        async writeAtomic(name: string, bytes: Uint8Array): Promise<void> {
+          if (this.failNextStateWrite && name === STATE_ARTIFACT) {
+            this.failNextStateWrite = false
+            throw new Error('state write failed')
+          }
+          await super.writeAtomic(name, bytes)
+        }
+      }
+      const storage = new FailOnceStateStorage()
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
+      )
+      await storage.writeAtomic(
+        deleteResolutionName('cmd-1'),
+        encodeJson({ id: 'cmd-1', action: 'restore', fileIds: ['f-held'], createdAt: T0 }),
+      )
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+      })
+
+      await engine.start()
+      storage.failNextStateWrite = true
+      await expect(engine.runCycle()).rejects.toThrow(/state write failed/)
+      expect(engine.pendingDeletes()).toHaveLength(1)
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([deleteResolutionName('cmd-1')])
+
+      await engine.runCycle()
+      const after = JSON.parse(
+        new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+      ) as DaemonWorkspaceState
+      expect(after.pendingDeletes).toEqual([])
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not drop a command enqueued during the daemon drain (race-safe)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const T0 = 1_000_000
+      // Storage that injects a second command file the instant the daemon
+      // snapshots the spool dir — i.e. a concurrent CLI enqueue landing
+      // between the daemon's list() and its per-file deletes.
+      class RacingStorage extends MemoryDaemonStorage {
+        injection: { name: string; bytes: Uint8Array } | null = null
+        async list(prefix?: string): Promise<string[]> {
+          const names = await super.list(prefix)
+          if (this.injection && prefix === DELETE_RESOLUTION_DIR) {
+            await super.writeAtomic(this.injection.name, this.injection.bytes)
+            this.injection = null
+          }
+          return names
+        }
+      }
+      const storage = new RacingStorage()
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
+      )
+      await storage.writeAtomic(
+        deleteResolutionName('cmd-1'),
+        encodeJson({ id: 'cmd-1', action: 'confirm', fileIds: ['f-held'], createdAt: T0 }),
+      )
+      storage.injection = {
+        name: deleteResolutionName('cmd-2'),
+        bytes: encodeJson({ id: 'cmd-2', action: 'confirm', fileIds: ['f-held'], createdAt: T0 }),
+      }
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+      })
+
+      await engine.start()
+      await engine.runCycle()
+      // cmd-1 was applied and its file removed; cmd-2 — written during the
+      // drain — was NOT dropped and survives for the next cycle.
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([deleteResolutionName('cmd-2')])
+
+      await engine.runCycle()
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

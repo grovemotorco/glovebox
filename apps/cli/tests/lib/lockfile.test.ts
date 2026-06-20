@@ -1,12 +1,13 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { gloveboxPaths } from '../../src/lib/paths.ts'
 import {
   LockHeldError,
   acquireLock,
   lockHolderPid,
+  lockRecordMatchesProcess,
   readLockRecord,
 } from '../../src/lib/lockfile.ts'
 
@@ -66,6 +67,70 @@ describe('per-mount lockfile', () => {
     const lock = await acquireLock(paths, 'm-1')
     expect(await lockHolderPid(paths, 'm-1')).toBe(process.pid)
     await lock.release()
+  })
+
+  it('breaks a live-pid lock whose process start token does not match', async () => {
+    const paths = await tempPaths()
+    const lockPath = paths.lockFile('m-recycled')
+    await mkdir(dirname(lockPath), { recursive: true })
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        nonce: 'stale-nonce',
+        startedAt: new Date(0).toISOString(),
+        processStartToken: 'not-this-process',
+      }) + '\n',
+    )
+
+    expect(
+      lockRecordMatchesProcess(
+        {
+          version: 1,
+          pid: process.pid,
+          nonce: 'stale-nonce',
+          startedAt: new Date(0).toISOString(),
+          processStartToken: 'not-this-process',
+        },
+        () => 'this-process',
+      ),
+    ).toBe(false)
+
+    const lock = await acquireLock(paths, 'm-recycled')
+    expect(lock.record.nonce).not.toBe('stale-nonce')
+    expect(await lockHolderPid(paths, 'm-recycled')).toBe(process.pid)
+    await lock.release()
+  })
+
+  it('matches a live holder by its recorded process start token', () => {
+    expect(
+      lockRecordMatchesProcess(
+        {
+          version: 1,
+          pid: process.pid,
+          nonce: 'nonce',
+          startedAt: new Date().toISOString(),
+          processStartToken: 'token-1',
+        },
+        () => 'token-1',
+      ),
+    ).toBe(true)
+  })
+
+  it('treats an unreadable start token as live for lock breaking', () => {
+    expect(
+      lockRecordMatchesProcess(
+        {
+          version: 1,
+          pid: process.pid,
+          nonce: 'nonce',
+          startedAt: new Date().toISOString(),
+          processStartToken: 'token-1',
+        },
+        () => null,
+      ),
+    ).toBe(true)
   })
 
   it('a stale release cannot delete a successor lock (nonce check)', async () => {
@@ -135,7 +200,6 @@ describe('stale-break race hardening (review findings)', () => {
     void stale
     // Simulate a breaker that crashed mid-break: mutex dir with an old mtime.
     const mutexPath = `${paths.lockFile('m-mutex')}.breaking`
-    const { mkdir, utimes } = await import('node:fs/promises')
     await mkdir(mutexPath)
     const past = new Date(Date.now() - 60_000)
     await utimes(mutexPath, past, past)

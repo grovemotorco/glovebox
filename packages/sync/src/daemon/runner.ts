@@ -100,11 +100,21 @@ export class DaemonRunner {
    * in-flight cycle; resolves when this cycle finishes.
    */
   kick(): Promise<void> {
-    return this.#enqueueCycle()
+    // A kicked cycle (watcher hint, reconnect, SIGUSR2) can change pending
+    // delete state, so re-arm against the fresh next-wake hint. Without this
+    // a delete observed off the timer path waits for the already-armed
+    // (often ~periodic) timer instead of waking at its tombstone expiry.
+    return this.#enqueueCycle().then(() => this.#schedule())
   }
 
   #schedule(): void {
     if (this.#stopped) return
+    // Idempotent: safe to call after any cycle (timer- or kick-driven)
+    // without leaking a second concurrent timer.
+    if (this.#timer !== null) {
+      this.#clearTimer(this.#timer)
+      this.#timer = null
+    }
     const jitter = this.#jitterMin + this.#random() * (this.#jitterMax - this.#jitterMin)
     const periodicDelayMs = Math.round(this.#intervalMs * jitter)
     const now = this.#now()

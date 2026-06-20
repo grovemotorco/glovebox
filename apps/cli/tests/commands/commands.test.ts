@@ -5,19 +5,19 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { verifyWorkspaceToken } from '@glovebox.md/sync/server'
 import { LoroFileDoc, bytesToBase64 } from '@glovebox.md/sync/loro'
 import {
-  DELETE_RESOLUTION_ARTIFACT,
+  DELETE_RESOLUTION_DIR,
   NodeDaemonStorage,
   STATE_ARTIFACT,
   envelopeName,
   type DaemonWorkspaceState,
 } from '@glovebox.md/sync/daemon'
 import { gloveboxPaths } from '../../src/lib/paths.ts'
-import { acquireLock } from '../../src/lib/lockfile.ts'
+import { acquireLock, type LockRecord } from '../../src/lib/lockfile.ts'
 import { runMount } from '../../src/commands/mount.ts'
 import { runList } from '../../src/commands/list.ts'
 import { resolveWorkspaceSocketToken } from '../../src/commands/run.ts'
 import { runStatus } from '../../src/commands/status.ts'
-import { runSyncDeletes } from '../../src/commands/sync.ts'
+import syncCommand, { isCurrentDaemonProcess, runSyncDeletes } from '../../src/commands/sync.ts'
 import { runUnmount } from '../../src/commands/unmount.ts'
 import authCommand, {
   runDeviceLoginWithClient,
@@ -47,6 +47,22 @@ async function fixture() {
   const home = await tempDir('glovebox-home-')
   const mountDir = await tempDir('glovebox-mount-')
   return { paths: gloveboxPaths({ GLOVEBOX_HOME: home }), mountDir }
+}
+
+/** The enqueued delete-resolution commands (one spool file each). */
+async function queuedCommands(storage: NodeDaemonStorage) {
+  const names = await storage.list(DELETE_RESOLUTION_DIR)
+  return Promise.all(
+    names.map(
+      async (name) =>
+        JSON.parse(new TextDecoder().decode((await storage.read(name))!)) as {
+          id: string
+          action: string
+          fileIds: string[]
+          createdAt: number
+        },
+    ),
+  )
 }
 
 describe('mount / list / unmount', () => {
@@ -311,10 +327,7 @@ describe('sync deletes', () => {
     expect(confirmed?.held).toBeUndefined()
     expect(confirmed?.confirmedAtMs).toBe(123)
 
-    const queue = JSON.parse(
-      new TextDecoder().decode((await storage.read(DELETE_RESOLUTION_ARTIFACT))!),
-    ) as { commands: { action: string; fileIds: string[]; createdAt: number }[] }
-    expect(queue.commands).toEqual([
+    expect(await queuedCommands(storage)).toEqual([
       { id: expect.any(String), action: 'confirm', fileIds: ['f-held'], createdAt: 123 },
     ])
   })
@@ -352,12 +365,126 @@ describe('sync deletes', () => {
     expect(state.pendingDeletes.map((intent) => intent.path)).toEqual(['free.md'])
     expect(state.files['f-held']!.lastWrittenHash).toBe('')
 
-    const queue = JSON.parse(
-      new TextDecoder().decode((await storage.read(DELETE_RESOLUTION_ARTIFACT))!),
-    ) as { commands: { action: string; fileIds: string[]; createdAt: number }[] }
-    expect(queue.commands).toEqual([
+    expect(await queuedCommands(storage)).toEqual([
       { id: expect.any(String), action: 'restore', fileIds: ['f-held'], createdAt: 456 },
     ])
+  })
+
+  it('errors when --confirm names a path that is not a held delete', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    // free.md is a free (non-held) pending delete — naming it must fail loudly,
+    // not report a silent `released 0 held delete(s)` success.
+    await expect(
+      runSyncDeletes(mountDir, {
+        action: 'confirm',
+        resolutionTarget: 'free.md',
+        paths,
+        env: {},
+        signalDaemon: false,
+      }),
+    ).rejects.toThrow(/no held delete matches "free.md"/)
+  })
+
+  it('does not rewrite daemon-owned state while a daemon holds the mount lock', async () => {
+    const { paths, mountDir } = await fixture()
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    // A live lock whose pid is this (alive) process stands in for a running
+    // daemon. signalDaemon:false avoids actually delivering SIGUSR2 to the test.
+    const lock = await acquireLock(paths, entry.mountId)
+    try {
+      const result = await runSyncDeletes(mountDir, {
+        action: 'confirm',
+        resolutionTarget: 'all',
+        paths,
+        env: {},
+        signalDaemon: false,
+        now: () => 123,
+      })
+
+      expect(result.daemon.running).toBe(true)
+      expect(result.action).toMatchObject({ matched: 1, queued: true })
+
+      // The daemon is the single writer of state; the CLI must leave the file
+      // untouched and let the queued command carry the resolution.
+      const state = JSON.parse(
+        new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+      ) as DaemonWorkspaceState
+      const held = state.pendingDeletes.find((intent) => intent.path === 'held.md')
+      expect(held?.held).toBe('bulk-window')
+      expect(held?.confirmedAtMs).toBeUndefined()
+
+      expect(await queuedCommands(storage)).toHaveLength(1)
+    } finally {
+      await lock.release()
+    }
+  })
+
+  it('rejects --confirm with an empty value instead of silently listing', async () => {
+    const home = await tempDir('glovebox-home-')
+    const mountDir = await tempDir('glovebox-mount-')
+    const paths = gloveboxPaths({ GLOVEBOX_HOME: home })
+    const entry = await runMount(mountDir, { workspace: 'ws-1', paths })
+    const storage = new NodeDaemonStorage(paths.stateDir(entry.mountId))
+    await storage.writeAtomic(
+      STATE_ARTIFACT,
+      new TextEncoder().encode(JSON.stringify(deleteState(entry.mountId, entry.deviceId))),
+    )
+
+    const prevHome = process.env.GLOVEBOX_HOME
+    process.env.GLOVEBOX_HOME = home
+    try {
+      await expect(
+        syncCommand(['deletes', mountDir, '--confirm', ''], { json: true, human: false }),
+      ).rejects.toThrow(/requires <path\|all>/)
+    } finally {
+      if (prevHome === undefined) delete process.env.GLOVEBOX_HOME
+      else process.env.GLOVEBOX_HOME = prevHome
+    }
+  })
+})
+
+describe('sync deletes daemon-signal PID-reuse guard', () => {
+  const record: LockRecord = {
+    version: 1,
+    pid: process.pid,
+    nonce: 'nonce-1',
+    startedAt: '2026-06-19T00:00:00.000Z',
+    processStartToken: 'daemon-token',
+  }
+
+  it('confirms a process whose start token matches the lock record', () => {
+    expect(isCurrentDaemonProcess(record, () => 'daemon-token')).toBe(true)
+  })
+
+  it('rejects a recycled pid whose start token differs from the lock record', () => {
+    expect(isCurrentDaemonProcess(record, () => 'other-token')).toBe(false)
+  })
+
+  it('rejects when the process start token cannot be determined', () => {
+    expect(isCurrentDaemonProcess(record, () => null)).toBe(false)
+  })
+
+  it('rejects legacy lock records without a process start token', () => {
+    const legacy: LockRecord = {
+      version: 1,
+      pid: process.pid,
+      nonce: 'nonce-legacy',
+      startedAt: record.startedAt,
+    }
+    expect(isCurrentDaemonProcess(legacy, () => 'daemon-token')).toBe(false)
   })
 })
 

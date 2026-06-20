@@ -16,9 +16,9 @@ import type { BatchAcceptedOp, BatchDeferredOp } from '../server/workspace-batch
 import { getSuffixedPath } from '../server/workspace-store.ts'
 import { scanMount, type DaemonFileView } from './scanner.ts'
 import {
-  DELETE_RESOLUTION_ARTIFACT,
+  DELETE_RESOLUTION_DIR,
   DaemonStateStore,
-  type DeleteResolutionQueue,
+  type DeleteResolutionCommand,
   type DaemonStorage,
   type PendingDelete,
   type PendingRename,
@@ -309,23 +309,49 @@ export class DaemonSyncEngine {
   }
 
   async #applyDeleteResolutionCommands(): Promise<void> {
-    const bytes = await this.#options.storage.read(DELETE_RESOLUTION_ARTIFACT)
-    if (bytes === null) return
-    let queue: DeleteResolutionQueue | null = null
-    try {
-      queue = JSON.parse(new TextDecoder().decode(bytes)) as DeleteResolutionQueue
-    } catch {
-      // A corrupt local command queue must not brick the daemon.
-    }
-    await this.#options.storage.delete(DELETE_RESOLUTION_ARTIFACT)
-    if (!queue || !Array.isArray(queue.commands)) return
+    // Each command is its own file under DELETE_RESOLUTION_DIR. We read the
+    // set present NOW; any file the CLI writes after this list() is a brand
+    // new name we never saw and is drained next cycle — so there is no
+    // shared read-modify-write to race, and no lock is needed. The startsWith
+    // guard is defensive: a storage impl that ignores the prefix must never
+    // cause us to read/delete envelopes or state as "commands".
+    const names = (await this.#options.storage.list(DELETE_RESOLUTION_DIR))
+      .filter((name) => name.startsWith(DELETE_RESOLUTION_DIR))
+      .sort()
+    if (names.length === 0) return
 
+    const commands: { name: string; command: DeleteResolutionCommand }[] = []
+    const consumedNames: string[] = []
+    for (const name of names) {
+      const bytes = await this.#options.storage.read(name)
+      if (bytes === null) continue
+      let command: DeleteResolutionCommand | null = null
+      try {
+        command = JSON.parse(new TextDecoder().decode(bytes)) as DeleteResolutionCommand
+      } catch {
+        command = null
+      }
+      if (!command || !Array.isArray(command.fileIds)) {
+        // A corrupt command file must not wedge the drain — drop it.
+        await this.#options.storage.delete(name)
+        continue
+      }
+      commands.push({ name, command })
+      consumedNames.push(name)
+    }
+    commands.sort(
+      (a, b) => a.command.createdAt - b.command.createdAt || a.name.localeCompare(b.name),
+    )
+
+    const projectedDeletes = new Map(
+      [...this.#pendingDeletes].map(([fileId, intent]) => [fileId, { ...intent }]),
+    )
+    const restored = new Set<string>()
     let pendingChanged = false
-    for (const command of queue.commands) {
-      if (!Array.isArray(command.fileIds)) continue
+    for (const { command } of commands) {
       for (const fileId of command.fileIds) {
         if (command.action === 'confirm') {
-          const intent = this.#pendingDeletes.get(fileId)
+          const intent = projectedDeletes.get(fileId)
           if (intent?.held !== undefined) {
             delete intent.held
             intent.confirmedAtMs = command.createdAt
@@ -334,27 +360,45 @@ export class DaemonSyncEngine {
           continue
         }
         if (command.action === 'restore') {
-          if (this.#pendingDeletes.delete(fileId)) {
+          // Only an actual pending delete is restorable. Restoring an id that
+          // is NOT pending would wipe a live file's watermark and force a
+          // resurrect-checkout over it (clobbering unsynced local edits) — a
+          // stale/duplicate command must be a no-op, not a data hazard.
+          if (projectedDeletes.delete(fileId)) {
+            restored.add(fileId)
             pendingChanged = true
           }
-          await this.#markForRestore(fileId)
         }
       }
     }
+    // Persist the applied resolution (surviving deletes + restored-file
+    // watermark clears, atomically) BEFORE deleting any command file, so a
+    // crash re-applies the commands idempotently instead of dropping them.
     if (pendingChanged) {
-      await this.#store.setPendingDeletes([...this.#pendingDeletes.values()])
+      await this.#store.commitDeleteResolutions([...projectedDeletes.values()], restored)
+      this.#pendingDeletes.clear()
+      for (const [fileId, intent] of projectedDeletes) {
+        this.#pendingDeletes.set(fileId, intent)
+      }
+      for (const fileId of restored) {
+        this.#markForRestore(fileId)
+      }
+    }
+    // Delete only the files we read; a command written after our list() keeps
+    // its own file and is drained on the next cycle.
+    for (const name of consumedNames) {
+      await this.#options.storage.delete(name)
     }
   }
 
-  async #markForRestore(fileId: string): Promise<void> {
+  /** In-memory restore authorization; persistence is the caller's atomic
+   *  commitDeleteResolutions so the watermark clear can't outrun the intent
+   *  removal across a crash. */
+  #markForRestore(fileId: string): void {
     const view = this.#views.get(fileId)
     if (!view) return
     view.lastWrittenHash = ''
     this.#resurrect.add(fileId)
-    await this.#store.updateFileMeta(fileId, {
-      lastWrittenHash: '',
-      ...(view.contentKind === 'opaque' ? { opaqueHash: '' } : {}),
-    })
   }
 
   /** Reconcile persisted artifacts and hydrate docs. Does not touch disk. */
@@ -613,12 +657,19 @@ export class DaemonSyncEngine {
     return [...this.#pendingDeletes.values()]
   }
 
-  nextWakeMs(_now?: number): number | null {
+  nextWakeMs(now?: number): number | null {
     if (this.#mountSuspect) return null
+    const reference = now ?? this.#now()
     let earliest: number | null = null
     for (const intent of this.#pendingDeletes.values()) {
       if (intent.held !== undefined) continue
       const wake = intent.observedMissingAtMs + this.#policy.tombstoneDelayMs
+      // Only schedule a wake for a delete that has NOT yet ripened. An
+      // already-ripe delete that failed to propagate must not pin the runner
+      // to its 1s wake floor (a busy-loop against a down/rate-limiting
+      // server); reconnect (onConnect → kick) and the periodic rescan retry
+      // it at a sane cadence.
+      if (wake <= reference) continue
       if (earliest === null || wake < earliest) earliest = wake
     }
     return earliest
