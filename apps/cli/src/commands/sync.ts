@@ -18,6 +18,7 @@ import {
   LockHeldError,
   acquireLock,
   isProcessAlive,
+  lockRecordMatchesProcess,
   processStartToken,
   readLockRecord,
   type LockRecord,
@@ -79,6 +80,13 @@ export async function runSyncDeletes(
   const storage = new NodeDaemonStorage(paths.stateDir(mount.mountId))
   const state = await readWorkspaceState(storage)
   const lockRecord = await readLockRecord(paths, mount.mountId)
+  // `running` (display + next-action hints) uses the SAME token-optional
+  // liveness as `glovebox status`/`list` (lockRecordMatchesProcess), so the two
+  // commands never disagree about whether a daemon is up. The stricter,
+  // token-REQUIRED `liveDaemonRecord`/`isCurrentDaemonProcess` gate is reserved
+  // for the actual SIGUSR2 signal, where a false negative only costs latency.
+  const runningRecord =
+    lockRecord !== null && lockRecordMatchesProcess(lockRecord) ? lockRecord : null
   let daemonRecord = liveDaemonRecord(lockRecord)
   let signaled = false
 
@@ -104,14 +112,16 @@ export async function runSyncDeletes(
       fileIds: targets.map((intent) => intent.fileId),
       createdAt: resolvedAtMs,
     }
-    applyResolutionCommandToState(state, command)
     if (targets.length > 0) {
       await enqueueDeleteResolution(storage, command)
       if (daemonRecord !== null) {
         // A live daemon is the single writer of workspace-state.json; the
         // queued command above is the resolution channel. Writing state here
         // would race the daemon's own whole-file persists and revert its
-        // progress, so only signal it to drain the queue.
+        // progress, so only signal it to drain the queue. The output below
+        // intentionally reflects the UNMUTATED on-disk state: holds stay listed
+        // until the daemon drains, so `sync deletes` agrees with `glovebox
+        // status` instead of claiming the resolution already applied.
         if (options.signalDaemon !== false) signaled = signalDaemon(daemonRecord)
       } else {
         // No live daemon owns the state file — persist the projected result
@@ -125,7 +135,11 @@ export async function runSyncDeletes(
           storage,
           command,
         )
-        if (!wroteState) {
+        if (wroteState) {
+          // We are the writer — reflect the projection we just persisted in
+          // this command's own output so it matches the on-disk state.
+          applyResolutionCommandToState(state, command)
+        } else {
           daemonRecord = liveDaemonRecord(await readLockRecord(paths, mount.mountId))
           if (daemonRecord !== null && options.signalDaemon !== false) {
             signaled = signalDaemon(daemonRecord)
@@ -157,7 +171,7 @@ export async function runSyncDeletes(
     mountId: mount.mountId,
     workspaceId: mount.workspaceId,
     serverUrl: mount.serverUrl,
-    daemon: { running: daemonRecord !== null, pid: daemonRecord?.pid ?? null, signaled },
+    daemon: { running: runningRecord !== null, pid: runningRecord?.pid ?? null, signaled },
     heldDeleteIntents: intents.filter((intent) => intent.held !== null).length,
     freeDeleteIntents: intents.filter((intent) => intent.held === null).length,
     deleteIntents: intents,

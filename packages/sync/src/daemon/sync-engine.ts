@@ -141,6 +141,10 @@ export type DaemonSyncWarning =
       paths: string[]
       totalHeld: number
     }
+  | {
+      type: 'delete-resolution-invalid'
+      name: string
+    }
 
 export interface DaemonTreeState {
   currentSeq: number
@@ -340,8 +344,16 @@ export class DaemonSyncEngine {
       } catch {
         command = null
       }
-      if (!command || !Array.isArray(command.fileIds)) {
-        // A corrupt command file must not wedge the drain — drop it.
+      if (
+        !command ||
+        !Array.isArray(command.fileIds) ||
+        (command.action !== 'confirm' && command.action !== 'restore')
+      ) {
+        // A corrupt or unrecognized-action command must not wedge the drain —
+        // drop it, but SURFACE it. Silently consuming a resolution whose action
+        // we can't apply would strand the user's held deletes with no signal
+        // that their confirm/restore was lost.
+        this.#warn({ type: 'delete-resolution-invalid', name })
         await this.#options.storage.delete(name)
         continue
       }

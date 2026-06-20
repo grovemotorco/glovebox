@@ -718,6 +718,58 @@ describe('DaemonSyncEngine delete holds and resolution', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('drops a resolution command with an unrecognized action and warns instead of silently consuming it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const T0 = 1_000_000
+      const storage = new MemoryDaemonStorage()
+      await storage.writeAtomic(
+        STATE_ARTIFACT,
+        encodeJson(deleteState({ observedAt: T0 - 31_000, held: 'bulk-window' })),
+      )
+      // A schema-drifted command whose action we cannot apply, queued alongside
+      // a valid one. The bad command must be surfaced, not silently consumed.
+      await storage.writeAtomic(
+        deleteResolutionName('cmd-bad'),
+        encodeJson({ id: 'cmd-bad', action: 'purge', fileIds: ['f-held'], createdAt: T0 }),
+      )
+      await storage.writeAtomic(
+        deleteResolutionName('cmd-ok'),
+        encodeJson({ id: 'cmd-ok', action: 'restore', fileIds: ['f-held'], createdAt: T0 + 1 }),
+      )
+      const warnings: DaemonSyncWarning[] = []
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+        now: () => T0,
+        onWarning: (warning) => warnings.push(warning),
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      // The unrecognized command surfaced a warning (not silently lost), and the
+      // whole spool drained — the bad command did not wedge the queue.
+      expect(warnings).toContainEqual({
+        type: 'delete-resolution-invalid',
+        name: deleteResolutionName('cmd-bad'),
+      })
+      expect(await storage.list(DELETE_RESOLUTION_DIR)).toEqual([])
+      // The valid command still applied: restore removed the held intent.
+      const after = JSON.parse(
+        new TextDecoder().decode((await storage.read(STATE_ARTIFACT))!),
+      ) as DaemonWorkspaceState
+      expect(after.pendingDeletes).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })
 
 function deleteState(options: {
