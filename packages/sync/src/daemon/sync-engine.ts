@@ -109,7 +109,13 @@ export interface OpaqueFetchResult {
   manifest?: OpaqueManifest
 }
 
-export type DaemonFileOperationPhase = 'scan.create'
+export type DaemonFileOperationPhase =
+  | 'scan.create'
+  | 'scan.opaque-create'
+  | 'scan.rename'
+  | 'scan.kind'
+  | 'scan.content-change'
+  | 'push.flush'
 
 type SubmitOpaqueRejectedReason = Extract<SubmitOpaqueResult, { type: 'rejected' }>['reason']
 
@@ -281,6 +287,50 @@ export class DaemonSyncEngine {
 
   #warn(warning: DaemonSyncWarning): void {
     this.#options.onWarning?.(warning)
+  }
+
+  /**
+   * Per-file isolation boundary (ISSUE-0053 A): run one file's scan/push work
+   * so a throw degrades to "that file didn't sync this cycle" — logged once
+   * with path + reason — instead of aborting every later step of the cycle.
+   *
+   * The boundary isolates UNCONDITIONALLY: every signal that legitimately
+   * aborts the whole cycle and re-pulls — snapshot-required (a value from
+   * `eventsSince`, consumed in `#pull`), history-pruned (routed to
+   * `#needsRepair`, never thrown), mount-suspect (a flag), adoption, and the
+   * `isOpaqueFileRefusal` re-throws in `#adopt`/`#pull` — is raised BEFORE or
+   * OUTSIDE these per-file loops, so nothing whole-cycle is ever in scope here
+   * to re-raise.
+   *
+   * Retry semantics (AC-B) depend on where the throw lands. A network/server
+   * failure (fetchSnapshot, the transitions' fetch) throws BEFORE any in-memory
+   * mutation, so the file's watermark never advances and the next scan re-detects
+   * it cleanly. A `#store` persist failure throws AFTER the in-memory view has
+   * already rolled (the engine is in-memory-leads-storage everywhere): the bytes
+   * still reach the server via the same cycle's flush/#pushOpaque, and the
+   * durable watermark catches up on a later successful persist or on restart
+   * (reload rebuilds from the last durable state). We deliberately do NOT try to
+   * roll the in-memory view back here — undoing a partially-applied op (a doc
+   * import, a registered view, a kind flip) cleanly is not generally possible,
+   * and a half-rollback is worse than the self-healing lag (see ISSUE-0053).
+   */
+  async #runFileOp(
+    phase: DaemonFileOperationPhase,
+    fileId: string | undefined,
+    path: string,
+    op: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await op()
+    } catch (error) {
+      this.#warn({
+        type: 'file-operation-failed',
+        phase,
+        fileId,
+        path,
+        reason: errorReason(error),
+      })
+    }
   }
 
   #warnHeldDeletes(intents: PendingDelete[]): void {
@@ -1410,14 +1460,16 @@ export class DaemonSyncEngine {
     this.#firstScanDone = true
 
     for (const rename of diff.renames) {
-      // A delete intent for a file that reappeared under a new path was a
-      // move observed across scans — the rename correction cancels it.
-      await this.#cancelDeleteIntent(rename.fileId)
-      await this.#updateView(rename.fileId, {
-        path: rename.toPath,
-        nodeId: rename.entry.nodeId,
+      await this.#runFileOp('scan.rename', rename.fileId, rename.toPath, async () => {
+        // A delete intent for a file that reappeared under a new path was a
+        // move observed across scans — the rename correction cancels it.
+        await this.#cancelDeleteIntent(rename.fileId)
+        await this.#updateView(rename.fileId, {
+          path: rename.toPath,
+          nodeId: rename.entry.nodeId,
+        })
+        await this.#recordPendingRename(rename.fileId, rename.fromPath, rename.toPath)
       })
-      await this.#recordPendingRename(rename.fileId, rename.fromPath, rename.toPath)
     }
 
     // Derived kind consistency (ISSUE-0043, INV-6 flavor): the view's kind
@@ -1430,90 +1482,92 @@ export class DaemonSyncEngine {
     for (const [fileId, view] of Array.from(this.#views)) {
       const pathKind = isMarkdownFile(view.path) ? 'markdown' : 'opaque'
       if (view.contentKind === pathKind) continue
-      if (pathKind === 'opaque') {
-        await this.#transitionToOpaque(fileId)
-      } else {
-        await this.#transitionToMarkdown(fileId)
-      }
+      await this.#runFileOp('scan.kind', fileId, view.path, async () => {
+        if (pathKind === 'opaque') {
+          await this.#transitionToOpaque(fileId)
+        } else {
+          await this.#transitionToMarkdown(fileId)
+        }
+      })
     }
 
     for (const create of diff.creates) {
       if (create.contentKind !== 'markdown') {
-        // Opaque create: track watermark-only with NO confirmed base —
-        // the derived push submits the bytes as expecting-to-create.
         const fileId = this.#newFileId()
-        this.#views.set(fileId, {
-          fileId,
-          path: create.path,
-          contentKind: 'opaque',
-          nodeId: create.nodeId,
-          lastWrittenHash: '',
-          lastWrittenVV: new Uint8Array(),
-          sizeBytes: create.sizeBytes,
+        await this.#runFileOp('scan.opaque-create', fileId, create.path, async () => {
+          // Opaque create: track watermark-only with NO confirmed base —
+          // the derived push submits the bytes as expecting-to-create.
+          this.#views.set(fileId, {
+            fileId,
+            path: create.path,
+            contentKind: 'opaque',
+            nodeId: create.nodeId,
+            lastWrittenHash: '',
+            lastWrittenVV: new Uint8Array(),
+            sizeBytes: create.sizeBytes,
+          })
+          await this.#persistOpaque(fileId)
         })
-        await this.#persistOpaque(fileId)
         continue
       }
       const fileId = this.#newFileId()
-      const text = normalizeEol(create.text ?? '')
-      let snapshot: Uint8Array
-      let doc: LoroFileDoc
-      try {
-        snapshot = await this.#options.transport.fetchSnapshot(fileId, text, create.path)
-        doc = LoroFileDoc.fromSnapshot(snapshot)
-      } catch (error) {
-        this.#warn({
-          type: 'file-operation-failed',
-          phase: 'scan.create',
+      await this.#runFileOp('scan.create', fileId, create.path, async () => {
+        const text = normalizeEol(create.text ?? '')
+        const snapshot = await this.#options.transport.fetchSnapshot(fileId, text, create.path)
+        const doc = LoroFileDoc.fromSnapshot(snapshot)
+        this.#views.set(fileId, {
           fileId,
           path: create.path,
-          reason: errorReason(error),
+          contentKind: 'markdown',
+          nodeId: create.nodeId,
+          // Watermark is the OBSERVED disk bytes (raw), so a CRLF file is
+          // recognized as our own even though the doc holds normalized text.
+          lastWrittenHash: create.contentHash,
+          lastWrittenVV: doc.contentVersion(),
+          sizeBytes: create.sizeBytes,
         })
-        continue
-      }
-      this.#views.set(fileId, {
-        fileId,
-        path: create.path,
-        contentKind: 'markdown',
-        nodeId: create.nodeId,
-        // Watermark is the OBSERVED disk bytes (raw), so a CRLF file is
-        // recognized as our own even though the doc holds normalized text.
-        lastWrittenHash: create.contentHash,
-        lastWrittenVV: doc.contentVersion(),
-        sizeBytes: create.sizeBytes,
+        const client = await this.#attach(fileId, { snapshot, syncedVersion: doc.contentVersion() })
+        if (client.getTextContent() !== text) {
+          // The fileId already existed server-side with other content: merge
+          // the disk text as inserts-at-inception — union, never deletion of
+          // the server's text (INV-2).
+          const view = this.#views.get(fileId)!
+          view.lastWrittenVV = client.getDoc().applyTextAtBase(new Uint8Array(), text)
+        }
+        await this.#persistMarkdown(fileId)
       })
-      const client = await this.#attach(fileId, { snapshot, syncedVersion: doc.contentVersion() })
-      if (client.getTextContent() !== text) {
-        // The fileId already existed server-side with other content: merge
-        // the disk text as inserts-at-inception — union, never deletion of
-        // the server's text (INV-2).
-        const view = this.#views.get(fileId)!
-        view.lastWrittenVV = client.getDoc().applyTextAtBase(new Uint8Array(), text)
-      }
-      await this.#persistMarkdown(fileId)
     }
 
     for (const change of diff.contentChanges) {
       const view = this.#views.get(change.fileId)
       if (!view) continue
-      // Content at the path means the absence behind any open intent was
-      // transient (rename-correction class) — cancel before absorbing.
-      if (this.#pendingDeletes.has(change.fileId)) {
-        await this.#cancelDeleteIntent(change.fileId)
-      }
-      if (view.contentKind !== 'markdown') {
-        // Opaque content is push-derived (disk hash vs watermark); only
-        // the disk-facing meta rolls here.
-        await this.#updateView(change.fileId, { nodeId: change.entry.nodeId })
-        continue
-      }
-      this.#absorbObserved(change.fileId, {
-        text: change.entry.text ?? '',
-        contentHash: change.entry.contentHash,
-        sizeBytes: change.entry.sizeBytes,
-        nodeId: change.entry.nodeId,
+      await this.#runFileOp('scan.content-change', change.fileId, view.path, async () => {
+        // Content at the path means the absence behind any open intent was
+        // transient (rename-correction class) — cancel before absorbing.
+        if (this.#pendingDeletes.has(change.fileId)) {
+          await this.#cancelDeleteIntent(change.fileId)
+        }
+        if (view.contentKind !== 'markdown') {
+          // Opaque content is push-derived (disk hash vs watermark); only
+          // the disk-facing meta rolls here.
+          await this.#updateView(change.fileId, { nodeId: change.entry.nodeId })
+          return
+        }
+        // #absorbObserved imports the disk text into the live doc, then the
+        // persist commits it. We do NOT roll the in-memory watermark back if
+        // the persist throws: the import cannot be cleanly undone (Loro's DAG
+        // is append-only), and rewinding only the watermark would re-fork a
+        // later edit off a stale base and duplicate text. On a persist failure
+        // the imported ops still flush to the server this cycle and the durable
+        // watermark catches up on the next successful persist or on restart.
+        this.#absorbObserved(change.fileId, {
+          text: change.entry.text ?? '',
+          contentHash: change.entry.contentHash,
+          sizeBytes: change.entry.sizeBytes,
+          nodeId: change.entry.nodeId,
+        })
+        await this.#persistMarkdown(change.fileId)
       })
-      await this.#persistMarkdown(change.fileId)
     }
 
     if (this.#mountSuspect) return // Absences on a suspect mount mean nothing.
@@ -1623,8 +1677,20 @@ export class DaemonSyncEngine {
   async #push(): Promise<void> {
     for (const [fileId, client] of this.#clients) {
       if (!client.hasPendingChanges()) continue
-      await client.flush()
-      await this.#persistMarkdown(fileId)
+      // flush() never rejects — a server reject / transport error is handled
+      // inside the room client (submit-error / history-pruned → #needsRepair,
+      // drained below), leaving the synced version un-advanced so the file
+      // stays dirty and retries. The throw this boundary isolates is the
+      // persist; either way one file's failure no longer aborts #push.
+      await this.#runFileOp(
+        'push.flush',
+        fileId,
+        this.#views.get(fileId)?.path ?? fileId,
+        async () => {
+          await client.flush()
+          await this.#persistMarkdown(fileId)
+        },
+      )
     }
     // history-pruned deferrals surfaced during flush: rebuild from a fresh
     // snapshot, re-apply unacked local text, resubmit under new opIds.
@@ -1711,15 +1777,29 @@ export class DaemonSyncEngine {
         sizeBytes: bytes.byteLength,
         nodeId: stat?.nodeId ?? view.nodeId,
       })
-      await this.#persistOpaque(fileId)
-      if (result.path !== undefined && result.path !== view.path) {
-        // The server suffixed our create path (collision policy) — adopt
-        // the canonical path like the remote rename it effectively is.
-        await this.#applyRemoteRename({
-          type: 'rename',
+      try {
+        await this.#persistOpaque(fileId)
+        if (result.path !== undefined && result.path !== view.path) {
+          // The server suffixed our create path (collision policy) — adopt
+          // the canonical path like the remote rename it effectively is.
+          await this.#applyRemoteRename({
+            type: 'rename',
+            fileId,
+            newPath: result.path,
+          } as WireWorkspaceEvent)
+        }
+      } catch (error) {
+        // The bytes are acked server-side; only the durable bookkeeping failed.
+        // Isolate it (ISSUE-0053 A) — a persist throw here must not abort the
+        // whole cycle. The in-memory watermark advanced, so we won't resubmit;
+        // restart reload re-derives from disk if the persist never lands.
+        this.#warn({
+          type: 'opaque-submit-failed',
           fileId,
-          newPath: result.path,
-        } as WireWorkspaceEvent)
+          path: view.path,
+          reason: errorReason(error),
+        })
+        continue
       }
     }
   }

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -11,6 +11,7 @@ import {
   MemoryDaemonStorage,
   STATE_ARTIFACT,
   deleteResolutionName,
+  envelopeName,
   type DaemonWorkspaceState,
   type PendingDelete,
 } from '../../src/daemon/state.ts'
@@ -32,6 +33,7 @@ class FakeTransport implements DaemonTransport {
     []
   readonly opaqueSubmits: SubmitOpaqueInput[] = []
   readonly batchSubmits: WorkspaceBatchWireOp[][] = []
+  readonly submittedUpdates: string[] = []
   opaqueError: Error | null = null
   opaqueResult: SubmitOpaqueResult | null = null
 
@@ -51,7 +53,8 @@ class FakeTransport implements DaemonTransport {
     return { ok: true, currentSeq: 0, events: [] }
   }
 
-  async submitUpdate(_input: SubmitUpdateInput): Promise<SubmitUpdateResult> {
+  async submitUpdate(input: SubmitUpdateInput): Promise<SubmitUpdateResult> {
+    this.submittedUpdates.push(input.fileId)
     return { type: 'ack', applied: true, contentVersionB64: bytesToBase64(new Uint8Array()) }
   }
 
@@ -227,7 +230,234 @@ describe('DaemonSyncEngine cycle isolation and opaque observability (ISSUE-0053)
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it('isolates a failed rename and keeps it pending without losing the move (scan.rename)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, 'note.md'), 'hello')
+
+      // Throw the first time the pending-rename record is persisted (its JSON
+      // is the only state write carrying a `fromPath`), then heal.
+      class FailRenamePersistOnce extends MemoryDaemonStorage {
+        armed = false
+        async writeAtomic(name: string, bytes: Uint8Array): Promise<void> {
+          if (
+            this.armed &&
+            name === STATE_ARTIFACT &&
+            new TextDecoder().decode(bytes).includes('"fromPath"')
+          ) {
+            this.armed = false
+            throw new Error('pending-rename write failed')
+          }
+          await super.writeAtomic(name, bytes)
+        }
+      }
+      const storage = new FailRenamePersistOnce()
+      const transport = new FakeTransport()
+      const warnings: DaemonSyncWarning[] = []
+      const ids = ['file-note', 'file-asset']
+      let op = 0
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport,
+        newFileId: () => ids.shift() ?? `file-extra-${ids.length}`,
+        newOpId: () => `op-${++op}`,
+        onWarning: (warning) => warnings.push(warning),
+      })
+
+      await engine.start()
+      await engine.runCycle() // adopt + create note.md
+
+      // Move note.md and drop a new opaque file in the same cycle; poison the
+      // rename record's persist so the rename op throws.
+      await rename(join(root, 'note.md'), join(root, 'renamed.md'))
+      await writeFile(join(root, 'asset.bin'), new Uint8Array([1, 2, 3]))
+      storage.armed = true
+      await engine.runCycle()
+
+      // AC-A: the rename failure did not abort the cycle — the opaque file synced.
+      expect(transport.opaqueSubmits.map((submit) => submit.observedPath)).toContain('asset.bin')
+      // AC-B: the failure is logged once with path + reason.
+      expect(warnings).toContainEqual({
+        type: 'file-operation-failed',
+        phase: 'scan.rename',
+        fileId: 'file-note',
+        path: 'renamed.md',
+        reason: 'pending-rename write failed',
+      })
+
+      // The move is not lost: the in-memory rename op still propagates this
+      // cycle and the view converges onto the new path; a follow-up cycle keeps
+      // it there (the store catches up once the transient write heals).
+      await engine.runCycle()
+      expect(engine.files()).toContainEqual({
+        fileId: 'file-note',
+        path: 'renamed.md',
+        contentKind: 'markdown',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('isolates a failed content-change persist and never corrupts a later edit (scan.content-change)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, 'poisoned.md'), 'v1')
+      await writeFile(join(root, 'healthy.md'), 'h1')
+
+      // Throw the first time the poisoned file's Loro envelope is persisted
+      // (persistMarkdownFile writes the per-file envelope before the shared
+      // state blob), then heal — isolating the failure to one file.
+      class FailEnvelopeOnce extends MemoryDaemonStorage {
+        failEnvelope: string | null = null
+        async writeAtomic(name: string, bytes: Uint8Array): Promise<void> {
+          if (this.failEnvelope !== null && name === this.failEnvelope) {
+            this.failEnvelope = null
+            throw new Error('markdown persist failed')
+          }
+          await super.writeAtomic(name, bytes)
+        }
+      }
+      const storage = new FailEnvelopeOnce()
+      const transport = new FakeTransport()
+      const warnings: DaemonSyncWarning[] = []
+      let id = 0
+      let op = 0
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport,
+        newFileId: () => `file-${++id}`,
+        newOpId: () => `op-${++op}`,
+        onWarning: (warning) => warnings.push(warning),
+      })
+
+      await engine.start()
+      await engine.runCycle() // create both markdown files
+
+      const poisonedId = engine.files().find((file) => file.path === 'poisoned.md')!.fileId
+
+      // Edit both files, add an opaque file, and poison the persist of one edit.
+      await writeFile(join(root, 'poisoned.md'), 'v2')
+      await writeFile(join(root, 'healthy.md'), 'h2')
+      await writeFile(join(root, 'asset.bin'), new Uint8Array([9, 9, 9]))
+      storage.failEnvelope = envelopeName(poisonedId)
+      await engine.runCycle()
+
+      // AC-A: the failed content-change did not abort the cycle — the healthy
+      // markdown push and the opaque submit both completed.
+      const healthyId = engine.files().find((file) => file.path === 'healthy.md')!.fileId
+      expect(transport.submittedUpdates).toContain(healthyId)
+      expect(transport.opaqueSubmits.map((submit) => submit.observedPath)).toContain('asset.bin')
+      // AC-A: the failure is logged once with path + reason.
+      expect(warnings).toContainEqual({
+        type: 'file-operation-failed',
+        phase: 'scan.content-change',
+        fileId: poisonedId,
+        path: 'poisoned.md',
+        reason: 'markdown persist failed',
+      })
+
+      // The edit is not rolled back: its ops still flush to the server this
+      // cycle and the durable watermark catches up on the same cycle's push.
+      const hashV2 = sha256Hex(new TextEncoder().encode('v2'))
+      expect(transport.submittedUpdates).toContain(poisonedId)
+      expect((await decodeState(storage)).files[poisonedId]!.lastWrittenHash).toBe(hashV2)
+
+      // Regression: a NEW edit after the failed persist must converge cleanly.
+      // Rewinding the in-memory watermark on the persist failure would re-fork
+      // this edit off the stale base and duplicate the text (e.g. "v23").
+      await writeFile(join(root, 'poisoned.md'), 'v3')
+      await engine.runCycle()
+      expect(engine.getText(poisonedId)).toBe('v3')
+      const hashV3 = sha256Hex(new TextEncoder().encode('v3'))
+      expect((await decodeState(storage)).files[poisonedId]!.lastWrittenHash).toBe(hashV3)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('isolates a failed opaque persist after a successful submit (push opaque)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, 'asset.bin'), new Uint8Array([1, 2, 3]))
+      await writeFile(join(root, 'keep.md'), 'k1')
+
+      // The new opaque hash only reaches the state blob via #pushOpaque's own
+      // persist (the scan-time meta roll still carries the OLD hash), so throw
+      // on the write that carries it — the post-submit, post-ack persist.
+      const newHash = sha256Hex(new Uint8Array([4, 5, 6]))
+      class FailOpaquePersistOnce extends MemoryDaemonStorage {
+        armed = false
+        async writeAtomic(name: string, bytes: Uint8Array): Promise<void> {
+          if (
+            this.armed &&
+            name === STATE_ARTIFACT &&
+            new TextDecoder().decode(bytes).includes(newHash)
+          ) {
+            this.armed = false
+            throw new Error('opaque persist failed')
+          }
+          await super.writeAtomic(name, bytes)
+        }
+      }
+      const storage = new FailOpaquePersistOnce()
+      const transport = new FakeTransport()
+      const warnings: DaemonSyncWarning[] = []
+      let id = 0
+      let op = 0
+      const engine = new DaemonSyncEngine({
+        workspaceId: 'ws-test',
+        mountId: 'mount-test',
+        deviceId: 'device-test',
+        fs: await createNodeFS(root),
+        storage,
+        transport,
+        newFileId: () => `file-${++id}`,
+        newOpId: () => `op-${++op}`,
+        onWarning: (warning) => warnings.push(warning),
+      })
+
+      await engine.start()
+      await engine.runCycle() // create asset.bin + keep.md
+
+      const assetId = engine.files().find((file) => file.path === 'asset.bin')!.fileId
+      const keepId = engine.files().find((file) => file.path === 'keep.md')!.fileId
+
+      // Change the opaque bytes (so #pushOpaque re-submits) and edit the
+      // markdown sibling; poison only the opaque persist that follows the ack.
+      await writeFile(join(root, 'asset.bin'), new Uint8Array([4, 5, 6]))
+      await writeFile(join(root, 'keep.md'), 'k2')
+      storage.armed = true
+
+      // AC-A: the opaque persist failure must NOT abort the cycle.
+      await expect(engine.runCycle()).resolves.toBeUndefined()
+      expect(transport.opaqueSubmits.map((submit) => submit.observedPath)).toContain('asset.bin')
+      expect(transport.submittedUpdates).toContain(keepId)
+      expect(warnings).toContainEqual({
+        type: 'opaque-submit-failed',
+        fileId: assetId,
+        path: 'asset.bin',
+        reason: 'opaque persist failed',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })
+
+async function decodeState(storage: MemoryDaemonStorage): Promise<DaemonWorkspaceState> {
+  const bytes = await storage.read(STATE_ARTIFACT)
+  return JSON.parse(new TextDecoder().decode(bytes!)) as DaemonWorkspaceState
+}
 
 describe('DaemonSyncEngine delete holds and resolution', () => {
   it('treats schema-invalid nested state as fresh on start instead of crashing', async () => {
