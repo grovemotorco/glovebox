@@ -35,6 +35,11 @@ const KEY_PURPOSE_OPTIONS: SelectOption[] = [
   { value: 'api', label: 'API' },
 ]
 
+// Keys minted from this workspace-specific form are operational sync credentials.
+// Match the CLI device flow's least-privilege default: content read + write, while
+// keeping owner-only workspace:admin capabilities explicitly opt-in.
+const WORKSPACE_SYNC_KEY_SCOPES = ['workspace:read', 'workspace:write'] as const
+
 export function SettingsModal() {
   const { settingsModalOpen } = useUiState()
   const { closeSettingsModal } = useUiActions()
@@ -445,12 +450,12 @@ function AccessTab() {
 
   const createKey = () =>
     run(async () => {
-      if (!keyName.trim()) return
+      if (!workspaceId || !keyName.trim()) return
       const result = await api.keys.create({
         name: keyName.trim(),
         purpose,
-        scopes: [],
-        workspaceIds: workspaceId ? [workspaceId] : [],
+        scopes: [...WORKSPACE_SYNC_KEY_SCOPES],
+        workspaceIds: [workspaceId],
       })
       setPlaintext(result.plaintext)
       setKeyName('')
@@ -489,7 +494,7 @@ function AccessTab() {
           <ActionButton
             label="Create"
             primary
-            disabled={busy || !keyName.trim()}
+            disabled={busy || !workspaceId || !keyName.trim()}
             onClick={() => void createKey()}
           />
         </div>
