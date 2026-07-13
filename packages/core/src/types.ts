@@ -28,7 +28,15 @@ export interface OpaqueManifest {
 
 export type WorkspaceChangeEvent =
   | { type: 'snapshot'; entries: WorkspaceTreeEntry[]; seq?: number }
-  | { type: 'create'; path: string; entry: WorkspaceTreeEntry; seq?: number }
+  | {
+      type: 'create'
+      path: string
+      entry: WorkspaceTreeEntry
+      seq?: number
+      /** File content version at registration time. A daemon with a matching
+       *  durable local create intent uses it as the exact disk edit anchor. */
+      contentVersionB64?: string
+    }
   | { type: 'update'; path: string; entry: WorkspaceTreeEntry; seq?: number }
   | {
       type: 'delete'

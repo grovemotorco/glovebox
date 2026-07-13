@@ -39,6 +39,36 @@ export interface PendingRename {
 }
 
 /**
+ * Markdown create identity persisted BEFORE the side-effecting snapshot.get.
+ * A response-lost restart may use this local record (never client-visible
+ * server metadata alone) to prove that a replayed create owns the disk path.
+ */
+export interface PendingCreate {
+  fileId: string
+  path: string
+  contentKind: 'markdown'
+  /** Raw disk-byte hash used as the guarded-checkout watermark. */
+  contentHash: string
+  /** Hash of normalized text sent as initialContent; matches the create row. */
+  baseContentHash: string
+  nodeId: string | null
+  sizeBytes: number
+  /**
+   * Durable phase marker for conservative collision isolation. It is written
+   * before moving an unrelated occupant aside, so a crash after the move but
+   * before the authoritative view commit can finish the same move and must
+   * not reinterpret the now-absent source as a user delete.
+   */
+  collision?: {
+    path: string
+    isolatedPath: string
+    contentHash: string
+    nodeId: string | null
+    sizeBytes: number
+  }
+}
+
+/**
  * Delete INTENT (INV-3): records when absence was first observed so the
  * tombstone delay and rename-correction window can be enforced by the cycle.
  */
@@ -101,6 +131,8 @@ export interface DaemonWorkspaceState {
    */
   adoptedAt?: number
   files: Record<string, DaemonFileState>
+  /** Optional only for backward compatibility with pre-intent state files. */
+  pendingCreates?: PendingCreate[]
   pendingRenames: PendingRename[]
   pendingDeletes: PendingDelete[]
 }
@@ -219,6 +251,12 @@ export class DaemonStateStore {
       sizeBytes: meta.sizeBytes,
       savedAt,
     }
+    // Once the envelope + view entry are committed, a staged create for this
+    // identity is necessarily complete. Clear it in THIS state write so no
+    // caller can leave an orphan intent behind after a successful persist.
+    state.pendingCreates = (state.pendingCreates ?? []).filter(
+      (pending) => pending.fileId !== fileId,
+    )
     await this.#saveState(state)
   }
 
@@ -253,6 +291,9 @@ export class DaemonStateStore {
       opaqueHash: meta.opaqueHash,
       savedAt: this.#now(),
     }
+    state.pendingCreates = (state.pendingCreates ?? []).filter(
+      (pending) => pending.fileId !== fileId,
+    )
     await this.#saveState(state)
   }
 
@@ -280,6 +321,12 @@ export class DaemonStateStore {
   async setLastAckedSeq(seq: number): Promise<void> {
     const state = await this.#loadStateOrFresh()
     state.lastAckedSeq = seq
+    await this.#saveState(state)
+  }
+
+  async setPendingCreates(creates: PendingCreate[]): Promise<void> {
+    const state = await this.#loadStateOrFresh()
+    state.pendingCreates = creates
     await this.#saveState(state)
   }
 
@@ -425,6 +472,7 @@ export class DaemonStateStore {
       deviceId: this.#deviceId,
       lastAckedSeq: 0,
       files: {},
+      pendingCreates: [],
       pendingRenames: [],
       pendingDeletes: [],
     }
@@ -527,6 +575,27 @@ function isPendingDelete(value: unknown): value is PendingDelete {
   )
 }
 
+function isPendingCreate(value: unknown): value is PendingCreate {
+  const collision = isRecord(value) ? value.collision : undefined
+  return (
+    isRecord(value) &&
+    typeof value.fileId === 'string' &&
+    typeof value.path === 'string' &&
+    value.contentKind === 'markdown' &&
+    typeof value.contentHash === 'string' &&
+    typeof value.baseContentHash === 'string' &&
+    (value.nodeId === null || typeof value.nodeId === 'string') &&
+    typeof value.sizeBytes === 'number' &&
+    (collision === undefined ||
+      (isRecord(collision) &&
+        typeof collision.path === 'string' &&
+        typeof collision.isolatedPath === 'string' &&
+        typeof collision.contentHash === 'string' &&
+        (collision.nodeId === null || typeof collision.nodeId === 'string') &&
+        typeof collision.sizeBytes === 'number'))
+  )
+}
+
 function isPendingRename(value: unknown): value is PendingRename {
   return (
     isRecord(value) &&
@@ -548,6 +617,8 @@ function isWorkspaceState(value: unknown): value is DaemonWorkspaceState {
     typeof state.lastAckedSeq === 'number' &&
     isRecord(state.files) &&
     Object.values(state.files).every(isFileState) &&
+    (state.pendingCreates === undefined ||
+      (Array.isArray(state.pendingCreates) && state.pendingCreates.every(isPendingCreate))) &&
     Array.isArray(state.pendingRenames) &&
     state.pendingRenames.every(isPendingRename) &&
     Array.isArray(state.pendingDeletes) &&

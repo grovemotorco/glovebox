@@ -897,6 +897,9 @@ export class WorkspaceServer {
           opId: `snapshot:${message.requestId}`,
           deviceId: readAttachment(socket)?.deviceId ?? 'unknown',
         },
+        {
+          contentVersionB64: bytesToBase64(materialized.contentVersion),
+        },
       )
       if (!registered) {
         this.#send(socket, {
@@ -930,6 +933,9 @@ export class WorkspaceServer {
         {
           opId: `snapshot:${message.requestId}`,
           deviceId: attachment?.deviceId ?? 'unknown',
+        },
+        {
+          contentVersionB64: bytesToBase64(materialized!.contentVersion),
         },
       )
       if (!registered) {
@@ -1202,6 +1208,9 @@ export class WorkspaceServer {
       input.text,
       input.modifiedBy,
       input.recovery,
+      {
+        contentVersionB64: input.contentVersionB64,
+      },
     )
     if (rolledSeq === false) return false
     const body = {
@@ -1233,11 +1242,14 @@ export class WorkspaceServer {
     text: string,
     modifiedBy: string,
     recovery?: { opId: string; deviceId: string },
+    createMetadata?: { contentVersionB64: string },
   ): number | null | false {
     try {
       const row = this.#workspace.getByFileId(fileId)
       if (!row) {
-        return this.#registerFile(fileId, observedPath, text, modifiedBy, recovery) ? null : false
+        return this.#registerFile(fileId, observedPath, text, modifiedBy, recovery, createMetadata)
+          ? null
+          : false
       }
       // Belt-and-braces kind routing: text must never land in an opaque
       // row (writeFileById would store raw text the byte readers then
@@ -1262,6 +1274,7 @@ export class WorkspaceServer {
     text: string,
     modifiedBy: string,
     recovery?: { opId: string; deviceId: string },
+    createMetadata?: { contentVersionB64: string },
   ): boolean {
     const fallbackPath = `${fileId}.md`
     const requestedPath = observedPath ?? fallbackPath
@@ -1285,7 +1298,10 @@ export class WorkspaceServer {
         lastError = new Error('Registered file has no tree seq')
         continue
       }
-      const body = { path: entry.path, entry }
+      // The create-time VV is part of the durable event, not merely the live
+      // broadcast. A daemon killed after this side effect can combine it with
+      // its LOCAL pre-request intent to anchor unseen disk edits exactly.
+      const body = { path: entry.path, entry, ...createMetadata }
       this.#events.appendAt(entry.seq, 'create', fileId, JSON.stringify(body))
       this.#broadcast({ type: 'create', fileId, seq: entry.seq, ...body })
       return true

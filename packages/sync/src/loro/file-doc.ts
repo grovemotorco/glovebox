@@ -188,6 +188,18 @@ export class LoroFileDoc {
     return this.#doc.getText(TEXT_CONTAINER_ID).toString()
   }
 
+  /**
+   * Materialize text at an exact historical content version without
+   * mutating this doc. Throws when the version is not in this doc's lineage
+   * or predates a shallow-history root; callers must not guess across either
+   * case.
+   */
+  getTextContentAtVersion(version: LoroContentVersion): string {
+    const vv = decodeVersion(version)
+    const fork = this.#doc.forkAt(this.#doc.vvToFrontiers(vv))
+    return fork.getText(TEXT_CONTAINER_ID).toString()
+  }
+
   getTextContentSizeBytes(): number {
     return encoder.encode(this.getTextContent()).byteLength
   }
