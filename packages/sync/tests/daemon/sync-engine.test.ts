@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import type { WorkspaceTreeEntry } from '@glovebox.md/core'
 import { createNodeFS } from '../../src/fs/node-fs.ts'
 import { sha256Hex } from '../../src/fs/hash.ts'
 import { LoroFileDoc } from '../../src/loro/file-doc.ts'
@@ -13,10 +14,12 @@ import {
   deleteResolutionName,
   envelopeName,
   type DaemonWorkspaceState,
+  type PendingCreate,
   type PendingDelete,
 } from '../../src/daemon/state.ts'
 import {
   DaemonSyncEngine,
+  type DaemonSyncEngineOptions,
   type DaemonSyncWarning,
   type DaemonTransport,
   type DaemonTreeState,
@@ -25,7 +28,7 @@ import {
   type SubmitOpaqueResult,
 } from '../../src/daemon/sync-engine.ts'
 import type { SubmitUpdateInput, SubmitUpdateResult } from '../../src/loro/room-client.ts'
-import type { EventsSinceResult } from '../../src/client/sync-engine.ts'
+import type { EventsSinceResult, WireWorkspaceEvent } from '../../src/client/sync-engine.ts'
 import type { WorkspaceBatchWireOp } from '../../src/server/workspace-server.ts'
 
 class FakeTransport implements DaemonTransport {
@@ -93,6 +96,937 @@ class FakeTransport implements DaemonTransport {
     }
   }
 }
+
+class CreateReplayTransport extends FakeTransport {
+  readonly #docs = new Map<string, LoroFileDoc>()
+
+  constructor(
+    readonly event: WireWorkspaceEvent,
+    readonly canonicalSnapshot: Uint8Array,
+  ) {
+    super()
+    this.#docs.set(event.fileId, LoroFileDoc.fromSnapshot(canonicalSnapshot))
+  }
+
+  override async fetchSnapshot(
+    fileId: string,
+    initialContent?: string,
+    observedPath?: string,
+  ): Promise<Uint8Array> {
+    this.snapshotRequests.push({ fileId, initialContent, observedPath })
+    let doc = this.#docs.get(fileId)
+    if (!doc) {
+      doc = LoroFileDoc.empty(initialContent)
+      this.#docs.set(fileId, doc)
+    }
+    return doc.exportSnapshot()
+  }
+
+  override async submitUpdate(input: SubmitUpdateInput): Promise<SubmitUpdateResult> {
+    this.submittedUpdates.push(input.fileId)
+    const doc = this.#docs.get(input.fileId) ?? LoroFileDoc.empty()
+    doc.importUpdate(input.loroUpdate)
+    this.#docs.set(input.fileId, doc)
+    return {
+      type: 'ack',
+      applied: true,
+      contentVersionB64: bytesToBase64(doc.contentVersion()),
+    }
+  }
+
+  override async eventsSince(afterSeq: number): Promise<EventsSinceResult> {
+    const seq = this.event.seq ?? 1
+    return {
+      ok: true,
+      currentSeq: seq,
+      events: afterSeq < seq ? [this.event] : [],
+    }
+  }
+
+  serverText(fileId: string): string | null {
+    return this.#docs.get(fileId)?.getTextContent() ?? null
+  }
+}
+
+/** Simulates a create whose event fell out of replay while its live tree row remains. */
+class PrunedCreateTransport extends CreateReplayTransport {
+  override async eventsSince(): Promise<EventsSinceResult> {
+    return { ok: true, currentSeq: this.event.seq ?? 1, events: [] }
+  }
+
+  override async listTree(): Promise<DaemonTreeState> {
+    return {
+      currentSeq: this.event.seq ?? 1,
+      entries: this.event.entry ? [this.event.entry as DaemonTreeState['entries'][number]] : [],
+    }
+  }
+}
+
+const textEncoder = new TextEncoder()
+
+function pendingMarkdownCreate(
+  fileId: string,
+  path: string,
+  baseText: string,
+  nodeId: string | null,
+  overrides: Partial<PendingCreate> = {},
+): PendingCreate {
+  return {
+    fileId,
+    path,
+    contentKind: 'markdown',
+    contentHash: sha256Hex(baseText),
+    baseContentHash: sha256Hex(baseText),
+    nodeId,
+    sizeBytes: textEncoder.encode(baseText).byteLength,
+    ...overrides,
+  }
+}
+
+async function seedPendingState(
+  storage: MemoryDaemonStorage,
+  pendingCreates: PendingCreate[],
+  overrides: Partial<DaemonWorkspaceState> = {},
+): Promise<void> {
+  await storage.writeAtomic(
+    STATE_ARTIFACT,
+    encodeJson({
+      workspaceId: 'ws-test',
+      mountId: 'mount-test',
+      deviceId: 'device-test',
+      lastAckedSeq: 0,
+      adoptedAt: 1,
+      files: {},
+      pendingCreates,
+      pendingRenames: [],
+      pendingDeletes: [],
+      ...overrides,
+    }),
+  )
+}
+
+function markdownTreeEntry(
+  fileId: string,
+  path: string,
+  text: string,
+  seq = 1,
+  overrides: Partial<WorkspaceTreeEntry> = {},
+): WorkspaceTreeEntry {
+  return {
+    fileId,
+    path,
+    contentKind: 'markdown',
+    contentHash: sha256Hex(text),
+    sizeBytes: textEncoder.encode(text).byteLength,
+    version: 1,
+    seq,
+    modifiedBy: 'test-user',
+    modifiedAt: 1,
+    ...overrides,
+  }
+}
+
+function markdownCreateEvent(
+  fileId: string,
+  path: string,
+  entryText: string,
+  options: {
+    seq?: number
+    contentVersionB64?: string
+    entry?: Partial<WorkspaceTreeEntry>
+  } = {},
+): WireWorkspaceEvent {
+  const seq = options.seq ?? 1
+  return {
+    type: 'create',
+    fileId,
+    path,
+    seq,
+    contentVersionB64: options.contentVersionB64,
+    entry: markdownTreeEntry(fileId, path, entryText, seq, options.entry),
+  }
+}
+
+function crashEngine(
+  options: Omit<DaemonSyncEngineOptions, 'workspaceId' | 'mountId' | 'deviceId'>,
+): DaemonSyncEngine {
+  return new DaemonSyncEngine({
+    workspaceId: 'ws-test',
+    mountId: 'mount-test',
+    deviceId: 'device-test',
+    ...options,
+  })
+}
+
+describe('DaemonSyncEngine create-response crash reconciliation', () => {
+  it('persists intent before request and reuses the same fileId after a pre-effect failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'retry.md'), 'retry me')
+      class FailFirstSnapshotTransport extends FakeTransport {
+        attempts = 0
+
+        override async fetchSnapshot(
+          fileId: string,
+          initialContent?: string,
+          observedPath?: string,
+        ): Promise<Uint8Array> {
+          this.snapshotRequests.push({ fileId, initialContent, observedPath })
+          this.attempts += 1
+          if (this.attempts === 1) throw new Error('failed before server effect')
+          return LoroFileDoc.empty(initialContent).exportSnapshot()
+        }
+      }
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [])
+      const transport = new FailFirstSnapshotTransport()
+      const localFs = await createNodeFS(root)
+      let mintedIds = 0
+      const options = {
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => `file-${++mintedIds}`,
+      }
+      const first = crashEngine(options)
+
+      await first.start()
+      await first.runCycle()
+      expect((await decodeState(storage)).pendingCreates).toMatchObject([
+        { fileId: 'file-1', path: 'retry.md', contentKind: 'markdown' },
+      ])
+      expect(first.files()).toEqual([])
+      first.stop()
+
+      // A new process hydrates the intent and must not mint another identity.
+      const restarted = crashEngine(options)
+      await restarted.start()
+      await restarted.runCycle()
+      expect(transport.snapshotRequests.map((request) => request.fileId)).toEqual([
+        'file-1',
+        'file-1',
+      ])
+      expect(mintedIds).toBe(1)
+      expect(restarted.files()).toEqual([
+        { fileId: 'file-1', path: 'retry.md', contentKind: 'markdown' },
+      ])
+      const state = await decodeState(storage)
+      expect(state.pendingCreates).toEqual([])
+      expect(state.files['file-1']).toBeDefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('re-binds a dirty pending create regardless of untrusted event origin', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      // The server accepted the initial create, but SIGKILL landed before the
+      // daemon persisted the returned fileId. The user then appended while the
+      // daemon was dead. Restart only has the durable create event + disk.
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'kill-one.md'), 'oneafter-kill')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('kill-one.md'))!.nodeId
+      const created = LoroFileDoc.empty('one')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-kill-one', 'kill-one.md', 'one', nodeId),
+      ])
+      const event: WireWorkspaceEvent = {
+        ...markdownCreateEvent('file-kill-one', 'kill-one.md', 'one', {
+          contentVersionB64: bytesToBase64(created.contentVersion()),
+        }),
+        originDeviceId: 'foreign-or-spoofed-device',
+      }
+      const transport = new CreateReplayTransport(event, created.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-suffix-file',
+        newOpId: () => 'op-local-append',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'kill-one.md'), 'utf8')).toBe('oneafter-kill')
+      await expect(readFile(join(root, 'kill-one-2.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect(engine.files()).toEqual([
+        { fileId: 'file-kill-one', path: 'kill-one.md', contentKind: 'markdown' },
+      ])
+      expect(engine.getText('file-kill-one')).toBe('oneafter-kill')
+      expect(transport.submittedUpdates).toContain('file-kill-one')
+      expect(transport.serverText('file-kill-one')).toBe('oneafter-kill')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('follows a server-suffixed own create when an earlier remote event moved the staged inode', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'shared.md'), 'oneafter-kill')
+      const localFs = await createNodeFS(root)
+      const stagedNodeId = (await localFs.stat('shared.md'))!.nodeId
+      const ownCreated = LoroFileDoc.empty('one')
+      const remote = LoroFileDoc.empty('remote-file')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-own', 'shared.md', 'one', stagedNodeId),
+      ])
+      const remoteEvent = markdownCreateEvent('file-remote', 'shared.md', 'remote-file')
+      const ownEvent = markdownCreateEvent('file-own', 'shared-2.md', 'one', {
+        seq: 2,
+        contentVersionB64: bytesToBase64(ownCreated.contentVersion()),
+        entry: { modifiedAt: 2 },
+      })
+      class OrderedCollisionTransport extends CreateReplayTransport {
+        override async eventsSince(afterSeq: number): Promise<EventsSinceResult> {
+          return {
+            ok: true,
+            currentSeq: 2,
+            events: [remoteEvent, ownEvent].filter((event) => (event.seq ?? 0) > afterSeq),
+          }
+        }
+
+        override async fetchSnapshot(
+          fileId: string,
+          initialContent?: string,
+          observedPath?: string,
+        ): Promise<Uint8Array> {
+          if (fileId === 'file-remote') {
+            this.snapshotRequests.push({ fileId, initialContent, observedPath })
+            return remote.exportSnapshot()
+          }
+          return super.fetchSnapshot(fileId, initialContent, observedPath)
+        }
+      }
+      const transport = new OrderedCollisionTransport(ownEvent, ownCreated.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-third-file',
+        newOpId: () => 'op-suffixed-append',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('remote-file')
+      expect(await readFile(join(root, 'shared-2.md'), 'utf8')).toBe('oneafter-kill')
+      await expect(readFile(join(root, 'shared-3.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect(engine.files()).toEqual(
+        expect.arrayContaining([
+          { fileId: 'file-remote', path: 'shared.md', contentKind: 'markdown' },
+          { fileId: 'file-own', path: 'shared-2.md', contentKind: 'markdown' },
+        ]),
+      )
+      expect(transport.serverText('file-own')).toBe('oneafter-kill')
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('merges a concurrent canonical edit with the post-crash local append', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'crash-race.md'), 'base\nlocal-marker\n')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('crash-race.md'))!.nodeId
+      const canonical = LoroFileDoc.empty('base\n')
+      const createVersion = canonical.contentVersion()
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-crash-race', 'crash-race.md', 'base\n', nodeId),
+      ])
+      const event: WireWorkspaceEvent = {
+        ...markdownCreateEvent('file-crash-race', 'crash-race.md', 'base\n', {
+          contentVersionB64: bytesToBase64(createVersion),
+        }),
+        originDeviceId: 'device-test',
+      }
+      const transport = new CreateReplayTransport(event, canonical.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-suffix-file',
+        newOpId: () => 'op-raced-append',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      const disk = await readFile(join(root, 'crash-race.md'), 'utf8')
+      const server = transport.serverText('file-crash-race')!
+      for (const text of [disk, server, engine.getText('file-crash-race')!]) {
+        expect(text).toContain('remote-marker')
+        expect(text).toContain('local-marker')
+      }
+      expect(disk).toBe(server)
+      await expect(readFile(join(root, 'crash-race-2.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts an empty create-time version as valid replay proof', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'empty.md'), 'written-after-kill')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('empty.md'))!.nodeId
+      const created = LoroFileDoc.empty('')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [pendingMarkdownCreate('file-empty', 'empty.md', '', nodeId)])
+      const event: WireWorkspaceEvent = {
+        ...markdownCreateEvent('file-empty', 'empty.md', '', { contentVersionB64: '' }),
+        originDeviceId: 'device-test',
+      }
+      const transport = new CreateReplayTransport(event, created.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-suffix-file',
+        newOpId: () => 'op-empty-edit',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'empty.md'), 'utf8')).toBe('written-after-kill')
+      expect(transport.serverText('file-empty')).toBe('written-after-kill')
+      await expect(readFile(join(root, 'empty-2.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('uses canonical bytes without inception merge when legacy proof is missing and disk is unchanged', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'legacy.md'), 'base\n')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('legacy.md'))!.nodeId
+      const canonical = LoroFileDoc.empty('base\n')
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-legacy', 'legacy.md', 'base\n', nodeId),
+      ])
+      // Legacy event: no create-time VV, while canonical has advanced.
+      const event = markdownCreateEvent('file-legacy', 'legacy.md', 'base\n')
+      const transport = new CreateReplayTransport(event, canonical.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-suffix-file',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'legacy.md'), 'utf8')).toBe('base\nremote-marker\n')
+      await expect(readFile(join(root, 'legacy-2.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect(engine.getText('file-legacy')).toBe('base\nremote-marker\n')
+      expect(transport.serverText('file-legacy')).toBe('base\nremote-marker\n')
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an edit that lands during legacy create snapshot fetch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'fetch-race.md'), 'base\n')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('fetch-race.md'))!.nodeId
+      const canonical = LoroFileDoc.empty('base\n')
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-fetch-race', 'fetch-race.md', 'base\n', nodeId),
+      ])
+      const event = markdownCreateEvent('file-fetch-race', 'fetch-race.md', 'base\n')
+      class EditDuringFetchTransport extends CreateReplayTransport {
+        edited = false
+
+        override async fetchSnapshot(
+          fileId: string,
+          initialContent?: string,
+          observedPath?: string,
+        ): Promise<Uint8Array> {
+          const snapshot = await super.fetchSnapshot(fileId, initialContent, observedPath)
+          if (!this.edited && fileId === 'file-fetch-race') {
+            this.edited = true
+            await writeFile(join(root, 'fetch-race.md'), 'base\nlocal-marker\n')
+          }
+          return snapshot
+        }
+      }
+      const transport = new EditDuringFetchTransport(event, canonical.exportShallowSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'file-fetch-race-local',
+        newOpId: () => 'op-fetch-race',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'fetch-race.md'), 'utf8')).toBe('base\nremote-marker\n')
+      expect(await readFile(join(root, 'fetch-race-2.md'), 'utf8')).toBe('base\nlocal-marker\n')
+      expect(transport.serverText('file-fetch-race')).toBe('base\nremote-marker\n')
+      expect(transport.serverText('file-fetch-race-local')).toBe('base\nlocal-marker\n')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('cleanly binds unchanged staged bytes when the create event was pruned and canonical advanced', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'pruned-clean.md'), 'base\n')
+      const localFs = await createNodeFS(root)
+      const nodeId = (await localFs.stat('pruned-clean.md'))!.nodeId
+      const canonical = LoroFileDoc.empty('base\n')
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-pruned-clean', 'pruned-clean.md', 'base\n', nodeId),
+      ])
+      const event = markdownCreateEvent(
+        'file-pruned-clean',
+        'pruned-clean.md',
+        'base\nremote-marker\n',
+        { seq: 8, entry: { version: 2, modifiedBy: 'other-user', modifiedAt: 2 } },
+      )
+      const transport = new PrunedCreateTransport(event, canonical.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'unexpected-suffix-file',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'pruned-clean.md'), 'utf8')).toBe('base\nremote-marker\n')
+      await expect(readFile(join(root, 'pruned-clean-2.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect(engine.files()).toEqual([
+        {
+          fileId: 'file-pruned-clean',
+          path: 'pruned-clean.md',
+          contentKind: 'markdown',
+        },
+      ])
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('suffixes conservatively when replay proof is legacy, malformed, or pruned', async () => {
+    const full = LoroFileDoc.empty('server-base')
+    const createVersion = full.contentVersion()
+    full.setTextContent('server-new')
+    const scenarios: {
+      name: string
+      contentVersionB64: string | undefined
+      canonicalSnapshot: Uint8Array
+      canonicalText: string
+    }[] = [
+      {
+        name: 'legacy-missing',
+        contentVersionB64: undefined,
+        canonicalSnapshot: LoroFileDoc.empty('server-base').exportSnapshot(),
+        canonicalText: 'server-base',
+      },
+      {
+        name: 'malformed',
+        contentVersionB64: '%%%not-base64%%%',
+        canonicalSnapshot: LoroFileDoc.empty('server-base').exportSnapshot(),
+        canonicalText: 'server-base',
+      },
+      {
+        // Structurally valid and dominated, but it materializes empty text,
+        // not the nonempty bytes stamped into the create entry.
+        name: 'wrong-valid-version',
+        contentVersionB64: '',
+        canonicalSnapshot: LoroFileDoc.empty('server-base').exportSnapshot(),
+        canonicalText: 'server-base',
+      },
+      {
+        name: 'history-pruned',
+        contentVersionB64: bytesToBase64(createVersion),
+        canonicalSnapshot: full.exportShallowSnapshot(),
+        canonicalText: 'server-new',
+      },
+    ]
+
+    for (const scenario of scenarios) {
+      const root = await mkdtemp(join(tmpdir(), `glovebox-sync-engine-${scenario.name}-`))
+      try {
+        await writeFile(join(root, '.glovebox.json'), '{}\n')
+        await writeFile(join(root, 'shared.md'), 'local-unrelated')
+        const localFs = await createNodeFS(root)
+        const nodeId = (await localFs.stat('shared.md'))!.nodeId
+        const storage = new MemoryDaemonStorage()
+        await seedPendingState(storage, [
+          pendingMarkdownCreate(`file-${scenario.name}`, 'shared.md', 'server-base', nodeId),
+        ])
+        const event: WireWorkspaceEvent = {
+          ...markdownCreateEvent(`file-${scenario.name}`, 'shared.md', 'server-base', {
+            contentVersionB64: scenario.contentVersionB64,
+          }),
+          originDeviceId: 'device-test',
+        }
+        const transport = new CreateReplayTransport(event, scenario.canonicalSnapshot)
+        const engine = crashEngine({
+          fs: localFs,
+          storage,
+          transport,
+          newFileId: () => `local-${scenario.name}`,
+          newOpId: () => `op-${scenario.name}`,
+        })
+
+        await engine.start()
+        await engine.runCycle()
+
+        expect(await readFile(join(root, 'shared.md'), 'utf8'), scenario.name).toBe(
+          scenario.canonicalText,
+        )
+        expect(await readFile(join(root, 'shared-2.md'), 'utf8'), scenario.name).toBe(
+          'local-unrelated',
+        )
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+  })
+
+  it('keeps suffix isolation for a spoofed same-device create without a local intent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'shared.md'), 'local-unrelated')
+      const remote = LoroFileDoc.empty('remote-file')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [])
+      const event: WireWorkspaceEvent = {
+        ...markdownCreateEvent('file-remote', 'shared.md', 'remote-file', {
+          contentVersionB64: bytesToBase64(remote.contentVersion()),
+          entry: { modifiedBy: 'other-user' },
+        }),
+        // Origin is client-controlled and therefore deliberately irrelevant.
+        originDeviceId: 'device-test',
+      }
+      const transport = new CreateReplayTransport(event, remote.exportSnapshot())
+      const engine = crashEngine({
+        fs: await createNodeFS(root),
+        storage,
+        transport,
+        newFileId: () => 'file-local-suffix',
+        newOpId: () => 'op-local-suffix',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('remote-file')
+      expect(await readFile(join(root, 'shared-2.md'), 'utf8')).toBe('local-unrelated')
+      expect(engine.files()).toEqual(
+        expect.arrayContaining([
+          { fileId: 'file-remote', path: 'shared.md', contentKind: 'markdown' },
+          { fileId: 'file-local-suffix', path: 'shared-2.md', contentKind: 'markdown' },
+        ]),
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('suffixes a same-path replacement whose inode differs from the staged create', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'shared.md'), 'one')
+      const localFs = await createNodeFS(root)
+      const stagedNodeId = (await localFs.stat('shared.md'))!.nodeId
+      await writeFile(join(root, 'replacement.tmp'), 'unrelated replacement')
+      await rename(join(root, 'replacement.tmp'), join(root, 'shared.md'))
+      expect((await localFs.stat('shared.md'))!.nodeId).not.toBe(stagedNodeId)
+
+      const created = LoroFileDoc.empty('one')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-original', 'shared.md', 'one', stagedNodeId),
+      ])
+      const event: WireWorkspaceEvent = {
+        ...markdownCreateEvent('file-original', 'shared.md', 'one', {
+          contentVersionB64: bytesToBase64(created.contentVersion()),
+        }),
+        originDeviceId: 'device-test',
+      }
+      const transport = new CreateReplayTransport(event, created.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'file-replacement',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('one')
+      expect(await readFile(join(root, 'shared-2.md'), 'utf8')).toBe('unrelated replacement')
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reconciles a pruned create with a replaced inode and tracks both preserved rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'shared.md'), 'one')
+      const localFs = await createNodeFS(root)
+      const stagedNodeId = (await localFs.stat('shared.md'))!.nodeId
+      await writeFile(join(root, 'replacement.tmp'), 'unrelated replacement')
+      await rename(join(root, 'replacement.tmp'), join(root, 'shared.md'))
+
+      const created = LoroFileDoc.empty('one')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-original', 'shared.md', 'one', stagedNodeId),
+      ])
+      const event = markdownCreateEvent('file-original', 'shared.md', 'one', { seq: 9 })
+      const transport = new PrunedCreateTransport(event, created.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'file-replacement',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('one')
+      expect(await readFile(join(root, 'shared-2.md'), 'utf8')).toBe('unrelated replacement')
+      expect(engine.files()).toEqual(
+        expect.arrayContaining([
+          { fileId: 'file-original', path: 'shared.md', contentKind: 'markdown' },
+          {
+            fileId: 'file-replacement',
+            path: 'shared-2.md',
+            contentKind: 'markdown',
+          },
+        ]),
+      )
+      expect(transport.serverText('file-original')).toBe('one')
+      expect(transport.serverText('file-replacement')).toBe('unrelated replacement')
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('finishes a journaled collision move when the create event replays after another crash', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'shared-2.md'), 'unrelated replacement')
+      const localFs = await createNodeFS(root)
+      const isolated = await localFs.stat('shared-2.md')
+      const created = LoroFileDoc.empty('one')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-original', 'shared.md', 'one', 'staged-inode', {
+          collision: {
+            path: 'shared.md',
+            isolatedPath: 'shared-2.md',
+            contentHash: sha256Hex('unrelated replacement'),
+            nodeId: isolated!.nodeId,
+            sizeBytes: 21,
+          },
+        }),
+      ])
+      const event = markdownCreateEvent('file-original', 'shared.md', 'one', {
+        contentVersionB64: bytesToBase64(created.contentVersion()),
+      })
+      const transport = new CreateReplayTransport(event, created.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'file-replacement',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(await readFile(join(root, 'shared.md'), 'utf8')).toBe('one')
+      expect(await readFile(join(root, 'shared-2.md'), 'utf8')).toBe('unrelated replacement')
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('binds an absent pruned create without resurrecting it and opens normal delete intent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      const canonical = LoroFileDoc.empty('base\n')
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-absent', 'absent.md', 'base\n', 'old-inode'),
+      ])
+      const event = markdownCreateEvent('file-absent', 'absent.md', 'base\nremote-marker\n', {
+        seq: 5,
+        entry: { version: 2, modifiedBy: 'other-user', modifiedAt: 2 },
+      })
+      const transport = new PrunedCreateTransport(event, canonical.exportSnapshot())
+      const engine = crashEngine({
+        fs: await createNodeFS(root),
+        storage,
+        transport,
+        newOpId: () => 'delete-absent',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      await expect(readFile(join(root, 'absent.md'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect(engine.files()).toContainEqual({
+        fileId: 'file-absent',
+        path: 'absent.md',
+        contentKind: 'markdown',
+      })
+      const state = await decodeState(storage)
+      expect(state.pendingCreates).toEqual([])
+      expect(state.pendingDeletes).toMatchObject([{ fileId: 'file-absent', path: 'absent.md' }])
+      expect(transport.serverText('file-absent')).toBe('base\nremote-marker\n')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a zero-view pending create frozen when the mount sentinel is missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-mounted', 'mounted.md', 'mounted', 'volume-inode'),
+      ])
+      const engine = crashEngine({
+        fs: await createNodeFS(root),
+        storage,
+        transport: new FakeTransport(),
+      })
+
+      await engine.start()
+      await engine.runCycle()
+
+      expect(engine.mountSuspect()).toBe(true)
+      await expect(readFile(join(root, '.glovebox.json'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+      expect((await decodeState(storage)).pendingCreates).toMatchObject([
+        { fileId: 'file-mounted', path: 'mounted.md' },
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('suffixes divergent local bytes when the create event and exact base were pruned', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'glovebox-sync-engine-'))
+    try {
+      await writeFile(join(root, '.glovebox.json'), '{}\n')
+      await writeFile(join(root, 'window-miss.md'), 'base\n')
+      const localFs = await createNodeFS(root)
+      const stagedNodeId = (await localFs.stat('window-miss.md'))!.nodeId
+      await writeFile(join(root, 'window-miss.md'), 'base\nlocal-marker\n')
+
+      const canonical = LoroFileDoc.empty('base\n')
+      canonical.setTextContent('base\nremote-marker\n')
+      const storage = new MemoryDaemonStorage()
+      await seedPendingState(storage, [
+        pendingMarkdownCreate('file-window-miss', 'window-miss.md', 'base\n', stagedNodeId),
+      ])
+      const event: WireWorkspaceEvent = {
+        type: 'create',
+        fileId: 'file-window-miss',
+        path: 'window-miss.md',
+        seq: 1,
+      }
+      class NoReplayTransport extends CreateReplayTransport {
+        override async eventsSince(): Promise<EventsSinceResult> {
+          return { ok: true, currentSeq: 1, events: [] }
+        }
+      }
+      const transport = new NoReplayTransport(event, canonical.exportSnapshot())
+      const engine = crashEngine({
+        fs: localFs,
+        storage,
+        transport,
+        newFileId: () => 'file-local-suffix',
+      })
+
+      await engine.start()
+      await engine.runCycle()
+      await engine.runCycle() // register the preserved suffix under a new identity
+
+      const canonicalText = 'base\nremote-marker\n'
+      const localText = 'base\nlocal-marker\n'
+      expect(await readFile(join(root, 'window-miss.md'), 'utf8')).toBe(canonicalText)
+      expect(await readFile(join(root, 'window-miss-2.md'), 'utf8')).toBe(localText)
+      expect(transport.serverText('file-window-miss')).toBe(canonicalText)
+      expect(transport.serverText('file-local-suffix')).toBe(localText)
+      expect((await decodeState(storage)).pendingCreates).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('DaemonSyncEngine cycle isolation and opaque observability (ISSUE-0053)', () => {
   it('continues to opaque submit when one markdown create is rejected', async () => {

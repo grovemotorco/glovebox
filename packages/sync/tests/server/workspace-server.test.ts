@@ -1082,6 +1082,7 @@ describe('WorkspaceServer hibernation safety', () => {
     const editor = LoroFileDoc.fromSnapshot(base64ToBytes(snapshotB64), {
       peerId: BigInt(peerId),
     })
+    const createVersionB64 = bytesToBase64(editor.contentVersion())
 
     await submitEdit(hostA, editorSocket, editor, fileId, 'r1\n', 'op-r1')
     await submitEdit(hostA, editorSocket, editor, fileId, 'r2\n', 'op-r2')
@@ -1101,7 +1102,10 @@ describe('WorkspaceServer hibernation safety', () => {
     // The file's registration replays first (cross-replica discovery), then
     // the content history.
     expect(events[0]!.type).toBe('create')
-    expect(events[0]).toMatchObject({ path: `${fileId}.md` })
+    expect(events[0]).toMatchObject({
+      path: `${fileId}.md`,
+      contentVersionB64: createVersionB64,
+    })
 
     const replayDoc = LoroFileDoc.fromSnapshot(base64ToBytes(snapshotB64))
     for (const event of events.slice(1)) {

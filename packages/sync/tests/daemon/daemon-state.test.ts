@@ -127,6 +127,37 @@ describe('DaemonStateStore', () => {
     expect(await storage.list()).toEqual([])
   })
 
+  it('completes a pending create atomically with its durable view entry', async () => {
+    const pending = {
+      fileId: 'file-1',
+      path: 'notes/a.md',
+      contentKind: 'markdown' as const,
+      contentHash: 'raw-hash',
+      baseContentHash: 'normalized-hash',
+      nodeId: '0:1',
+      sizeBytes: 5,
+    }
+    const storage = new MemoryDaemonStorage()
+    await makeStore(storage).setPendingCreates([pending])
+
+    // Envelope lands, but the shared state commit is cut down. The old state
+    // still has the intent and no view, so restart retries the same identity.
+    const crashing = new CrashingStorage(storage, 1)
+    await expect(
+      makeStore(crashing).persistMarkdownFile('file-1', makePair('hello'), markdownMeta),
+    ).rejects.toThrow('simulated crash')
+    const afterCrash = await makeStore(storage).load()
+    expect(afterCrash.state.pendingCreates).toEqual([pending])
+    expect(afterCrash.state.files).toEqual({})
+    expect(afterCrash.ready).toEqual([])
+
+    await makeStore(storage).persistMarkdownFile('file-1', makePair('hello'), markdownMeta)
+    const completed = await makeStore(storage).load()
+    expect(completed.state.pendingCreates).toEqual([])
+    expect(completed.state.files['file-1']).toBeDefined()
+    expect(completed.ready.map((ready) => ready.fileId)).toEqual(['file-1'])
+  })
+
   it('crash between envelope UPDATE and state write → newer envelope wins (case 1)', async () => {
     const storage = new MemoryDaemonStorage()
     let clock = 1000

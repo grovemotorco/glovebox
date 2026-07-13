@@ -20,6 +20,7 @@ import {
   DaemonStateStore,
   type DeleteResolutionCommand,
   type DaemonStorage,
+  type PendingCreate,
   type PendingDelete,
   type PendingRename,
 } from './state.ts'
@@ -219,6 +220,13 @@ interface EngineFileView extends DaemonFileView {
   lastWrittenVV: Uint8Array
 }
 
+interface DiskFileEntry {
+  text: string
+  contentHash: string
+  sizeBytes: number
+  nodeId: string | null
+}
+
 export class DaemonSyncEngine {
   readonly #options: DaemonSyncEngineOptions
   readonly #store: DaemonStateStore
@@ -226,6 +234,7 @@ export class DaemonSyncEngine {
   readonly #policy: DaemonDeletePolicy
   readonly #views = new Map<string, EngineFileView>()
   readonly #clients = new Map<string, LoroRoomClient>()
+  readonly #pendingCreates = new Map<string, PendingCreate>()
   readonly #pendingDeletes = new Map<string, PendingDelete>()
   readonly #pendingRenames = new Map<string, PendingRename>()
   readonly #warnedHeldDeletes = new Set<string>()
@@ -485,6 +494,9 @@ export class DaemonSyncEngine {
     // pass first — binding disk files to existing fileIds by path is what
     // keeps a remount from re-creating the whole workspace (ISSUE-0044).
     this.#needsAdoption = reconciled.state.adoptedAt === undefined
+    for (const create of reconciled.state.pendingCreates ?? []) {
+      this.#pendingCreates.set(create.fileId, create)
+    }
     for (const intent of reconciled.state.pendingDeletes) {
       this.#pendingDeletes.set(intent.fileId, intent)
     }
@@ -576,6 +588,7 @@ export class DaemonSyncEngine {
       this.#needsAdoption = false
     }
     await this.#pull()
+    await this.#reconcilePendingCreates()
     // A bailed remote rename (ISSUE-0050 A) re-applies once this cycle's
     // pull has relocated the tracked view that held its destination.
     await this.#retryRenameReconcile()
@@ -603,7 +616,7 @@ export class DaemonSyncEngine {
       this.#mountSuspect = false
       return
     }
-    if (this.#views.size === 0) {
+    if (this.#views.size === 0 && this.#pendingCreates.size === 0) {
       await this.#fs.writeFile(
         this.#policy.sentinelPath,
         `${JSON.stringify(
@@ -854,8 +867,25 @@ export class DaemonSyncEngine {
     const entry = event.entry as WorkspaceTreeEntry | undefined
     const path = entry?.path ?? event.path
     if (!path) return
+    if (this.#mountSuspect) {
+      // Pull must not mutate a directory whose mount sentinel is missing.
+      // Throwing also prevents cursor advance, so the event is retried once
+      // the intended volume returns instead of being durably forgotten.
+      throw new Error(`mount sentinel missing; deferred remote create for ${event.fileId}`)
+    }
     const existing = this.#views.get(event.fileId)
     if (existing) {
+      if (this.#pendingCreates.has(event.fileId)) {
+        // A prior attempt attached the view but crashed/failed before the
+        // state write that completes the intent. Re-drive that atomic commit.
+        if (existing.contentKind === 'markdown' && this.#clients.has(event.fileId)) {
+          await this.#persistMarkdown(event.fileId)
+        } else if (existing.contentKind === 'opaque') {
+          await this.#persistOpaque(event.fileId)
+        } else {
+          return
+        }
+      }
       if (existing.path !== path) {
         await this.#applyRemoteRename({
           type: 'rename',
@@ -867,6 +897,20 @@ export class DaemonSyncEngine {
     }
     for (const view of this.#views.values()) {
       if (view.path === path) return // Local file occupies the path; scan owns it.
+    }
+    const pendingCreate = this.#pendingCreates.get(event.fileId)
+    if (pendingCreate) {
+      if (entry && (await this.#bindPendingCreateReplay(event, entry, pendingCreate))) return
+      // Keep the intent durable until the authoritative view commit. Recovery
+      // itself may fetch content and move a collision aside; journaling that
+      // phase prevents a second crash from orphaning this already-created row.
+      if (!entry) return
+      await this.#reconcileAuthoritativePendingCreate(
+        pendingCreate,
+        entry,
+        await this.#readDisk(pendingCreate.path),
+      )
+      return
     }
     const diskHash = await this.#fs.hash(path).catch(() => null)
     if (diskHash !== null) {
@@ -910,6 +954,437 @@ export class DaemonSyncEngine {
     await this.#attach(event.fileId, { snapshot, syncedVersion: doc.contentVersion() })
     this.#resurrect.add(event.fileId)
     await this.#persistMarkdown(event.fileId)
+  }
+
+  /**
+   * A create request is side-effecting: the server can durably register the
+   * file and broadcast its create just before SIGKILL prevents the daemon
+   * from persisting the returned fileId. On restart the path is occupied by
+   * the daemon's still-untracked bytes. Treating that as an arbitrary
+   * collision suffix-preserves the bytes but severs their identity from the
+   * file the daemon just created.
+   *
+   * The durable LOCAL pending-create record proves identity by fileId, path,
+   * kind, and create-base hash. Server event metadata is only the CRDT anchor:
+   * its VV must materialize the same create-base hash and remain forkable from
+   * the canonical snapshot. A client-controlled origin ID is never treated as
+   * authority. Missing, mismatched, invalid, or history-pruned evidence falls
+   * back to the conservative unrelated-file suffix policy.
+   */
+  async #bindPendingCreateReplay(
+    event: WireWorkspaceEvent,
+    entry: WorkspaceTreeEntry,
+    pending: PendingCreate,
+  ): Promise<boolean> {
+    // A collision phase means recovery already moved (or was about to move)
+    // the path occupant. Disk absence is then daemon-authored, not a local
+    // delete; finish the journaled isolation through authoritative recovery.
+    if (pending.collision) return false
+    if (pending.fileId !== event.fileId) return false
+    if (pending.contentKind !== 'markdown' || entry.contentKind === 'opaque') return false
+    if (pending.baseContentHash !== entry.contentHash) return false
+    if (event.contentVersionB64 === undefined) return false
+
+    let createVersion: Uint8Array
+    try {
+      createVersion = base64ToBytes(event.contentVersionB64)
+    } catch {
+      return false
+    }
+
+    // A transport failure is inconclusive, not evidence of an unrelated
+    // collision. Abort this cycle and retry the proof without moving bytes.
+    const snapshot = await this.#options.transport.fetchSnapshot(event.fileId)
+    let doc: LoroFileDoc
+    try {
+      doc = LoroFileDoc.fromSnapshot(snapshot)
+      if (!versionDominates(doc.contentVersion(), createVersion)) return false
+      if (!versionDominates(createVersion, doc.shallowSinceVersion())) return false
+      // Dominance proves lineage but not that the server stamped the RIGHT
+      // point in that lineage. Materialize the claimed version and match it
+      // to the create event's immutable content hash before using it as the
+      // disk edit anchor (notably, '' is a valid VV only for an empty create).
+      if (sha256Hex(doc.getTextContentAtVersion(createVersion)) !== entry.contentHash) return false
+    } catch {
+      return false
+    }
+
+    const disk = await this.#readDisk(entry.path)
+    if (
+      entry.path !== pending.path &&
+      (disk === null ||
+        pending.nodeId === null ||
+        disk.nodeId === null ||
+        pending.nodeId !== disk.nodeId)
+    ) {
+      // Server collision resolution can suffix this create after an earlier
+      // remote event moved the still-untracked inode to that same suffix.
+      // Only the exact journaled inode authorizes following the canonical
+      // path; absence or path-only equality remains unrelated.
+      return false
+    }
+    if (
+      disk !== null &&
+      (pending.nodeId === null || disk.nodeId === null || pending.nodeId !== disk.nodeId)
+    ) {
+      // The original path was atomically replaced after staging. Preserve the
+      // replacement as an unrelated collision; only the journaled inode can
+      // carry dirty same-file bytes back into this identity.
+      return false
+    }
+    this.#views.set(event.fileId, {
+      fileId: event.fileId,
+      path: entry.path,
+      contentKind: 'markdown',
+      nodeId: disk?.nodeId ?? pending.nodeId,
+      // The create event's entry is the materialization at createVersion.
+      // A mismatch is the unseen post-create disk edit; guarded checkout
+      // leaves it alone and scan absorbs it at createVersion.
+      lastWrittenHash: pending.contentHash,
+      lastWrittenVV: createVersion,
+      sizeBytes: pending.sizeBytes,
+    })
+    await this.#attach(event.fileId, {
+      snapshot,
+      syncedVersion: doc.contentVersion(),
+    })
+    // Envelope + view entry + intent removal use one state commit. A crash
+    // before it leaves the intent retryable; a crash after it leaves a fully
+    // bound view and no orphan intent.
+    await this.#persistMarkdown(event.fileId)
+    return true
+  }
+
+  async #recordPendingCreate(create: PendingCreate): Promise<void> {
+    await this.#setPendingCreate(create)
+  }
+
+  async #setPendingCreate(create: PendingCreate): Promise<void> {
+    const projected = [
+      ...[...this.#pendingCreates.values()].filter((pending) => pending.fileId !== create.fileId),
+      create,
+    ]
+    await this.#store.setPendingCreates(projected)
+    this.#pendingCreates.set(create.fileId, create)
+  }
+
+  async #discardPendingCreate(fileId: string): Promise<void> {
+    if (!this.#pendingCreates.has(fileId)) return
+    const projected = [...this.#pendingCreates.values()].filter(
+      (pending) => pending.fileId !== fileId,
+    )
+    await this.#store.setPendingCreates(projected)
+    this.#pendingCreates.delete(fileId)
+  }
+
+  #pendingCreateAtPath(path: string): PendingCreate | undefined {
+    return [...this.#pendingCreates.values()].find((pending) => pending.path === path)
+  }
+
+  /**
+   * Resolve every durable create intent that pull could not match to an
+   * event. A create event may have fallen out of the replay window even
+   * though snapshot.get already registered the row, while a request that
+   * failed before its server effect has no row at all. One authoritative
+   * tree read distinguishes those outcomes without trusting the path alone.
+   *
+   * Same-path/same-inode rows defer to scan, which can compare the staged
+   * base with the fetched canonical snapshot and absorb a dirty edit at the
+   * exact base. Every divergent case is reconciled immediately so an old
+   * server row can never become permanently untracked.
+   */
+  async #reconcilePendingCreates(): Promise<void> {
+    // A missing sentinel may mean the mounted volume disappeared. Do not
+    // classify its now-absent staged inode or mutate the durable intent until
+    // the mount identity is present again (same freeze as delete detection).
+    if (this.#mountSuspect) return
+    for (const pending of this.#pendingCreates.values()) {
+      const view = this.#views.get(pending.fileId)
+      if (!view) continue
+      // An earlier recovery may have built the in-memory view but failed its
+      // final state write. Re-drive that atomic completion even when the
+      // create event was pruned and will not trigger #applyRemoteCreate again.
+      if (view.contentKind === 'opaque') {
+        await this.#persistOpaque(pending.fileId)
+      } else if (this.#clients.has(pending.fileId)) {
+        await this.#persistMarkdown(pending.fileId)
+      }
+    }
+    const unresolved = [...this.#pendingCreates.values()].filter(
+      (pending) => !this.#views.has(pending.fileId),
+    )
+    if (unresolved.length === 0) return
+
+    const tree = await this.#options.transport.listTree()
+    const entries = new Map(
+      tree.entries
+        .filter((entry) => !entry.tombstone)
+        .map((entry) => [entry.fileId, entry] as const),
+    )
+    for (const pending of unresolved) {
+      const disk = await this.#readDisk(pending.path)
+      const entry = entries.get(pending.fileId)
+      if (!entry) {
+        // No server row proves that snapshot.get never took effect. Retain a
+        // still-present staged inode for scan to retry with the same fileId;
+        // retire an absent/replaced intent so the replacement can mint one.
+        if (
+          disk === null ||
+          pending.nodeId === null ||
+          disk.nodeId === null ||
+          pending.nodeId !== disk.nodeId
+        ) {
+          await this.#discardPendingCreate(pending.fileId)
+        }
+        continue
+      }
+
+      const sameStagedFile =
+        pending.collision === undefined &&
+        entry.path === pending.path &&
+        entry.contentKind !== 'opaque' &&
+        disk !== null &&
+        pending.nodeId !== null &&
+        disk.nodeId !== null &&
+        pending.nodeId === disk.nodeId
+      const diskStillStagedBase =
+        disk !== null &&
+        (disk.contentHash === pending.contentHash ||
+          sha256Hex(normalizeEol(disk.text)) === pending.baseContentHash)
+      // Dirty bytes on the same inode need scan's exact create-base merge.
+      // Unchanged staged bytes can be reconciled here even when canonical has
+      // advanced and the create event/VV was pruned, avoiding a needless
+      // duplicate suffix for a file with no unseen local edit.
+      if (sameStagedFile && !diskStillStagedBase) continue
+
+      await this.#reconcileAuthoritativePendingCreate(pending, entry, disk)
+    }
+  }
+
+  /**
+   * Reconcile a server row whose create event is unavailable and whose local
+   * staged inode cannot safely be rebound by scan. An absent staged file is
+   * attached with a nonempty watermark so normal delete-intent semantics run;
+   * occupied/divergent paths reuse remote-create collision isolation.
+   */
+  async #reconcileAuthoritativePendingCreate(
+    pending: PendingCreate,
+    entry: WorkspaceTreeEntry,
+    pendingDisk: DiskFileEntry | null,
+  ): Promise<void> {
+    let currentPending = this.#pendingCreates.get(pending.fileId) ?? pending
+    let authoritativeDisk =
+      entry.path === pending.path ? pendingDisk : await this.#readDisk(entry.path)
+
+    let snapshot: Uint8Array | undefined
+    let doc: LoroFileDoc | undefined
+    if (entry.contentKind !== 'opaque') {
+      // Fetch before any disk move. A transport failure leaves both the
+      // occupant and durable intent untouched, so retry is side-effect free.
+      snapshot = await this.#options.transport.fetchSnapshot(pending.fileId)
+      doc = LoroFileDoc.fromSnapshot(snapshot)
+      // The fetch is an unbounded race window. All canonical/base decisions
+      // below must use a fresh disk observation; a user edit that landed while
+      // awaiting the network is divergent data and goes through journaled
+      // suffix isolation, never a stale guarded-checkout anchor.
+      pendingDisk = await this.#readDisk(pending.path)
+      authoritativeDisk =
+        entry.path === pending.path ? pendingDisk : await this.#readDisk(entry.path)
+      const canonicalHash = sha256Hex(doc.getTextContent())
+      const diskNormalizedHash =
+        authoritativeDisk === null ? null : sha256Hex(normalizeEol(authoritativeDisk.text))
+
+      // Recovery may have written canonical bytes before crashing on the
+      // state commit. Content equality is sufficient to finish that clean
+      // bind even when atomic replacement changed the inode.
+      if (
+        authoritativeDisk !== null &&
+        (authoritativeDisk.contentHash === canonicalHash || diskNormalizedHash === canonicalHash)
+      ) {
+        this.#views.set(pending.fileId, {
+          fileId: pending.fileId,
+          path: entry.path,
+          contentKind: 'markdown',
+          nodeId: authoritativeDisk.nodeId,
+          lastWrittenHash: authoritativeDisk.contentHash,
+          lastWrittenVV: doc.contentVersion(),
+          sizeBytes: authoritativeDisk.sizeBytes,
+        })
+        await this.#attach(pending.fileId, {
+          snapshot,
+          syncedVersion: doc.contentVersion(),
+        })
+        await this.#persistMarkdown(pending.fileId)
+        return
+      }
+
+      const sameStagedInode =
+        entry.path === pending.path &&
+        authoritativeDisk !== null &&
+        pending.nodeId !== null &&
+        authoritativeDisk.nodeId !== null &&
+        pending.nodeId === authoritativeDisk.nodeId
+      const diskStillStagedBase =
+        authoritativeDisk !== null &&
+        (authoritativeDisk.contentHash === pending.contentHash ||
+          diskNormalizedHash === pending.baseContentHash)
+      if (sameStagedInode && diskStillStagedBase) {
+        const stagedDisk = authoritativeDisk!
+        this.#views.set(pending.fileId, {
+          fileId: pending.fileId,
+          path: entry.path,
+          contentKind: 'markdown',
+          nodeId: stagedDisk.nodeId,
+          lastWrittenHash: stagedDisk.contentHash,
+          // If canonical advanced but the create VV was unavailable, never
+          // claim the stale disk included those remote ops. We immediately
+          // replace the proven-unchanged base with canonical bytes below.
+          lastWrittenVV:
+            canonicalHash === pending.baseContentHash
+              ? doc.contentVersion()
+              : doc.shallowSinceVersion(),
+          sizeBytes: stagedDisk.sizeBytes,
+        })
+        await this.#attach(pending.fileId, {
+          snapshot,
+          syncedVersion: doc.contentVersion(),
+        })
+        // Persist before checkout and let the normal guarded checkout re-read
+        // disk. If a user edits during fetch, its hash no longer matches this
+        // staged watermark and scan preserves it from the conservative floor;
+        // unchanged bytes are replaced with canonical content normally.
+        await this.#persistMarkdown(pending.fileId)
+        return
+      }
+    }
+
+    // A previously staged isolation is authoritative evidence that an absent
+    // source was moved by this recovery, not deleted by the user. Complete it
+    // before considering normal absent-file semantics.
+    if (currentPending.collision) {
+      currentPending = await this.#isolatePendingCreateCollision(currentPending, entry.path)
+      authoritativeDisk = await this.#readDisk(entry.path)
+    }
+
+    if (pendingDisk === null && authoritativeDisk === null && !currentPending.collision) {
+      if (entry.contentKind === 'opaque') {
+        this.#views.set(pending.fileId, {
+          fileId: pending.fileId,
+          path: entry.path,
+          contentKind: 'opaque',
+          nodeId: null,
+          lastWrittenHash: pending.contentHash,
+          lastWrittenVV: new Uint8Array(),
+          sizeBytes: pending.sizeBytes,
+        })
+        await this.#persistOpaque(pending.fileId)
+        return
+      }
+      const markdownDoc = doc!
+      const anchor =
+        sha256Hex(markdownDoc.getTextContent()) === pending.baseContentHash
+          ? markdownDoc.contentVersion()
+          : markdownDoc.shallowSinceVersion()
+      this.#views.set(pending.fileId, {
+        fileId: pending.fileId,
+        path: entry.path,
+        contentKind: 'markdown',
+        nodeId: null,
+        // Nonempty even for an initially empty file (SHA-256 of empty bytes):
+        // checkout classifies absence as a local delete, never materializes it.
+        lastWrittenHash: pending.contentHash,
+        lastWrittenVV: anchor,
+        sizeBytes: pending.sizeBytes,
+      })
+      await this.#attach(pending.fileId, {
+        snapshot: snapshot!,
+        syncedVersion: markdownDoc.contentVersion(),
+      })
+      await this.#persistMarkdown(pending.fileId)
+      return
+    }
+
+    // A divergent occupant is unrelated to the staged inode. Journal its
+    // exact suffix destination before the atomic move; the marker remains
+    // until persist{Markdown,Opaque} commits the authoritative view.
+    if (authoritativeDisk !== null) {
+      currentPending = await this.#isolatePendingCreateCollision(currentPending, entry.path)
+    }
+
+    if (entry.contentKind === 'opaque') {
+      this.#views.set(pending.fileId, {
+        fileId: pending.fileId,
+        path: entry.path,
+        contentKind: 'opaque',
+        nodeId: null,
+        lastWrittenHash: '',
+        lastWrittenVV: new Uint8Array(),
+        sizeBytes: 0,
+      })
+      this.#resurrect.add(pending.fileId)
+      await this.#persistOpaque(pending.fileId)
+      return
+    }
+
+    const markdownDoc = doc!
+    this.#views.set(pending.fileId, {
+      fileId: pending.fileId,
+      path: entry.path,
+      contentKind: 'markdown',
+      nodeId: null,
+      lastWrittenHash: '',
+      lastWrittenVV: markdownDoc.contentVersion(),
+      sizeBytes: 0,
+    })
+    await this.#attach(pending.fileId, {
+      snapshot: snapshot!,
+      syncedVersion: markdownDoc.contentVersion(),
+    })
+    this.#resurrect.add(pending.fileId)
+    await this.#persistMarkdown(pending.fileId)
+  }
+
+  async #isolatePendingCreateCollision(
+    pending: PendingCreate,
+    path: string,
+  ): Promise<PendingCreate> {
+    let current = pending
+    for (;;) {
+      const source = await this.#readDisk(path)
+      const collision = current.collision
+      if (collision) {
+        const isolated = await this.#readDisk(collision.isolatedPath)
+        const matches = (disk: DiskFileEntry | null): boolean =>
+          disk !== null &&
+          disk.contentHash === collision.contentHash &&
+          (collision.nodeId === null || disk.nodeId === null || disk.nodeId === collision.nodeId)
+        if (matches(isolated) && source === null) return current
+        if (matches(source) && isolated === null) {
+          await this.#fs.move(path, collision.isolatedPath)
+          return current
+        }
+        // The recorded occupant was already isolated but a new file appeared
+        // at the source, or either endpoint changed externally. Preserve the
+        // current source through a fresh durable phase instead of moving an
+        // unverified inode under the old record.
+        if (source === null) return current
+      } else if (source === null) {
+        return current
+      }
+
+      const isolatedPath = await this.#nextLocalSuffixPath(path)
+      current = {
+        ...current,
+        collision: {
+          path,
+          isolatedPath,
+          contentHash: source!.contentHash,
+          nodeId: source!.nodeId,
+          sizeBytes: source!.sizeBytes,
+        },
+      }
+      await this.#setPendingCreate(current)
+    }
   }
 
   /**
@@ -1510,11 +1985,83 @@ export class DaemonSyncEngine {
         })
         continue
       }
-      const fileId = this.#newFileId()
+      let existingPending = this.#pendingCreateAtPath(create.path)
+      if (
+        existingPending &&
+        (existingPending.nodeId === null ||
+          create.nodeId === null ||
+          existingPending.nodeId !== create.nodeId)
+      ) {
+        // The path was deleted/replaced while the daemon was down. Path alone
+        // cannot authorize attaching the replacement to the staged fileId.
+        // Re-check tree state before retiring it: snapshot.get may already
+        // have registered the old identity while its create event was pruned.
+        const tree = await this.#options.transport.listTree()
+        const entry = tree.entries.find(
+          (candidate) => candidate.fileId === existingPending!.fileId && !candidate.tombstone,
+        )
+        if (entry) {
+          await this.#reconcileAuthoritativePendingCreate(
+            existingPending,
+            entry,
+            await this.#readDisk(existingPending.path),
+          )
+          // The scan diff predates collision isolation/materialization and is
+          // stale. A later cycle registers any preserved suffix separately.
+          continue
+        }
+        await this.#discardPendingCreate(existingPending.fileId)
+        existingPending = undefined
+      }
+      const fileId = existingPending?.fileId ?? this.#newFileId()
       await this.#runFileOp('scan.create', fileId, create.path, async () => {
         const text = normalizeEol(create.text ?? '')
+        if (!existingPending) {
+          // Identity must reach durable local state before snapshot.get can
+          // register the file server-side. Retried scans reuse this fileId.
+          await this.#recordPendingCreate({
+            fileId,
+            path: create.path,
+            contentKind: 'markdown',
+            contentHash: create.contentHash,
+            baseContentHash: sha256Hex(text),
+            nodeId: create.nodeId,
+            sizeBytes: create.sizeBytes,
+          })
+        }
         const snapshot = await this.#options.transport.fetchSnapshot(fileId, text, create.path)
         const doc = LoroFileDoc.fromSnapshot(snapshot)
+        const canonicalText = doc.getTextContent()
+        const canonicalHash = sha256Hex(canonicalText)
+
+        if (
+          existingPending &&
+          canonicalHash !== existingPending.baseContentHash &&
+          canonicalHash !== sha256Hex(text)
+        ) {
+          // The create event/VV fell out of the replay window and the server
+          // has advanced concurrently. With no exact base anchor, inception
+          // merge duplicates the original text. Preserve the local bytes at
+          // a suffix and materialize canonical at the original path instead.
+          // Journal the move because this scan branch is itself a replay
+          // recovery path: another crash must not reinterpret our move as a
+          // user deletion or leave the accepted server row untracked.
+          await this.#isolatePendingCreateCollision(existingPending, create.path)
+          this.#views.set(fileId, {
+            fileId,
+            path: create.path,
+            contentKind: 'markdown',
+            nodeId: null,
+            lastWrittenHash: '',
+            lastWrittenVV: doc.contentVersion(),
+            sizeBytes: 0,
+          })
+          await this.#attach(fileId, { snapshot, syncedVersion: doc.contentVersion() })
+          this.#resurrect.add(fileId)
+          await this.#persistMarkdown(fileId)
+          return
+        }
+
         this.#views.set(fileId, {
           fileId,
           path: create.path,
@@ -1527,7 +2074,14 @@ export class DaemonSyncEngine {
           sizeBytes: create.sizeBytes,
         })
         const client = await this.#attach(fileId, { snapshot, syncedVersion: doc.contentVersion() })
-        if (client.getTextContent() !== text) {
+        if (existingPending && canonicalHash === existingPending.baseContentHash) {
+          if (canonicalText !== text) {
+            // The unchanged canonical snapshot is the exact staged base.
+            // Absorb edits made while down at that version, never inception.
+            const view = this.#views.get(fileId)!
+            view.lastWrittenVV = client.getDoc().applyTextAtBase(doc.contentVersion(), text)
+          }
+        } else if (client.getTextContent() !== text) {
           // The fileId already existed server-side with other content: merge
           // the disk text as inserts-at-inception — union, never deletion of
           // the server's text (INV-2).
@@ -1955,12 +2509,7 @@ export class DaemonSyncEngine {
     })
   }
 
-  async #readDisk(path: string): Promise<{
-    text: string
-    contentHash: string
-    sizeBytes: number
-    nodeId: string | null
-  } | null> {
+  async #readDisk(path: string): Promise<DiskFileEntry | null> {
     try {
       const bytes = await this.#fs.readFileBytes(path)
       const stat = await this.#fs.stat(path)
@@ -2044,6 +2593,7 @@ export class DaemonSyncEngine {
         sizeBytes: view.sizeBytes,
       },
     )
+    this.#pendingCreates.delete(fileId)
   }
 
   /** Watermark-only persistence — state entry, no Loro envelope. */
@@ -2056,6 +2606,7 @@ export class DaemonSyncEngine {
       opaqueHash: view.lastWrittenHash,
       sizeBytes: view.sizeBytes,
     })
+    this.#pendingCreates.delete(fileId)
   }
 
   /** Disk-facing meta only — never the VV anchor (see absorb for why). */

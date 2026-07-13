@@ -60,4 +60,15 @@ describe('LoroFileDoc', () => {
     const fromState = LoroFileDoc.fromState({ snapshot, updates: [update1] })
     expect(fromState.getTextContent()).toBe('initial extended')
   })
+
+  it('materializes text at an exact historical content version', () => {
+    const doc = LoroFileDoc.empty('base')
+    const base = doc.contentVersion()
+    doc.setTextContent('base plus')
+    const extended = doc.contentVersion()
+
+    expect(doc.getTextContentAtVersion(base)).toBe('base')
+    expect(doc.getTextContentAtVersion(extended)).toBe('base plus')
+    expect(doc.getTextContent()).toBe('base plus')
+  })
 })
