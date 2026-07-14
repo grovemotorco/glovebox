@@ -40,8 +40,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Update npm for trusted publishing (OIDC)
+        # Pin to npm 11.x: OIDC trusted publishing needs npm >= 11.5.1, but
+        # npm@latest (>=12) requires node >=26 and this repo pins node 25.9.0
+        # (.node-version), so `npm@latest` fails EBADENGINE. 11.x is the newest
+        # line compatible with node 25. Revisit if .node-version moves to 26+.
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11
           npm --version
 
       - name: Skip while a Version Packages PR is still open
