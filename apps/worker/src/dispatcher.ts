@@ -3,6 +3,7 @@ import { handleAppFallback } from './app-fallback.ts'
 import { createDb } from './db/index.ts'
 import { createAuth } from './lib/auth.ts'
 import { dispatchOrpc } from './orpc/handlers.ts'
+import { isProbeRequest, probeRejectResponse } from './probe-guard.ts'
 
 export type Env = {
   DB: D1Database
@@ -56,6 +57,10 @@ const API_CORS_HEADERS = {
 export const worker: WorkerHandler = {
   async fetch(request, env, executionCtx) {
     const url = new URL(request.url)
+
+    if (isProbeRequest(url.pathname)) {
+      return probeRejectResponse()
+    }
 
     if (url.pathname === '/healthz') {
       return Response.json({ ok: true })
