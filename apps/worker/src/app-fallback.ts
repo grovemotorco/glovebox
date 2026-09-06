@@ -1,10 +1,16 @@
 import tanstackStart from '@tanstack/react-start/server-entry'
 import { createDevAppShellResponse } from '#dev-app-shell'
+import { isProbeRequest, probeRejectResponse } from './probe-guard.ts'
 
 const IS_VITEST = Boolean(import.meta.env.VITEST)
 const IS_DEV = Boolean(import.meta.env.DEV)
 
 export async function handleAppFallback(request: Request): Promise<Response> {
+  const url = new URL(request.url)
+  if (isProbeRequest(url.pathname)) {
+    return probeRejectResponse()
+  }
+
   if (IS_DEV && !IS_VITEST) {
     return createDevAppShellResponse(request)
   }

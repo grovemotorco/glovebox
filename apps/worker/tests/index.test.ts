@@ -159,6 +159,39 @@ describe('worker dispatcher', () => {
     expect(body).toContain('docs/demo.md')
     expect(body).toContain('Markdown content')
   })
+
+  describe('probe path rejection', () => {
+    const probePaths = [
+      '/.env',
+      '/.env.dev',
+      '/.env.prod',
+      '/.git/config',
+      '/actuator/env',
+      '/actuator/configprops',
+      '/api/actuator/health',
+      '/phpinfo.php',
+      '/secrets',
+      '/docker-compose.yml',
+      '/config.php',
+      '/user_secrets',
+      '/service-account.json',
+    ]
+
+    it.each(probePaths)('returns 403 with empty body for probe path %s', async (path) => {
+      const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+      expect(response.status).toBe(403)
+      expect(await response.text()).toBe('')
+    })
+
+    const legitimatePaths = ['/', '/device', '/healthz']
+
+    it.each(legitimatePaths)('does not block legitimate path %s', async (path) => {
+      const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+      expect(response.status).not.toBe(403)
+    })
+  })
 })
 
 function dispatch(request: Request, env = createEnv()): Promise<Response> {
