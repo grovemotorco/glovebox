@@ -228,6 +228,17 @@ describe('worker dispatcher', () => {
       expect(response.headers.get('content-type')).toContain('text/html')
     })
 
+    const trailingSlashPagePaths = ['/device/', '/invites/accept/']
+
+    it.each(trailingSlashPagePaths)(
+      'does not reject page route with trailing slash %s',
+      async (path) => {
+        const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+        expect(response.status).not.toBe(404)
+      },
+    )
+
     it('still serves /healthz', async () => {
       const response = await dispatch(new Request('https://api.glovebox.test/healthz'))
 

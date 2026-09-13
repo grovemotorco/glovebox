@@ -62,8 +62,9 @@ const EXACT_KNOWN_PATHS: ReadonlySet<string> = new Set([
  * toward the 128 MB memory limit on every probe request.
  */
 export function isUnknownPath(pathname: string): boolean {
-  if (PAGE_ROUTES.has(pathname)) return false
-  if (EXACT_KNOWN_PATHS.has(pathname)) return false
+  const normalized = pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  if (PAGE_ROUTES.has(normalized)) return false
+  if (EXACT_KNOWN_PATHS.has(normalized)) return false
   if (
     pathname.startsWith('/api/') ||
     pathname.startsWith('/ws/') ||
