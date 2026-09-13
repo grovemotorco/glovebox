@@ -47,14 +47,15 @@ const EXACT_KNOWN_PATHS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Returns true when the pathname is not part of the app's real surface.
+ * Returns true when the pathname should not reach the SSR pipeline.
  *
- * The known surface is:
- *  - Page routes: `/`, `/device`, `/invites/accept` (exact match)
- *  - API routes: `/api/*`
- *  - WebSocket: `/ws/*`
- *  - Admin: `/admin/*`
- *  - Infrastructure: `/healthz`, `/openapi.json`, `/docs`
+ * Called in the dispatcher **after** all specific route handlers (/api/*,
+ * /ws/*, /admin/*, /healthz, /openapi.json, /docs) have already run. At that
+ * point the only paths that should proceed to SSR are the page routes and
+ * client-side assets; everything else is unknown.
+ *
+ * Known paths that may still reach SSR:
+ *  - Page routes: `/`, `/device`, `/invites/accept` (exact, trailing-slash tolerant)
  *  - Static assets: `/assets/*`, `/robots.txt`, `/sitemap.xml`, `/favicon.ico`
  *
  * Everything else is unknown and should be rejected cheaply (404) instead of
@@ -65,13 +66,6 @@ export function isUnknownPath(pathname: string): boolean {
   const normalized = pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
   if (PAGE_ROUTES.has(normalized)) return false
   if (EXACT_KNOWN_PATHS.has(normalized)) return false
-  if (
-    pathname.startsWith('/api/') ||
-    pathname.startsWith('/ws/') ||
-    pathname.startsWith('/admin/') ||
-    pathname.startsWith('/assets/')
-  ) {
-    return false
-  }
+  if (pathname.startsWith('/assets/')) return false
   return true
 }

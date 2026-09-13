@@ -252,6 +252,18 @@ describe('worker dispatcher', () => {
       expect(response.status).toBe(404)
       expect(await response.text()).toBe('REST route not found')
     })
+
+    const unmatchedPrefixPaths = ['/admin/login', '/api/swagger', '/ws/']
+
+    it.each(unmatchedPrefixPaths)(
+      'rejects unmatched prefix path %s that no handler caught',
+      async (path) => {
+        const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+        expect(response.status).toBe(404)
+        expect(await response.text()).toBe('Not Found')
+      },
+    )
   })
 })
 
