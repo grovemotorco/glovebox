@@ -166,6 +166,9 @@ describe('worker dispatcher', () => {
       '/.env.dev',
       '/.env.prod',
       '/.git/config',
+      '/.rubocop.yml',
+      '/.svn/entries',
+      '/.github/workflows/publish.yml',
       '/actuator/env',
       '/actuator/configprops',
       '/api/actuator/health',
@@ -190,6 +193,53 @@ describe('worker dispatcher', () => {
       const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
 
       expect(response.status).not.toBe(403)
+    })
+  })
+
+  describe('unknown path rejection', () => {
+    const unknownPaths = [
+      '/google-api-private-key.json',
+      '/haproxy.cfg',
+      '/settings.json',
+      '/Guardfile',
+      '/mcp.json',
+      '/config.codekit3',
+      '/sites/default/settings.php.orig',
+      '/wp-json/Batch/v1',
+      '/index.php',
+    ]
+
+    it.each(unknownPaths)(
+      'returns 404 for scanner path %s that bypasses the probe blocklist',
+      async (path) => {
+        const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+        expect(response.status).toBe(404)
+        expect(await response.text()).toBe('Not Found')
+      },
+    )
+
+    const legitimatePagePaths = ['/', '/device']
+
+    it.each(legitimatePagePaths)('still renders page route %s', async (path) => {
+      const response = await dispatch(new Request(`https://api.glovebox.test${path}`))
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toContain('text/html')
+    })
+
+    it('still serves /healthz', async () => {
+      const response = await dispatch(new Request('https://api.glovebox.test/healthz'))
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toEqual({ ok: true })
+    })
+
+    it('does not reject a real API path', async () => {
+      const response = await dispatch(new Request('https://api.glovebox.test/api/v1/nonexistent'))
+
+      expect(response.status).toBe(404)
+      expect(await response.text()).toBe('REST route not found')
     })
   })
 })

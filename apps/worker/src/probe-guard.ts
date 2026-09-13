@@ -34,3 +34,43 @@ export function isProbeRequest(pathname: string): boolean {
 export function probeRejectResponse(): Response {
   return new Response(null, { status: 403 })
 }
+
+const PAGE_ROUTES: ReadonlySet<string> = new Set(['/', '/device', '/invites/accept'])
+
+const EXACT_KNOWN_PATHS: ReadonlySet<string> = new Set([
+  '/healthz',
+  '/openapi.json',
+  '/docs',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/favicon.ico',
+])
+
+/**
+ * Returns true when the pathname is not part of the app's real surface.
+ *
+ * The known surface is:
+ *  - Page routes: `/`, `/device`, `/invites/accept` (exact match)
+ *  - API routes: `/api/*`
+ *  - WebSocket: `/ws/*`
+ *  - Admin: `/admin/*`
+ *  - Infrastructure: `/healthz`, `/openapi.json`, `/docs`
+ *  - Static assets: `/assets/*`, `/robots.txt`, `/sitemap.xml`, `/favicon.ico`
+ *
+ * Everything else is unknown and should be rejected cheaply (404) instead of
+ * falling through to SSR, which cold-boots React and pushes the isolate
+ * toward the 128 MB memory limit on every probe request.
+ */
+export function isUnknownPath(pathname: string): boolean {
+  if (PAGE_ROUTES.has(pathname)) return false
+  if (EXACT_KNOWN_PATHS.has(pathname)) return false
+  if (
+    pathname.startsWith('/api/') ||
+    pathname.startsWith('/ws/') ||
+    pathname.startsWith('/admin/') ||
+    pathname.startsWith('/assets/')
+  ) {
+    return false
+  }
+  return true
+}

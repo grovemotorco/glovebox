@@ -3,7 +3,7 @@ import { handleAppFallback } from './app-fallback.ts'
 import { createDb } from './db/index.ts'
 import { createAuth } from './lib/auth.ts'
 import { dispatchOrpc } from './orpc/handlers.ts'
-import { isProbeRequest, probeRejectResponse } from './probe-guard.ts'
+import { isProbeRequest, isUnknownPath, probeRejectResponse } from './probe-guard.ts'
 
 export type Env = {
   DB: D1Database
@@ -100,6 +100,10 @@ export const worker: WorkerHandler = {
     const adminRoute = matchAdminPath(url.pathname)
     if (adminRoute) {
       return handleWorkspaceAdmin(request, env, adminRoute.workspaceId)
+    }
+
+    if (isUnknownPath(url.pathname)) {
+      return new Response('Not Found', { status: 404 })
     }
 
     return handleAppFallback(request)
